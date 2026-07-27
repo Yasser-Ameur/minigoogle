@@ -1,0 +1,28 @@
+# Build output
+build/
+.gradle/
+out/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Runtime data
+demo-index/
+snapshots/
+
+# Gradle wrapper (keep JAR)
+!gradle/wrapper/gradle-wrapper.jar
