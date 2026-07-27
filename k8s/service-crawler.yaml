@@ -1,0 +1,19 @@
+# ClusterIP service for crawler nodes
+apiVersion: v1
+kind: Service
+metadata:
+  name: minigoogle-crawler
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: crawler
+    app.kubernetes.io/part-of: minigoogle
+spec:
+  type: ClusterIP
+  selector:
+    app: minigoogle
+    component: crawler
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

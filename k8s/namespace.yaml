@@ -1,0 +1,7 @@
+# Namespace for the MiniGoogle search engine application
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minigoogle
+  labels:
+    app.kubernetes.io/part-of: minigoogle

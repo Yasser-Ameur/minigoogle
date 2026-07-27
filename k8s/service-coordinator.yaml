@@ -1,0 +1,19 @@
+# ClusterIP service for coordinator nodes
+apiVersion: v1
+kind: Service
+metadata:
+  name: minigoogle-coordinator
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/part-of: minigoogle
+spec:
+  type: ClusterIP
+  selector:
+    app: minigoogle
+    component: coordinator
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

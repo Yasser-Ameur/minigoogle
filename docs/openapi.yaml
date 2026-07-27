@@ -1,0 +1,219 @@
+openapi: "3.0.3"
+
+info:
+  title: MiniGoogle Search API
+  description: REST API for the MiniGoogle distributed search engine.
+  version: "1.0.0"
+  contact:
+    name: MiniGoogle Team
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /api/v1/search:
+    post:
+      summary: Execute a search query
+      description: >
+        Runs a query against the search index and returns ranked results with
+        pagination support.
+      operationId: search
+      tags:
+        - Search
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+            example:
+              query: "distributed systems"
+              page: 1
+              pageSize: 10
+      responses:
+        "200":
+          description: Successful search response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+              example:
+                executionTimeMs: 42
+                totalResults: 1580
+                results:
+                  - url: "https://example.com/dist-systems"
+                    title: "Distributed Systems 101"
+                    snippet: "An introduction to distributed systems concepts..."
+                    score: 0.95
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/health:
+    get:
+      summary: Health check
+      description: Returns the health status of the service.
+      operationId: healthCheck
+      tags:
+        - Cluster
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - ok
+              example:
+                status: "ok"
+
+  /api/v1/cluster/nodes:
+    get:
+      summary: List cluster nodes
+      description: Returns information about all registered nodes in the cluster.
+      operationId: listClusterNodes
+      tags:
+        - Cluster
+      responses:
+        "200":
+          description: List of cluster nodes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NodeInfo"
+              example:
+                - nodeId: "node-1"
+                  host: "192.168.1.10"
+                  port: 9001
+                  role: "INDEX"
+                  status: "ALIVE"
+                  lastHeartbeat: 1721750000000
+
+components:
+  schemas:
+    SearchRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: The search query string
+          example: "distributed systems"
+        page:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Page number (1-indexed)
+          example: 1
+        pageSize:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: Number of results per page
+          example: 10
+
+    SearchResponse:
+      type: object
+      properties:
+        executionTimeMs:
+          type: integer
+          format: int64
+          description: Total time taken to execute the query in milliseconds
+          example: 42
+        totalResults:
+          type: integer
+          description: Estimated total number of matching documents
+          example: 1580
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+
+    SearchResult:
+      type: object
+      properties:
+        url:
+          type: string
+          description: URL of the matching document
+          example: "https://example.com/dist-systems"
+        title:
+          type: string
+          description: Title of the document
+          example: "Distributed Systems 101"
+        snippet:
+          type: string
+          description: Relevant text excerpt from the document
+          example: "An introduction to distributed systems concepts..."
+        score:
+          type: number
+          format: double
+          description: Relevance score (0.0 to 1.0)
+          example: 0.95
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: High-level error code
+          example: "INVALID_QUERY"
+        message:
+          type: string
+          description: Human-readable error description
+          example: "Query cannot be empty"
+
+    NodeInfo:
+      type: object
+      properties:
+        nodeId:
+          type: string
+          description: Unique identifier of the node
+          example: "node-1"
+        host:
+          type: string
+          description: Hostname or IP address of the node
+          example: "192.168.1.10"
+        port:
+          type: integer
+          description: Port the node listens on
+          example: 9001
+        role:
+          type: string
+          enum:
+            - COORDINATOR
+            - CRAWLER
+            - INDEX
+            - QUERY
+          description: Role of the node in the cluster
+          example: "INDEX"
+        status:
+          type: string
+          enum:
+            - ALIVE
+            - SUSPECT
+            - DEAD
+          description: Current status of the node
+          example: "ALIVE"
+        lastHeartbeat:
+          type: integer
+          format: int64
+          description: Timestamp of the last heartbeat in milliseconds since epoch
+          example: 1721750000000

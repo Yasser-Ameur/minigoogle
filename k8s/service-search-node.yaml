@@ -1,0 +1,19 @@
+# ClusterIP service for search nodes
+apiVersion: v1
+kind: Service
+metadata:
+  name: minigoogle-search-node
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: search-node
+    app.kubernetes.io/part-of: minigoogle
+spec:
+  type: ClusterIP
+  selector:
+    app: minigoogle
+    component: search-node
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

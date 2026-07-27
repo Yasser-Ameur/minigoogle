@@ -1,0 +1,14 @@
+# Configuration for the MiniGoogle search engine
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minigoogle-config
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/part-of: minigoogle
+data:
+  server.port: "8080"
+  cluster.replicationFactor: "3"
+  crawler.workers: "32"
+  search.topK: "20"

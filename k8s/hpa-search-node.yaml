@@ -1,0 +1,30 @@
+# HorizontalPodAutoscaler for search nodes based on CPU and memory usage
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: minigoogle-search-node-hpa
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: search-node
+    app.kubernetes.io/part-of: minigoogle
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minigoogle-search-node
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

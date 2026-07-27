@@ -1,0 +1,30 @@
+# MiniGoogle application configuration.
+# This file is not currently loaded automatically by the application.
+# Use environment variables (NODE_TYPE, NODE_PORT, CLUSTER_PEERS) for runtime config.
+
+server:
+  port: 8080
+  host: 0.0.0.0
+
+cluster:
+  replicationFactor: 3
+  nodeTimeout: 30000
+  gossipInterval: 1000
+
+crawler:
+  workers: 32
+  maxDepth: 5
+  politenessDelay: 1000
+
+search:
+  topK: 20
+  maxResults: 100
+  timeoutMs: 5000
+
+indexing:
+  segmentSize: 10000
+  compactionThreshold: 5
+
+logging:
+  level: INFO
+  format: json
