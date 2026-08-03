@@ -89,6 +89,26 @@ public class VectorIndex {
     }
 
     /**
+     * Returns the cosine similarity between a query vector and the stored
+     * vector for the given id, or {@code null} if the id is not indexed.
+     *
+     * @param id          The document ID.
+     * @param queryVector The query vector.
+     * @return The cosine similarity, or {@code null} if not found.
+     */
+    public Double similarity(int id, double[] queryVector) {
+        if (queryVector.length != dimension) {
+            throw new IllegalArgumentException("Query vector dimension mismatch");
+        }
+        for (VectorEntry entry : entries) {
+            if (entry.id() == id) {
+                return EmbeddingGenerator.cosineSimilarity(queryVector, entry.vector());
+            }
+        }
+        return null;
+    }
+
+    /**
      * @return The number of vectors in the index.
      */
     public int size() {

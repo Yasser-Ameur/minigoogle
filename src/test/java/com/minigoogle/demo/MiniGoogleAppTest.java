@@ -12,6 +12,8 @@ import com.minigoogle.query.lexer.Lexer;
 import com.minigoogle.query.lexer.Token;
 import com.minigoogle.query.parser.Parser;
 import com.minigoogle.query.planner.QueryPlanner;
+import com.minigoogle.semantic.expansion.PmiThesaurusBuilder;
+import com.minigoogle.semantic.expansion.QueryExpander;
 import com.minigoogle.indexer.inverted.PostingList;
 import com.minigoogle.ranking.bm25.BM25Parameters;
 import com.minigoogle.ranking.model.RankedDocument;
@@ -204,6 +206,26 @@ class MiniGoogleAppTest {
         SearchResponse multi = search("machine learning");
         assertTrue(single.totalResults() > 0, "Should find results for 'machine'");
         assertTrue(multi.totalResults() > 0, "Should find results for 'machine learning'");
+    }
+
+    @Test
+    void testExpansionDoesNotBreakSingleWordQuery() {
+        QueryExpander expander = new QueryExpander(new PmiThesaurusBuilder(10, 1.0, 5).build(docs));
+        List<String> expanded = expander.expand("text", 4);
+        assertTrue(expanded.size() > 1, "demo corpus should expand 'text'");
+
+        // Mirror executeSearch: expansions must be OR-joined, never space-joined
+        // (a space-joined expansion becomes an AND query that matches nothing).
+        String expandedQuery = String.join(" OR ", expanded);
+        assertTrue(expandedQuery.contains(" OR "), "expansions must be OR-joined, not ANDed");
+
+        Lexer lexer = new Lexer();
+        List<Token> tokens = lexer.tokenize(expandedQuery);
+        Parser parser = new Parser(tokens);
+        QueryNode ast = parser.parse();
+        PostingList results = planner.execute(ast);
+        assertFalse(results.getPostings().isEmpty(),
+                "OR-joined expansion of 'text' must still return matches");
     }
 
     @Test

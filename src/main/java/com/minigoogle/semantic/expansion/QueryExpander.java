@@ -33,11 +33,13 @@ public class QueryExpander {
     /**
      * Creates a query expander using a provided synonym graph.
      *
+     * <p>No hard-coded defaults are added; expansion uses only the supplied
+     * graph (e.g. a corpus-derived PMI thesaurus).</p>
+     *
      * @param synonymGraph The synonym graph to use for expansion.
      */
     public QueryExpander(SynonymGraph synonymGraph) {
         this.synonymGraph = synonymGraph;
-        loadDefaultSynonyms();
     }
 
     /**

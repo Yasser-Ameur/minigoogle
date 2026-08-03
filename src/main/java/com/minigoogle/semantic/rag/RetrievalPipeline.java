@@ -79,26 +79,51 @@ public class RetrievalPipeline implements RetrievalEngine {
         double[] queryVector = embeddingGenerator.embed(query);
         List<VectorIndex.VectorResult> semanticResults = vectorIndex.search(queryVector, fetchK);
 
-        double maxLexical = normalizeMax(lexicalResults);
-        double maxSemantic = normalizeMax(semanticResults);
+        return mergeResults(lexicalResults, semanticResults, topK, lexicalWeight);
+    }
+
+    /**
+     * Merges lexical and semantic retrieval results into a single deduplicated,
+     * blended-score list.
+     *
+     * <p>Each result list is normalized by its own maximum score, then combined
+     * as {@code lexicalWeight * normLexical + (1 - lexicalWeight) * normSemantic}.
+     * Documents that appear in both lists accumulate both contributions. Ties are
+     * broken by document id for determinism.</p>
+     *
+     * @param lexical       Lexical search results (may be empty).
+     * @param semantic      Semantic search results (may be empty).
+     * @param topK          Maximum number of merged results to return.
+     * @param lexicalWeight Weight of lexical scores in [0.0, 1.0].
+     * @return The merged, ranked result list.
+     */
+    public static List<VectorIndex.VectorResult> mergeResults(
+            List<VectorIndex.VectorResult> lexical,
+            List<VectorIndex.VectorResult> semantic,
+            int topK,
+            double lexicalWeight) {
+        double maxLexical = normalizeMax(lexical);
+        double maxSemantic = normalizeMax(semantic);
 
         Map<Integer, Double> scores = new LinkedHashMap<>();
         Map<Integer, VectorIndex.VectorResult> resultMap = new LinkedHashMap<>();
 
-        for (VectorIndex.VectorResult r : lexicalResults) {
+        for (VectorIndex.VectorResult r : lexical) {
             double normalized = maxLexical > 0 ? r.score() / maxLexical : 0;
             scores.merge(r.id(), lexicalWeight * normalized, Double::sum);
             resultMap.putIfAbsent(r.id(), r);
         }
 
-        for (VectorIndex.VectorResult r : semanticResults) {
+        for (VectorIndex.VectorResult r : semantic) {
             double normalized = maxSemantic > 0 ? r.score() / maxSemantic : 0;
             scores.merge(r.id(), (1 - lexicalWeight) * normalized, Double::sum);
             resultMap.putIfAbsent(r.id(), r);
         }
 
         List<Map.Entry<Integer, Double>> sorted = new ArrayList<>(scores.entrySet());
-        sorted.sort(Comparator.<Map.Entry<Integer, Double>>comparingDouble(Map.Entry::getValue).reversed());
+        sorted.sort(Comparator
+                .<Map.Entry<Integer, Double>>comparingDouble(Map.Entry::getValue).reversed()
+                .thenComparing(Map.Entry::getKey));
 
         List<VectorIndex.VectorResult> results = new ArrayList<>();
         for (Map.Entry<Integer, Double> entry : sorted) {
@@ -118,7 +143,7 @@ public class RetrievalPipeline implements RetrievalEngine {
             .collect(Collectors.toList());
     }
 
-    private double normalizeMax(List<VectorIndex.VectorResult> results) {
+    private static double normalizeMax(List<VectorIndex.VectorResult> results) {
         return results.stream()
                 .mapToDouble(VectorIndex.VectorResult::score)
                 .max()

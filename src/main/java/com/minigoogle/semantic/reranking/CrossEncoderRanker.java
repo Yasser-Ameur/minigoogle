@@ -3,6 +3,8 @@ package com.minigoogle.semantic.reranking;
 import com.minigoogle.core.retrieval.ResultReRanker;
 import com.minigoogle.core.retrieval.RetrievalResult;
 import com.minigoogle.ranking.model.RankedDocument;
+import com.minigoogle.semantic.EmbeddingGenerator;
+import com.minigoogle.semantic.VectorIndex;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -14,25 +16,52 @@ import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 /**
- * A cross-encoder reranker that scores query-document pairs using a heuristic model.
+ * A cross-encoder reranker that scores query-document pairs.
  *
- * <p>Scoring is based on:
- * <ul>
- *   <li>Term overlap ratio: fraction of query terms found in the document.</li>
- *   <li>Title match bonus: extra weight when query terms appear in the title.</li>
- * </ul>
- * This is a lightweight approximation of a true neural cross-encoder.</p>
+ * <p>When a {@link VectorIndex} of document embeddings is supplied, scoring uses
+ * real content-based cosine similarity between the query embedding and each
+ * document embedding, blended with the lexical {@code finalScore} from the
+ * ranking pipeline. This replaces the previous simulated/heuristic behavior.</p>
+ *
+ * <p>Without a vector index (fallback path) it scores using a lightweight
+ * term-overlap approximation.</p>
  */
 public class CrossEncoderRanker implements ResultReRanker {
 
     private static final double TITLE_BONUS = 0.3;
+    private static final double DEFAULT_SEMANTIC_WEIGHT = 0.3;
+
+    private final VectorIndex vectorIndex;
+    private final EmbeddingGenerator embeddingGenerator;
+    private final double semanticWeight;
+
+    public CrossEncoderRanker() {
+        this(null, null, DEFAULT_SEMANTIC_WEIGHT);
+    }
+
+    public CrossEncoderRanker(VectorIndex vectorIndex) {
+        this(vectorIndex, null, DEFAULT_SEMANTIC_WEIGHT);
+    }
+
+    public CrossEncoderRanker(VectorIndex vectorIndex, double semanticWeight) {
+        this(vectorIndex, null, semanticWeight);
+    }
+
+    public CrossEncoderRanker(VectorIndex vectorIndex, EmbeddingGenerator embeddingGenerator, double semanticWeight) {
+        if (semanticWeight < 0 || semanticWeight > 1) {
+            throw new IllegalArgumentException("Semantic weight must be in [0, 1]");
+        }
+        this.vectorIndex = vectorIndex;
+        this.embeddingGenerator = embeddingGenerator;
+        this.semanticWeight = semanticWeight;
+    }
 
     /**
-     * Scores a query-document pair.
+     * Scores a query-document pair using term overlap.
      *
      * @param query    The search query.
      * @param document The document text.
-     * @return A relevance score in [0.0, ~1.3] (above 1.0 possible due to title bonus).
+     * @return A relevance score in [0.0, 1.0].
      */
     public double score(String query, String document) {
         if (query == null || document == null) return 0.0;
@@ -48,8 +77,7 @@ public class CrossEncoderRanker implements ResultReRanker {
                 overlap++;
             }
         }
-        double overlapRatio = (double) overlap / queryTerms.size();
-        return overlapRatio;
+        return (double) overlap / queryTerms.size();
     }
 
     /**
@@ -67,13 +95,50 @@ public class CrossEncoderRanker implements ResultReRanker {
     }
 
     /**
-     * Reranks a list of candidate documents by cross-encoder score.
+     * Reranks a list of candidate documents by semantic relevance.
+     *
+     * <p>When a vector index is available the query is embedded and each
+     * candidate's cosine similarity to the query is blended with its lexical
+     * {@code finalScore}: {@code (1 - semanticWeight) * normalizedLexical +
+     * semanticWeight * cosine}. Otherwise term-overlap scoring is used.</p>
      *
      * @param query      The search query.
      * @param candidates The pre-filtered candidate documents.
-     * @return A new list of candidates sorted by descending cross-encoder score.
+     * @return A new list of candidates sorted by descending combined score.
      */
     public List<RankedDocument> rerank(String query, List<RankedDocument> candidates) {
+        if (vectorIndex == null) {
+            return rerankByTermOverlap(query, candidates);
+        }
+
+        double[] queryVector = embeddingFor(query);
+        double maxLexical = candidates.stream()
+                .mapToDouble(RankedDocument::finalScore)
+                .max()
+                .orElse(0.0);
+
+        List<RankedDocument> reranked = new ArrayList<>();
+        for (RankedDocument doc : candidates) {
+            Double cosine = vectorIndex.similarity(doc.documentId(), queryVector);
+            double semantic = cosine != null ? Math.max(0.0, cosine) : 0.0;
+            double normalizedLexical = maxLexical > 0 ? doc.finalScore() / maxLexical : 0.0;
+            double combined = (1 - semanticWeight) * normalizedLexical + semanticWeight * semantic;
+            reranked.add(new RankedDocument(
+                    doc.documentId(),
+                    doc.url(),
+                    doc.title(),
+                    doc.bm25Score(),
+                    doc.pageRankScore(),
+                    combined,
+                    doc.snippet()
+            ));
+        }
+
+        reranked.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
+        return reranked;
+    }
+
+    private List<RankedDocument> rerankByTermOverlap(String query, List<RankedDocument> candidates) {
         List<RankedDocument> reranked = new ArrayList<>();
 
         for (RankedDocument doc : candidates) {
@@ -91,6 +156,13 @@ public class CrossEncoderRanker implements ResultReRanker {
 
         reranked.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
         return reranked;
+    }
+
+    private double[] embeddingFor(String text) {
+        if (embeddingGenerator != null) {
+            return embeddingGenerator.embed(text);
+        }
+        return new EmbeddingGenerator(vectorIndex.getDimension()).embed(text);
     }
 
     @Override

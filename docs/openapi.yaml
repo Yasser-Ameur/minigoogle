@@ -81,6 +81,43 @@ paths:
               example:
                 status: "ok"
 
+  /api/v1/entities:
+    get:
+      summary: Query the knowledge graph
+      description: >
+        Returns named entities extracted from the corpus. Without a query
+        parameter the top entities by document count are returned; with `q`,
+        entities matching the substring are returned along with their related
+        entities (ordered by co-occurrence weight).
+      operationId: getEntities
+      tags:
+        - Knowledge Graph
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Entity name substring to match (case-insensitive)
+          schema:
+            type: string
+          example: "Java"
+      responses:
+        "200":
+          description: List of matching entities
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityResult"
+              example:
+                - entity: "Java Programming Language"
+                  count: 1
+                  related:
+                    - entity: "James Gosling"
+                      score: 1
+                    - entity: "Sun Microsystems"
+                      score: 1
+
   /api/v1/cluster/nodes:
     get:
       summary: List cluster nodes
@@ -179,6 +216,35 @@ components:
           type: string
           description: Human-readable error description
           example: "Query cannot be empty"
+
+    EntityResult:
+      type: object
+      properties:
+        entity:
+          type: string
+          description: Extracted entity name
+          example: "Java Programming Language"
+        count:
+          type: integer
+          description: Number of documents mentioning the entity
+          example: 3
+        related:
+          type: array
+          description: Related entities sorted by co-occurrence weight
+          items:
+            $ref: "#/components/schemas/RelatedEntity"
+
+    RelatedEntity:
+      type: object
+      properties:
+        entity:
+          type: string
+          description: Related entity name
+          example: "James Gosling"
+        score:
+          type: integer
+          description: Number of documents in which both entities co-occur
+          example: 2
 
     NodeInfo:
       type: object

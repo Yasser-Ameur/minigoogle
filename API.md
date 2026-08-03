@@ -83,6 +83,56 @@ curl http://localhost:8080/api/v1/health
 
 ---
 
+## GET /api/v1/entities
+
+Queries the corpus knowledge graph for named entities. With no `q` parameter it
+returns the top entities by document count (capped at 20); with `q` it returns
+up to 5 matching entities (case-insensitive substring match).
+
+**Query Parameters**
+
+| Field | Type   | Required | Description                                      |
+|-------|--------|----------|--------------------------------------------------|
+| q     | string | no       | Entity name to look up (optional)                |
+
+**Response 200**
+
+Array of entity objects:
+
+| Field   | Type  | Description                              |
+|---------|-------|------------------------------------------|
+| entity  | string| Entity name                              |
+| count   | int   | Number of documents mentioning the entity|
+| related | array | Related entities sorted by co-occurrence weight |
+
+Each `related` entry:
+
+| Field   | Type   | Description                          |
+|---------|--------|--------------------------------------|
+| entity  | string | Related entity name                  |
+| score   | int    | Number of documents where both co-occur |
+
+**Example**
+
+```bash
+curl "http://localhost:8080/api/v1/entities?q=Java"
+```
+
+```json
+[
+  {
+    "entity": "Java Programming Language",
+    "count": 1,
+    "related": [
+      { "entity": "James Gosling", "score": 1 },
+      { "entity": "Sun Microsystems", "score": 1 }
+    ]
+  }
+]
+```
+
+---
+
 ## GET /api/v1/cluster/nodes
 
 Lists all registered nodes in the cluster.

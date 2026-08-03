@@ -44,6 +44,16 @@ public final class Configuration {
         }
     }
 
+    public double getDouble(String key, double defaultValue) {
+        String val = properties.get(key);
+        if (val == null) return defaultValue;
+        try {
+            return Double.parseDouble(val);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
     public boolean getBoolean(String key, boolean defaultValue) {
         String val = properties.get(key);
         if (val == null) return defaultValue;

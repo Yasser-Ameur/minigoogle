@@ -1,6 +1,9 @@
 # MiniGoogle application configuration.
-# This file is not currently loaded automatically by the application.
-# Use environment variables (NODE_TYPE, NODE_PORT, CLUSTER_PEERS) for runtime config.
+# Loaded by ConfigurationLoader at startup. Overridable via environment
+# variables: NODE_TYPE, NODE_PORT, CLUSTER_PEERS, MINIGOGLE_* (see ConfigurationLoader).
+
+node:
+  type: STANDALONE        # STANDALONE | SEARCH | COORDINATOR
 
 server:
   port: 8080
@@ -10,6 +13,9 @@ cluster:
   replicationFactor: 3
   nodeTimeout: 30000
   gossipInterval: 1000
+  port: 8081              # COORDINATOR: cluster registry port
+  # coordinatorUrl: http://localhost:8081   # defaults to cluster.port when unset
+  advertisedHost: localhost
 
 crawler:
   workers: 32
@@ -21,7 +27,26 @@ search:
   maxResults: 100
   timeoutMs: 5000
 
+semantic:
+  enabled: true            # build the content-based vector index and rerank by cosine
+  dimension: 128           # embedding dimensionality (feature hashing bucket count)
+  weight: 0.3              # blend weight: 0 = pure lexical, 1 = pure semantic
+  expansion:
+    enabled: true          # corpus-derived PMI query expansion
+    windowSize: 10         # co-occurrence window length in tokens
+    pmiThreshold: 1.0      # minimum PMI for a thesaurus edge
+    maxNeighbors: 5        # max expansion terms per term
+  hybrid:
+    enabled: true          # merge lexical and vector recall at search time
+    lexicalWeight: 0.5     # weight of lexical scores in the blended merge
+    fetchK: 60             # number of semantic candidates fetched
+  knowledge:
+    enabled: true          # build the corpus knowledge graph
+    maxEntitiesPerDoc: 10  # entities extracted per document
+    maxRelated: 8          # related entities returned per entity
+
 indexing:
+  indexDir: demo-index
   segmentSize: 10000
   compactionThreshold: 5
 

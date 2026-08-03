@@ -28,17 +28,36 @@ import com.minigoogle.ranking.model.RankedDocument;
 import com.minigoogle.ranking.pagerank.GraphBuilder;
 import com.minigoogle.ranking.pagerank.PageRankCalculator;
 import com.minigoogle.ranking.pipeline.RankingPipeline;
+import com.minigoogle.semantic.EmbeddingGenerator;
+import com.minigoogle.semantic.VectorIndex;
 import com.minigoogle.semantic.autocomplete.TrieAutocomplete;
+import com.minigoogle.semantic.expansion.PmiThesaurusBuilder;
 import com.minigoogle.semantic.expansion.QueryExpander;
+import com.minigoogle.semantic.knowledge.EntityExtractor;
+import com.minigoogle.semantic.knowledge.KnowledgeGraph;
+import com.minigoogle.semantic.rag.RetrievalPipeline;
 import com.minigoogle.semantic.reranking.CrossEncoderRanker;
 import com.minigoogle.semantic.spell.SpellCorrector;
+import com.minigoogle.semantic.synonym.SynonymGraph;
 import com.minigoogle.storage.dictionary.DictionaryEntry;
 import com.minigoogle.storage.dictionary.DictionaryReader;
 import com.minigoogle.storage.documents.DocumentReader;
 import com.minigoogle.storage.metadata.Metadata;
 import com.minigoogle.storage.metadata.MetadataReader;
 import com.minigoogle.storage.mmap.MemoryMappedIndex;
+import com.minigoogle.core.cache.LRUCache;
+import com.minigoogle.core.config.Configuration;
+import com.minigoogle.core.config.ConfigurationLoader;
+import com.minigoogle.core.event.EventBus;
+import com.minigoogle.core.event.QueryExecutedEvent;
+import com.minigoogle.distributed.coordinator.ClusterCoordinator;
+import com.minigoogle.distributed.coordinator.SearchCoordinator;
+import com.minigoogle.distributed.heartbeat.HeartbeatManager;
+import com.minigoogle.distributed.model.NodeInfo;
+import com.minigoogle.distributed.model.NodeRole;
+import com.minigoogle.distributed.model.NodeStatus;
 import com.minigoogle.monitoring.analytics.QueryAnalytics;
+import com.minigoogle.network.http.RestClient;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -47,7 +66,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -57,11 +75,12 @@ import java.util.stream.Collectors;
  */
 public class MiniGoogleApp {
 
-    private static final int PORT = 8080;
-    private static final String INDEX_DIR = "demo-index";
+    private static final int DEFAULT_PORT = 8080;
+    private static final String DEFAULT_INDEX_DIR = "demo-index";
 
     private final List<ParsedDocument> allDocs = new ArrayList<>();
     private IndexBuilder builder;
+    private Configuration config;
 
     private QueryPlanner planner;
     private RankingPipeline ranking;
@@ -71,12 +90,22 @@ public class MiniGoogleApp {
     private SpellCorrector spellCorrector;
     private QueryExpander queryExpander;
     private CrossEncoderRanker reranker;
+    private VectorIndex vectorIndex;
+    private EmbeddingGenerator embeddingGenerator;
     private Metadata metadata;
     private final QueryAnalytics analytics = new QueryAnalytics();
 
     private Map<String, DictionaryEntry> dictionary;
     private Path indexPath;
-    private final Map<String, List<com.minigoogle.network.dto.SearchResult>> queryCache = new ConcurrentHashMap<>();
+    private final LRUCache<String, List<com.minigoogle.network.dto.SearchResult>> queryCache = new LRUCache<>(200);
+    private final EventBus eventBus = new EventBus();
+
+    private Map<Integer, String> docUrls = new HashMap<>();
+    private Map<Integer, String> docTitles = new HashMap<>();
+    private Map<Integer, String> docBodies = new HashMap<>();
+    private Map<Integer, Integer> docLengths = new HashMap<>();
+    private Map<Integer, Double> pageRankScores = new HashMap<>();
+    private KnowledgeGraph knowledgeGraph;
 
     private final UnicodeNormalizer normalizer = new UnicodeNormalizer();
     private final CaseFolder caseFolder = new CaseFolder();
@@ -87,7 +116,20 @@ public class MiniGoogleApp {
     public void start() throws Exception {
         printBanner();
 
-        indexPath = Path.of(INDEX_DIR);
+        config = ConfigurationLoader.load("config/application.yaml");
+        int port = config.getInt("server.port", DEFAULT_PORT);
+        String indexDir = config.get("indexing.indexDir", DEFAULT_INDEX_DIR);
+        String nodeType = config.get("node.type", "STANDALONE").trim().toUpperCase(Locale.ROOT);
+
+        if ("COORDINATOR".equals(nodeType)) {
+            startCoordinatorNode(port);
+            return;
+        }
+
+        eventBus.subscribe(QueryExecutedEvent.class,
+            e -> analytics.recordQuery(e.query(), e.resultCount(), e.durationMs()));
+
+        indexPath = Path.of(indexDir);
         Files.createDirectories(indexPath);
 
         // Phase 1: Index demo documents
@@ -97,10 +139,10 @@ public class MiniGoogleApp {
         System.out.println("done (" + allDocs.size() + " documents)");
 
         // Phase 2: Start server
-        System.out.println("Starting server on http://localhost:" + PORT);
+        System.out.println("Starting server on http://localhost:" + port);
         System.out.println("============================================================");
 
-        RestServer server = new RestServer(PORT);
+        RestServer server = new RestServer(port);
 
         String html = loadResource("/demo/index.html");
         server.getHtml("/", req -> html);
@@ -112,7 +154,9 @@ public class MiniGoogleApp {
                     return JsonSerializer.toJson(new SearchResponse(0, 0, List.of()));
                 }
                 long start = System.currentTimeMillis();
-                SearchResponse response = executeSearch(request.query().trim(), request.pageSize());
+                int topK = config.getInt("search.topK", 20);
+                int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
+                SearchResponse response = executeSearch(request.query().trim(), pageSize);
                 long elapsed = System.currentTimeMillis() - start;
                 return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(), response.results(), response.didYouMean()));
             } catch (Exception e) {
@@ -183,6 +227,60 @@ public class MiniGoogleApp {
             }
         });
 
+        // Knowledge graph entities
+        server.getWithContentType("/api/v1/entities", "application/json", req -> {
+            try {
+                String q = req.replaceAll("^.*[?&]q=", "").replaceAll("&.*$", "");
+                q = java.net.URLDecoder.decode(q, StandardCharsets.UTF_8).trim();
+                if (knowledgeGraph == null) {
+                    return "[]";
+                }
+                List<Map.Entry<String, Integer>> rankedEntities = new ArrayList<>();
+                if (q.isEmpty()) {
+                    for (String entity : knowledgeGraph.entities()) {
+                        rankedEntities.add(Map.entry(entity, knowledgeGraph.documentCount(entity)));
+                    }
+                    rankedEntities.sort(Map.Entry.<String, Integer>comparingByValue().reversed()
+                            .thenComparing(Map.Entry.comparingByKey()));
+                    if (rankedEntities.size() > 20) {
+                        rankedEntities = rankedEntities.subList(0, 20);
+                    }
+                } else {
+                    String lower = q.toLowerCase(Locale.ROOT);
+                    for (String entity : knowledgeGraph.entities()) {
+                        if (entity.toLowerCase(Locale.ROOT).contains(lower)) {
+                            rankedEntities.add(Map.entry(entity, knowledgeGraph.documentCount(entity)));
+                        }
+                    }
+                    rankedEntities.sort(Map.Entry.<String, Integer>comparingByValue().reversed()
+                            .thenComparing(Map.Entry.comparingByKey()));
+                    if (rankedEntities.size() > 5) {
+                        rankedEntities = rankedEntities.subList(0, 5);
+                    }
+                }
+                StringBuilder sb = new StringBuilder("[");
+                for (int i = 0; i < rankedEntities.size(); i++) {
+                    if (i > 0) sb.append(",");
+                    String entity = rankedEntities.get(i).getKey().replace("\"", "\\\"");
+                    sb.append("{\"entity\":\"").append(entity)
+                      .append("\",\"count\":").append(rankedEntities.get(i).getValue())
+                      .append(",\"related\":[");
+                    List<KnowledgeGraph.RelatedEntity> related = knowledgeGraph.relatedEntities(rankedEntities.get(i).getKey());
+                    for (int j = 0; j < related.size(); j++) {
+                        if (j > 0) sb.append(",");
+                        KnowledgeGraph.RelatedEntity rel = related.get(j);
+                        sb.append("{\"entity\":\"").append(rel.entity().replace("\"", "\\\""))
+                          .append("\",\"score\":").append(rel.weight()).append("}");
+                    }
+                    sb.append("]}");
+                }
+                sb.append("]");
+                return sb.toString();
+            } catch (Exception e) {
+                return "[]";
+            }
+        });
+
         // Crawl endpoint: fetch a URL and add to index
         server.post("/api/v1/crawl", body -> {
             try {
@@ -221,7 +319,92 @@ public class MiniGoogleApp {
         });
 
         server.start();
+
+        if ("SEARCH".equals(nodeType)) {
+            registerWithCluster(port);
+        }
+
         Thread.currentThread().join();
+    }
+
+    /**
+     * Starts the node as a cluster coordinator (search gateway). It does not
+     * build a local index; instead it fans search queries out to the online
+     * index nodes tracked by the cluster registry and merges their results.
+     */
+    private void startCoordinatorNode(int port) throws Exception {
+        int clusterPort = config.getInt("cluster.port", 8081);
+        String coordinatorUrl = config.get("cluster.coordinatorUrl", "");
+        if (coordinatorUrl.isBlank()) {
+            coordinatorUrl = "http://localhost:" + clusterPort;
+        }
+
+        ClusterCoordinator clusterCoordinator = new ClusterCoordinator(clusterPort);
+        clusterCoordinator.start();
+        SearchCoordinator searchCoordinator = new SearchCoordinator(coordinatorUrl);
+
+        RestServer server = new RestServer(port);
+        String html = loadResource("/demo/index.html");
+        server.getHtml("/", req -> html);
+
+        server.post("/api/v1/search", body -> {
+            try {
+                SearchRequest request = JsonSerializer.fromJson(body, SearchRequest.class);
+                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                    return JsonSerializer.toJson(new SearchResponse(0, 0, List.of()));
+                }
+                int topK = config.getInt("search.topK", 20);
+                int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
+                long start = System.currentTimeMillis();
+                List<com.minigoogle.network.dto.SearchResult> results =
+                        searchCoordinator.search(request.query().trim(), pageSize);
+                long elapsed = System.currentTimeMillis() - start;
+                return JsonSerializer.toJson(new SearchResponse(elapsed, results.size(), results));
+            } catch (Exception e) {
+                return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+            }
+        });
+
+        server.getWithContentType("/api/v1/health", "application/json", req -> "{\"status\":\"ok\"}");
+
+        server.getWithContentType("/api/v1/cluster/state", "application/json", req -> {
+            try {
+                return JsonSerializer.toJson(clusterCoordinator.getState());
+            } catch (Exception e) {
+                return "{\"error\":\"" + e.getMessage() + "\"}";
+            }
+        });
+
+        server.start();
+        System.out.println("Cluster registry listening on http://localhost:" + clusterCoordinator.getPort());
+        System.out.println("Coordinator gateway on http://localhost:" + port);
+    }
+
+    /**
+     * Registers this index node with the cluster coordinator and starts
+     * sending heartbeats so it stays marked ONLINE.
+     */
+    private void registerWithCluster(int port) {
+        String coordinatorUrl = config.get("cluster.coordinatorUrl", "");
+        if (coordinatorUrl.isBlank()) {
+            coordinatorUrl = "http://localhost:" + config.getInt("cluster.port", 8081);
+        }
+        String nodeId = config.get("cluster.nodeId", "node-" + port);
+        String advertisedHost = config.get("cluster.advertisedHost", "localhost");
+
+        RestClient client = new RestClient();
+        NodeInfo info = new NodeInfo(nodeId, advertisedHost, port, NodeRole.INDEX, NodeStatus.ONLINE,
+                System.currentTimeMillis());
+        try {
+            client.post(coordinatorUrl + "/register", JsonSerializer.toJson(info));
+            System.out.println("[SearchNode] Registered with coordinator at " + coordinatorUrl
+                    + " as " + nodeId + " (" + advertisedHost + ":" + port + ")");
+        } catch (Exception e) {
+            System.err.println("[SearchNode] Failed to register with coordinator: " + e.getMessage());
+        }
+
+        HeartbeatManager heartbeats = new HeartbeatManager(coordinatorUrl, nodeId, client);
+        heartbeats.start(5000);
     }
 
     /**
@@ -229,6 +412,15 @@ public class MiniGoogleApp {
      * supporting structures from the current allDocs list.
      */
     private void reindex() throws IOException {
+        // Release the previous memory-mapped postings file BEFORE rewriting it,
+        // otherwise Windows refuses to truncate a file with a mapped section open.
+        if (mmapIndex != null) {
+            mmapIndex.close();
+            mmapIndex = null;
+            System.gc();
+            System.runFinalization();
+        }
+
         builder = new IndexBuilder();
         for (ParsedDocument doc : allDocs) {
             builder.processDocument(doc);
@@ -271,8 +463,27 @@ public class MiniGoogleApp {
             autocomplete.addWord(word);
         }
 
-        queryExpander = new QueryExpander();
-        reranker = new CrossEncoderRanker();
+        queryExpander = buildQueryExpander();
+
+        // Build the semantic vector index from real document content. Documents
+        // that share vocabulary map to nearby vectors via feature hashing.
+        boolean semanticEnabled = config.getBoolean("semantic.enabled", true);
+        if (semanticEnabled) {
+            int embeddingDim = config.getInt("semantic.dimension", 128);
+            double semanticWeight = config.getDouble("semantic.weight", 0.3);
+            embeddingGenerator = new EmbeddingGenerator(embeddingDim);
+            vectorIndex = new VectorIndex(embeddingDim);
+            for (int i = 0; i < allDocs.size(); i++) {
+                ParsedDocument doc = allDocs.get(i);
+                String content = doc.title() + " " + doc.text();
+                vectorIndex.add(i + 1, embeddingGenerator.embed(content), doc.title());
+            }
+            reranker = new CrossEncoderRanker(vectorIndex, embeddingGenerator, semanticWeight);
+        } else {
+            vectorIndex = null;
+            embeddingGenerator = null;
+            reranker = new CrossEncoderRanker();
+        }
         queryCache.clear();
 
         List<IndexedDocument> indexedDocs = new DocumentReader().read(indexPath.resolve("documents.bin"));
@@ -305,12 +516,12 @@ public class MiniGoogleApp {
                 }
             }
         }
-        Map<Integer, Double> pageRankScores = new PageRankCalculator().compute(graph);
+        Map<Integer, Double> pageRank = new PageRankCalculator().compute(graph);
 
-        Map<Integer, String> docUrls = new HashMap<>();
-        Map<Integer, String> docTitles = new HashMap<>();
-        Map<Integer, String> docBodies = new HashMap<>();
-        Map<Integer, Integer> docLengths = new HashMap<>();
+        docUrls = new HashMap<>();
+        docTitles = new HashMap<>();
+        docBodies = new HashMap<>();
+        docLengths = new HashMap<>();
 
         for (Map.Entry<Integer, IndexedDocument> e : docIdToIndexed.entrySet()) {
             int id = e.getKey();
@@ -325,22 +536,56 @@ public class MiniGoogleApp {
         BM25Parameters bm25Params = BM25Parameters.withDefaults(
             metadata.documentCount(), metadata.averageDocumentLength()
         );
+        pageRankScores = pageRank;
         ranking = new RankingPipeline(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths);
+
+        boolean knowledgeEnabled = config.getBoolean("semantic.knowledge.enabled", true);
+        if (knowledgeEnabled) {
+            int maxEntitiesPerDoc = config.getInt("semantic.knowledge.maxEntitiesPerDoc", 10);
+            int maxRelated = config.getInt("semantic.knowledge.maxRelated", 8);
+            EntityExtractor extractor = new EntityExtractor(maxEntitiesPerDoc);
+            KnowledgeGraph kg = new KnowledgeGraph(maxRelated);
+            for (Map.Entry<Integer, ParsedDocument> e : docIdToParsed.entrySet()) {
+                ParsedDocument parsed = e.getValue();
+                kg.addDocument(e.getKey(), extractor.extract(parsed.title(), parsed.text()));
+            }
+            knowledgeGraph = kg;
+        } else {
+            knowledgeGraph = null;
+        }
+    }
+
+    /**
+     * Builds the query expander, preferring a corpus-derived PMI thesaurus when
+     * corpus-based expansion is enabled.
+     */
+    private QueryExpander buildQueryExpander() {
+        boolean expansionEnabled = config.getBoolean("semantic.expansion.enabled", true);
+        if (!expansionEnabled) {
+            return new QueryExpander();
+        }
+        int windowSize = config.getInt("semantic.expansion.windowSize", 10);
+        double pmiThreshold = config.getDouble("semantic.expansion.pmiThreshold", 1.0);
+        int maxNeighbors = config.getInt("semantic.expansion.maxNeighbors", 5);
+        SynonymGraph thesaurus = new PmiThesaurusBuilder(windowSize, pmiThreshold, maxNeighbors).build(allDocs);
+        return new QueryExpander(thesaurus);
     }
 
     private SearchResponse executeSearch(String query, int pageSize) {
         // Check cache
         List<com.minigoogle.network.dto.SearchResult> cachedResults = queryCache.get(query.toLowerCase().strip());
         if (cachedResults != null) {
-            analytics.recordQuery(query, cachedResults.size(), 0);
+            eventBus.publish(new QueryExecutedEvent(query, cachedResults.size(), 0, true));
             return new SearchResponse(0, cachedResults.size(), cachedResults);
         }
 
         long start = System.currentTimeMillis();
 
-        // Expand query with synonyms
+        // Expand query with synonyms. Expansions are OR-ed with the original
+        // terms so a single-word query (e.g. "text") is not turned into an
+        // AND query that requires every expanded term to match.
         List<String> expandedTerms = queryExpander.expand(query, 4);
-        String expandedQuery = String.join(" ", expandedTerms);
+        String expandedQuery = String.join(" OR ", expandedTerms);
 
         // Parse and execute query
         List<Token> tokens = lexer.tokenize(expandedQuery);
@@ -377,8 +622,11 @@ public class MiniGoogleApp {
             }
         }
 
-        if (results.getPostings().isEmpty()) {
-            analytics.recordQuery(query, 0, System.currentTimeMillis() - start);
+        boolean hybridEnabled = config.getBoolean("semantic.hybrid.enabled", true)
+                && vectorIndex != null && embeddingGenerator != null;
+
+        if (results.getPostings().isEmpty() && !hybridEnabled) {
+            eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
             return new SearchResponse(0, 0, List.of(), didYouMean);
         }
 
@@ -410,7 +658,49 @@ public class MiniGoogleApp {
             .filter(t -> !t.isEmpty())
             .collect(Collectors.toList());
 
-        List<RankedDocument> ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
+        List<RankedDocument> ranked;
+        if (results.getPostings().isEmpty()) {
+            // No lexical matches; rely on semantic recall below.
+            ranked = new ArrayList<>();
+        } else {
+            ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
+        }
+
+        // Hybrid recall: merge lexical candidates with semantically-similar
+        // documents (which may share no lexical terms with the query) using the
+        // normalized score blend from the retrieval pipeline.
+        if (hybridEnabled) {
+            int fetchK = config.getInt("semantic.hybrid.fetchK", 60);
+            double lexicalWeight = config.getDouble("semantic.hybrid.lexicalWeight", 0.5);
+
+            List<VectorIndex.VectorResult> lexical = ranked.stream()
+                    .map(r -> new VectorIndex.VectorResult(r.documentId(), r.finalScore(), r.title()))
+                    .collect(Collectors.toList());
+
+            double[] queryVector = embeddingGenerator.embed(query);
+            List<VectorIndex.VectorResult> semantic = vectorIndex.search(queryVector, fetchK);
+
+            int topK = Math.max(pageSize, ranked.size());
+            List<VectorIndex.VectorResult> merged = RetrievalPipeline.mergeResults(
+                    lexical, semantic, topK, lexicalWeight);
+
+            Map<Integer, RankedDocument> byId = ranked.stream()
+                    .collect(Collectors.toMap(RankedDocument::documentId, r -> r));
+            ranked = new ArrayList<>();
+            for (VectorIndex.VectorResult r : merged) {
+                RankedDocument existing = byId.get(r.id());
+                if (existing != null) {
+                    ranked.add(new RankedDocument(
+                            existing.documentId(), existing.url(), existing.title(),
+                            existing.bm25Score(), existing.pageRankScore(), r.score(), existing.snippet()));
+                } else {
+                    String url = docUrls.getOrDefault(r.id(), "");
+                    String title = docTitles.getOrDefault(r.id(), r.metadata());
+                    ranked.add(new RankedDocument(
+                            r.id(), url, title, 0.0, 0.0, r.score(), snippetFor(r.id())));
+                }
+            }
+        }
 
         // Re-rank with cross-encoder
         ranked = reranker.rerank(query, ranked);
@@ -426,7 +716,7 @@ public class MiniGoogleApp {
 
         // Cache and record analytics
         queryCache.put(query.toLowerCase().strip(), dtoResults);
-        analytics.recordQuery(query, dtoResults.size(), elapsed);
+        eventBus.publish(new QueryExecutedEvent(query, dtoResults.size(), elapsed, false));
 
         return new SearchResponse(elapsed, dtoResults.size(), dtoResults, didYouMean);
     }
@@ -436,6 +726,15 @@ public class MiniGoogleApp {
             if (is == null) throw new IOException("Resource not found: " + resourcePath);
             return new String(is.readAllBytes(), StandardCharsets.UTF_8);
         }
+    }
+
+    private String snippetFor(int docId) {
+        String body = docBodies.getOrDefault(docId, "");
+        if (body == null || body.isEmpty()) {
+            return docTitles.getOrDefault(docId, "");
+        }
+        String cleaned = body.replaceAll("\\s+", " ").trim();
+        return cleaned.length() > 160 ? cleaned.substring(0, 160) : cleaned;
     }
 
     private void printBanner() {

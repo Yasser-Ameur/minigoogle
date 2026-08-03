@@ -1,6 +1,6 @@
 package com.minigoogle.semantic;
 
-import java.util.Random;
+import java.util.Locale;
 
 /**
  * Generates dense vector embeddings for documents and queries.
@@ -11,16 +11,17 @@ import java.util.Random;
  *   in a shared embedding space.
  *
  * In production, this would use a trained model (e.g. sentence-transformers).
- * This implementation provides a simulated embedding for architecture validation.
+ * This implementation is a real, dependency-free content embedding: it uses
+ * feature hashing over the tokenized text (a "hashing trick" with sign
+ * hashing) so that documents sharing vocabulary land close together, then
+ * L2-normalizes the result. It is fully deterministic for a given text.
  */
 public class EmbeddingGenerator {
 
     private final int dimension;
-    private final Random random;
 
     public EmbeddingGenerator(int dimension) {
         this.dimension = dimension;
-        this.random = new Random(42); // Fixed seed for reproducibility
     }
 
     public EmbeddingGenerator() {
@@ -34,25 +35,21 @@ public class EmbeddingGenerator {
      * @return A dense vector of the configured dimension.
      */
     public double[] embed(String text) {
-        if (text == null || text.isEmpty()) {
+        if (text == null || text.isBlank()) {
             return new double[dimension];
         }
-        // Deterministic: use text hash as seed for reproducible embeddings
-        Random textRandom = new Random(text.hashCode());
         double[] vector = new double[dimension];
-        double norm = 0;
-        for (int i = 0; i < dimension; i++) {
-            vector[i] = textRandom.nextGaussian();
-            norm += vector[i] * vector[i];
-        }
-        // L2 normalize
-        norm = Math.sqrt(norm);
-        if (norm > 0) {
-            for (int i = 0; i < dimension; i++) {
-                vector[i] /= norm;
+        String normalized = text.toLowerCase(Locale.ROOT);
+        for (String token : normalized.split("[^a-z0-9]+")) {
+            if (token.isEmpty()) {
+                continue;
             }
+            int hash = token.hashCode();
+            int bucket = (hash & Integer.MAX_VALUE) % dimension;
+            double sign = ((hash >>> 16) & 1) == 0 ? 1.0 : -1.0;
+            vector[bucket] += sign;
         }
-        return vector;
+        return l2Normalize(vector);
     }
 
     /**
@@ -64,6 +61,21 @@ public class EmbeddingGenerator {
             embeddings[i] = embed(texts[i]);
         }
         return embeddings;
+    }
+
+    private double[] l2Normalize(double[] vector) {
+        double normSq = 0;
+        for (double v : vector) {
+            normSq += v * v;
+        }
+        if (normSq == 0) {
+            return vector;
+        }
+        double norm = Math.sqrt(normSq);
+        for (int i = 0; i < vector.length; i++) {
+            vector[i] /= norm;
+        }
+        return vector;
     }
 
     /**
