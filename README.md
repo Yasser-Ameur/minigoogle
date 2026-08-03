@@ -93,7 +93,7 @@ cd minigoogle
 ./gradlew build -x test
 
 # Run
-java -jar build/libs/mini-google-unspecified.jar
+java -jar build/libs/mini-google.jar
 ```
 
 Open **http://localhost:8080** — you'll get a Google-style search UI with autocomplete, spell correction, and analytics.

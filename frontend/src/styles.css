@@ -1,0 +1,76 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: Arial, sans-serif;
+  background: #fff;
+  color: #202124;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+#root { display: flex; flex-direction: column; min-height: 100vh; flex: 1; }
+
+.center { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.home { padding-top: 14vh; }
+
+.search-box { width: 584px; max-width: 90vw; position: relative; }
+
+.buttons { margin-top: 28px; display: flex; gap: 12px; }
+.buttons button {
+  padding: 10px 20px; border: 1px solid #dfe1e5; border-radius: 4px;
+  background: #f8f9fa; font-size: 14px; cursor: pointer; color: #3c4043;
+}
+.buttons button:hover { border-color: #c0c0c0; box-shadow: 0 1px 2px rgba(0,0,0,.1); }
+
+.add-url { margin-top: 20px; display: flex; gap: 8px; align-items: center; }
+.add-url input {
+  padding: 8px 14px; border: 1px solid #dfe1e5; border-radius: 4px;
+  font-size: 13px; width: 360px; max-width: 70vw; outline: none;
+}
+.add-url input:focus { border-color: #4285f4; }
+.add-url button {
+  padding: 8px 16px; border: none; border-radius: 4px;
+  background: #4285f4; color: #fff; font-size: 13px; cursor: pointer;
+}
+.add-url button:hover { background: #3367d6; }
+.add-url .status { font-size: 12px; color: #70757a; margin-left: 8px; }
+
+.index-stats { margin-top: 28px; display: flex; gap: 24px; color: #70757a; font-size: 13px; }
+.index-stats .stat { text-align: center; }
+.index-stats .stat-val { font-size: 20px; font-weight: bold; color: #4285f4; }
+
+.results-page { display: flex; padding: 0; flex: 1; flex-direction: column; min-height: 0; }
+.results-page .top-bar {
+  display: flex; align-items: center; padding: 12px 20px;
+  border-bottom: 1px solid #dfe1e5; gap: 24px;
+}
+.results-page .search-box { width: 100%; max-width: 600px; }
+.results-page .search-input { padding: 10px 44px 10px 14px; font-size: 14px; }
+
+.results-stats { padding: 8px 20px 0 176px; color: #70757a; font-size: 13px; }
+.did-you-mean { padding: 4px 20px 0 176px; color: #4285f4; font-size: 14px; cursor: pointer; }
+.did-you-mean:hover { text-decoration: underline; }
+.result { padding: 8px 20px 8px 176px; max-width: 700px; }
+.result .url { font-size: 13px; color: #202124; margin-bottom: 2px; }
+.result .title { font-size: 18px; }
+.result .title a { color: #1a0dab; text-decoration: none; }
+.result .title a:hover { text-decoration: underline; }
+.result .snippet { font-size: 14px; color: #4d5156; line-height: 1.5; margin-top: 4px; }
+.result .snippet b { font-weight: 700; }
+.result .score { font-size: 12px; color: #70757a; margin-top: 2px; }
+
+.no-results { padding: 40px 176px; color: #70757a; font-size: 16px; }
+.loading { padding: 20px 176px; color: #70757a; }
+.loading .spinner {
+  display: inline-block; width: 20px; height: 20px; border: 2px solid #dfe1e5;
+  border-top-color: #4285f4; border-radius: 50%; animation: spin 0.6s linear infinite;
+  margin-right: 8px; vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.analytics-bar { padding: 8px 20px 8px 176px; display: flex; gap: 20px; color: #70757a; font-size: 12px; }
+.analytics-bar span { color: #4285f4; font-weight: bold; }
+
+.footer {
+  margin-top: auto; padding: 20px; text-align: center; color: #70757a; font-size: 13px;
+  border-top: 1px solid #dfe1e5;
+}
