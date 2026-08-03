@@ -25,6 +25,15 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MetricRegistry {
 
     private final Map<String, List<Metric>> store = new ConcurrentHashMap<>();
+    private final int maxEntriesPerMetric;
+
+    public MetricRegistry() {
+        this(1000);
+    }
+
+    public MetricRegistry(int maxEntriesPerMetric) {
+        this.maxEntriesPerMetric = maxEntriesPerMetric;
+    }
 
     /**
      * Records a metric value with the current timestamp.
@@ -39,6 +48,10 @@ public class MetricRegistry {
     public void record(String name, double value, Instant timestamp) {
         store.computeIfAbsent(name, k -> Collections.synchronizedList(new ArrayList<>()))
                 .add(new Metric(name, value, timestamp));
+        List<Metric> list = store.get(name);
+        while (list.size() > maxEntriesPerMetric) {
+            list.remove(0);
+        }
     }
 
     /**

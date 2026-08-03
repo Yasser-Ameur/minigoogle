@@ -5,6 +5,7 @@ import com.minigoogle.indexer.inverted.PostingList;
 import com.minigoogle.storage.postings.PostingReader;
 import com.minigoogle.storage.serialization.BinaryReader;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
@@ -43,7 +44,33 @@ public class MemoryMappedIndex implements IndexReader, AutoCloseable {
     }
 
     @Override
-    public void close() throws IOException {
-        channel.close();
+    public void close() {
+        unmap(mmap);
+        try {
+            channel.close();
+        } catch (IOException ignored) {
+            // Best effort — the mapped buffer may keep the file locked on Windows.
+        }
+    }
+
+    /**
+     * Attempts to force-unmap the buffer so the underlying file can be
+     * rewritten/removed. On Windows a mapped section keeps the file locked
+     * even after the channel is closed, so we call the direct-buffer cleaner
+     * directly. Falls back silently to GC-based reclamation when reflection
+     * is not permitted (e.g. missing --add-opens).
+     */
+    private static void unmap(MappedByteBuffer buffer) {
+        if (buffer == null) return;
+        try {
+            Method cleanerMethod = Class.forName("sun.nio.ch.DirectBuffer").getMethod("cleaner");
+            cleanerMethod.setAccessible(true);
+            Object cleaner = cleanerMethod.invoke(buffer);
+            if (cleaner != null) {
+                cleaner.getClass().getMethod("clean").invoke(cleaner);
+            }
+        } catch (Throwable ignored) {
+            // Best effort.
+        }
     }
 }

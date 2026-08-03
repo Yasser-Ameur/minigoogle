@@ -4,11 +4,16 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.minigoogle.network.http.RestServer;
 import com.minigoogle.distributed.model.NodeInfo;
+import com.minigoogle.distributed.model.NodeRole;
+import com.minigoogle.distributed.model.ShardInfo;
+import com.minigoogle.distributed.registry.ClusterState;
 import com.minigoogle.distributed.registry.NodeRegistry;
 
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The master node of the cluster.
@@ -19,6 +24,7 @@ public class ClusterCoordinator {
     private final NodeRegistry registry;
     private final RestServer server;
     private final Gson gson;
+    private final AtomicInteger nextShardId = new AtomicInteger(0);
     private final ScheduledExecutorService healthChecker;
 
     public ClusterCoordinator(int port) {
@@ -41,6 +47,13 @@ public class ClusterCoordinator {
         server.post("/register", body -> {
             NodeInfo node = gson.fromJson(body, NodeInfo.class);
             registry.register(node);
+            // Auto-assign a shard to each index node that doesn't own one yet,
+            // so scatter-gather has concrete shard targets to query.
+            if (node.role() == NodeRole.INDEX && registry.getShards().stream()
+                    .noneMatch(s -> s.primaryNodeId().equals(node.nodeId()))) {
+                int shardId = nextShardId.incrementAndGet();
+                registry.registerShard(new ShardInfo(shardId, node.nodeId(), List.of()));
+            }
             return "{\"status\":\"REGISTERED\"}";
         });
 
@@ -65,6 +78,20 @@ public class ClusterCoordinator {
     public void stop() {
         healthChecker.shutdownNow();
         server.stop();
+    }
+
+    /**
+     * Returns the current cluster state (nodes + shards).
+     */
+    public ClusterState getState() {
+        return registry.getState();
+    }
+
+    /**
+     * Returns the port the cluster registry is bound to.
+     */
+    public int getPort() {
+        return server.getPort();
     }
 
     // DTO for heartbeat

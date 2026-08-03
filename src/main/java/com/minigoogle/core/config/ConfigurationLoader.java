@@ -26,7 +26,8 @@ public final class ConfigurationLoader {
             Configuration fileConfig = new Configuration(fileProps);
             Configuration envConfig = fromEnvironmentVariables();
             Configuration defaults = withDefaults();
-            return merge(merge(defaults, fileConfig), envConfig);
+            // Precedence: environment > file > defaults
+            return merge(envConfig, merge(fileConfig, defaults));
         } catch (IOException e) {
             logger.error("Failed to load configuration from {}: {}", filePath, e.getMessage());
             return withDefaults();
@@ -38,7 +39,11 @@ public final class ConfigurationLoader {
         putIfEnv(props, "MINIGOGLE_NODE_TYPE", "node.type");
         putIfEnv(props, "MINIGOGLE_NODE_PORT", "server.port");
         putIfEnv(props, "MINIGOGLE_NODE_HOST", "server.host");
+        putIfEnv(props, "MINIGOGLE_NODE_ID", "cluster.nodeId");
+        putIfEnv(props, "MINIGOGLE_INDEX_DIR", "indexing.indexDir");
         putIfEnv(props, "MINIGOGLE_CLUSTER_PEERS", "cluster.peers");
+        putIfEnv(props, "MINIGOGLE_CLUSTER_PORT", "cluster.port");
+        putIfEnv(props, "MINIGOGLE_CLUSTER_COORDINATOR_URL", "cluster.coordinatorUrl");
         putIfEnv(props, "MINIGOGLE_REPLICATION_FACTOR", "cluster.replicationFactor");
         putIfEnv(props, "MINIGOGLE_LOG_LEVEL", "logging.level");
         putIfEnv(props, "NODE_TYPE", "node.type");
@@ -48,11 +53,14 @@ public final class ConfigurationLoader {
 
     public static Configuration withDefaults() {
         Map<String, String> defaults = new HashMap<>();
+        defaults.put("node.type", "STANDALONE");
         defaults.put("server.port", "8080");
         defaults.put("server.host", "0.0.0.0");
         defaults.put("cluster.replicationFactor", "3");
         defaults.put("cluster.nodeTimeout", "30000");
         defaults.put("cluster.gossipInterval", "1000");
+        defaults.put("cluster.port", "8081");
+        defaults.put("cluster.advertisedHost", "localhost");
         defaults.put("crawler.workers", "32");
         defaults.put("crawler.maxDepth", "5");
         defaults.put("crawler.politenessDelay", "1000");

@@ -9,14 +9,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Manages the active cluster state, including registered nodes and heartbeats.
+ * Manages the active cluster state, including registered nodes, shards,
+ * and heartbeats.
  */
 public class NodeRegistry {
 
     private final Map<String, NodeInfo> nodes = new ConcurrentHashMap<>();
-    private final List<ShardInfo> shards = new ArrayList<>(); // Stub for now
+    private final List<ShardInfo> shards = new CopyOnWriteArrayList<>();
     private final long timeoutMillis;
 
     public NodeRegistry(long timeoutMillis) {
@@ -63,10 +65,34 @@ public class NodeRegistry {
     }
 
     /**
+     * Registers a shard, replacing any existing shard with the same ID.
+     */
+    public void registerShard(ShardInfo shard) {
+        shards.removeIf(s -> s.shardId() == shard.shardId());
+        shards.add(shard);
+    }
+
+    /**
+     * Registers multiple shards at once.
+     */
+    public void registerShards(List<ShardInfo> newShards) {
+        for (ShardInfo shard : newShards) {
+            registerShard(shard);
+        }
+    }
+
+    /**
+     * Returns a snapshot of the registered shards.
+     */
+    public List<ShardInfo> getShards() {
+        return new ArrayList<>(shards);
+    }
+
+    /**
      * Returns a snapshot of the current cluster state.
      */
     public ClusterState getState() {
-        return new ClusterState(new ArrayList<>(nodes.values()), new ArrayList<>(shards));
+        return new ClusterState(new ArrayList<>(nodes.values()), getShards());
     }
 
     /**

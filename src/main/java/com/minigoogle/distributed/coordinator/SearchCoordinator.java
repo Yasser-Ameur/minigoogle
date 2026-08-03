@@ -1,34 +1,42 @@
 package com.minigoogle.distributed.coordinator;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.minigoogle.distributed.balancing.LoadBalancer;
-import com.minigoogle.network.http.RestClient;
 import com.minigoogle.distributed.model.NodeInfo;
 import com.minigoogle.distributed.model.NodeRole;
 import com.minigoogle.distributed.model.NodeStatus;
 import com.minigoogle.distributed.model.ShardInfo;
 import com.minigoogle.distributed.registry.ClusterState;
-import com.minigoogle.ranking.model.RankedDocument;
+import com.minigoogle.network.dto.SearchRequest;
+import com.minigoogle.network.dto.SearchResponse;
+import com.minigoogle.network.dto.SearchResult;
+import com.minigoogle.network.http.RestClient;
+import com.minigoogle.network.serialization.JsonSerializer;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
 
 /**
  * Orchestrates distributed search requests using the Scatter-Gather pattern.
+ *
+ * Fetches the current cluster state from the ClusterCoordinator, fans the
+ * query out to every online index node over the standard {@code POST
+ * /api/v1/search} protocol, then merges the per-node results into a global
+ * top-K ranked list.
  */
 public class SearchCoordinator {
 
     private final RestClient client;
-    private final Gson gson;
     private final String clusterCoordinatorUrl;
-    private final LoadBalancer loadBalancer;
 
     public SearchCoordinator(String clusterCoordinatorUrl) {
         this.client = new RestClient();
-        this.gson = new GsonBuilder().create();
         this.clusterCoordinatorUrl = clusterCoordinatorUrl;
-        this.loadBalancer = new LoadBalancer();
     }
 
     /**
@@ -38,26 +46,31 @@ public class SearchCoordinator {
      * @param topK  The number of results to return.
      * @return List of globally ranked top K results.
      */
-    public List<RankedDocument> search(String query, int topK) {
+    public List<SearchResult> search(String query, int topK) {
         // 1. Fetch current cluster state
         ClusterState state = getClusterState();
-        if (state == null || state.nodes().isEmpty() || state.shards().isEmpty()) {
+        if (state == null) {
             return List.of();
         }
 
-        // 2. Determine target nodes (one replica per shard)
-        Map<Integer, String> targetNodesByShard = selectTargets(state);
+        // 2. Determine target nodes (one replica per shard, else every online index node)
+        List<NodeInfo> targets = selectTargets(state);
+        if (targets.isEmpty()) {
+            return List.of();
+        }
 
         // 3. Scatter: Send query to all target nodes asynchronously
-        List<CompletableFuture<List<RankedDocument>>> futures = new ArrayList<>();
-        SearchRequest request = new SearchRequest(query, topK);
-        String requestJson = gson.toJson(request);
+        String requestJson = JsonSerializer.toJson(new SearchRequest(query, 1, topK));
+        List<CompletableFuture<List<SearchResult>>> futures = new ArrayList<>();
 
-        for (String targetUrl : targetNodesByShard.values()) {
-            CompletableFuture<List<RankedDocument>> future = client.postAsync(targetUrl + "/query", requestJson)
-                    .thenApply(response -> {
-                        SearchResponse resp = gson.fromJson(response, SearchResponse.class);
-                        return resp != null && resp.results != null ? resp.results : List.<RankedDocument>of();
+        for (NodeInfo node : targets) {
+            String url = "http://" + node.host() + ":" + node.port() + "/api/v1/search";
+            CompletableFuture<List<SearchResult>> future = client.postAsync(url, requestJson)
+                    .thenApply(body -> {
+                        SearchResponse resp = JsonSerializer.fromJson(body, SearchResponse.class);
+                        return resp != null && resp.results() != null
+                                ? resp.results()
+                                : List.<SearchResult>of();
                     })
                     .exceptionally(ex -> {
                         System.err.println("Shard query failed: " + ex.getMessage());
@@ -69,24 +82,24 @@ public class SearchCoordinator {
         // 4. Gather: Wait for all responses
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
-        // 5. Merge: Use a max-heap to find the global Top K
-        PriorityQueue<RankedDocument> heap = new PriorityQueue<>();
-        for (CompletableFuture<List<RankedDocument>> f : futures) {
+        // 5. Merge: Use a min-heap to find the global Top K
+        PriorityQueue<SearchResult> heap = new PriorityQueue<>(
+                Comparator.comparingDouble(SearchResult::score));
+        for (CompletableFuture<List<SearchResult>> f : futures) {
             try {
-                List<RankedDocument> shardResults = f.get();
-                for (RankedDocument doc : shardResults) {
-                    heap.offer(doc);
+                for (SearchResult result : f.get()) {
+                    heap.offer(result);
                     if (heap.size() > topK) {
                         heap.poll();
                     }
                 }
-            } catch (Exception e) {
-                // Ignore, handled in exceptionally block
+            } catch (Exception ignored) {
+                // Failures are already handled in the exceptionally block
             }
         }
 
         // Extract and sort results (highest score first)
-        List<RankedDocument> finalResults = new ArrayList<>();
+        List<SearchResult> finalResults = new ArrayList<>();
         while (!heap.isEmpty()) {
             finalResults.add(heap.poll());
         }
@@ -97,56 +110,43 @@ public class SearchCoordinator {
     private ClusterState getClusterState() {
         try {
             String json = client.get(clusterCoordinatorUrl + "/state");
-            return gson.fromJson(json, ClusterState.class);
+            return JsonSerializer.fromJson(json, ClusterState.class);
         } catch (Exception e) {
-            System.err.println("Failed to get cluster state: " + e.getMessage());
+            System.err.println("Failed to get cluster state from " + clusterCoordinatorUrl + "/state: " + e.getMessage());
+            e.printStackTrace();
             return null;
         }
     }
 
-    private Map<Integer, String> selectTargets(ClusterState state) {
-        Map<String, NodeInfo> nodeMap = new HashMap<>();
+    private List<NodeInfo> selectTargets(ClusterState state) {
+        Map<String, NodeInfo> onlineIndexNodes = new HashMap<>();
         for (NodeInfo node : state.nodes()) {
             if (node.status() == NodeStatus.ONLINE && node.role() == NodeRole.INDEX) {
-                nodeMap.put(node.nodeId(), node);
+                onlineIndexNodes.put(node.nodeId(), node);
             }
         }
 
-        Map<Integer, String> targets = new HashMap<>();
+        // Prefer one node per shard (primary, else first online replica).
+        Map<String, NodeInfo> selected = new LinkedHashMap<>();
         for (ShardInfo shard : state.shards()) {
-            List<String> candidates = new ArrayList<>();
-            if (nodeMap.containsKey(shard.primaryNodeId())) {
-                candidates.add(shard.primaryNodeId());
-            }
-            if (shard.replicaNodeIds() != null) {
+            NodeInfo primary = onlineIndexNodes.get(shard.primaryNodeId());
+            if (primary != null) {
+                selected.putIfAbsent(shard.primaryNodeId(), primary);
+            } else if (shard.replicaNodeIds() != null) {
                 for (String replica : shard.replicaNodeIds()) {
-                    if (nodeMap.containsKey(replica)) {
-                        candidates.add(replica);
+                    NodeInfo replicaNode = onlineIndexNodes.get(replica);
+                    if (replicaNode != null) {
+                        selected.putIfAbsent(replica, replicaNode);
+                        break;
                     }
                 }
             }
-
-            String selectedNodeId = loadBalancer.nextNode(candidates);
-            if (selectedNodeId != null) {
-                NodeInfo info = nodeMap.get(selectedNodeId);
-                targets.put(shard.shardId(), "http://" + info.host() + ":" + info.port());
-            }
         }
-        return targets;
-    }
 
-    // DTOs
-    private static class SearchRequest {
-        String query;
-        int topK;
-
-        public SearchRequest(String query, int topK) {
-            this.query = query;
-            this.topK = topK;
+        // Fallback: with no shard metadata, query every online index node.
+        if (selected.isEmpty()) {
+            return new ArrayList<>(onlineIndexNodes.values());
         }
-    }
-
-    private static class SearchResponse {
-        List<RankedDocument> results;
+        return new ArrayList<>(selected.values());
     }
 }

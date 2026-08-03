@@ -8,7 +8,12 @@ metadata:
     app.kubernetes.io/name: minigoogle
     app.kubernetes.io/part-of: minigoogle
 data:
-  server.port: "8080"
-  cluster.replicationFactor: "3"
-  crawler.workers: "32"
-  search.topK: "20"
+  # Consumed via envFrom configMapRef in the deployments. Keys must be the
+  # env-var names read by ConfigurationLoader.fromEnvironmentVariables()
+  # (MINIGOGLE_* / NODE_*) — dotted keys are neither valid env names nor parsed.
+  MINIGOGLE_NODE_HOST: "0.0.0.0"
+  MINIGOGLE_NODE_PORT: "8080"
+  MINIGOGLE_CLUSTER_PORT: "8081"
+  MINIGOGLE_REPLICATION_FACTOR: "3"
+  MINIGOGLE_LOG_LEVEL: "INFO"
+  NODE_PORT: "8080"

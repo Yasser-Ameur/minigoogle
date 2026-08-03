@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: minigoogle-crawler
-          image: ghcr.io/your-org/mini-google:latest
+          image: ghcr.io/Yasser-Ameur-Dev/distributed-search-engine:latest
           ports:
             - containerPort: 8080
               protocol: TCP
