@@ -30,7 +30,12 @@ public class RestServer {
                 exchange.sendResponseHeaders(405, -1);
                 return;
             }
-            handleExchange(exchange, handler);
+            try (InputStream is = exchange.getRequestBody()) {
+                String requestBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                handleExchange(exchange, handler, requestBody);
+            } catch (Exception e) {
+                sendError(exchange, e);
+            }
         });
     }
 
@@ -40,14 +45,20 @@ public class RestServer {
                 exchange.sendResponseHeaders(405, -1);
                 return;
             }
-            handleExchange(exchange, handler);
+            handleExchange(exchange, handler, exchange.getRequestURI().toString());
         });
     }
 
-    private void handleExchange(HttpExchange exchange, Function<String, String> handler) throws IOException {
-        try (InputStream is = exchange.getRequestBody()) {
-            String requestBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-            String responseBody = handler.apply(requestBody);
+    /**
+     * Handles a request by invoking the handler with the given input.
+     *
+     * <p>GET handlers receive the full request URI (including any {@code ?key=value}
+     * query string), since GET requests carry no body. POST handlers receive the
+     * request body as a string.</p>
+     */
+    private void handleExchange(HttpExchange exchange, Function<String, String> handler, String requestInput) {
+        try {
+            String responseBody = handler.apply(requestInput);
 
             byte[] responseBytes = responseBody.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -57,6 +68,12 @@ public class RestServer {
                 os.write(responseBytes);
             }
         } catch (Exception e) {
+            sendError(exchange, e);
+        }
+    }
+
+    private void sendError(HttpExchange exchange, Exception e) {
+        try {
             e.printStackTrace();
             String error = "{\"error\":\"" + e.getMessage() + "\"}";
             byte[] responseBytes = error.getBytes(StandardCharsets.UTF_8);
@@ -64,6 +81,8 @@ public class RestServer {
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(responseBytes);
             }
+        } catch (IOException ignored) {
+            // Client already gone; nothing more we can do.
         }
     }
 
@@ -77,9 +96,8 @@ public class RestServer {
                 exchange.sendResponseHeaders(405, -1);
                 return;
             }
-            try (InputStream is = exchange.getRequestBody()) {
-                String requestBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-                String responseBody = handler.apply(requestBody);
+            try {
+                String responseBody = handler.apply(exchange.getRequestURI().toString());
 
                 byte[] responseBytes = responseBody.getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().set("Content-Type", contentType);
@@ -89,13 +107,7 @@ public class RestServer {
                     os.write(responseBytes);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                String error = "{\"error\":\"" + e.getMessage() + "\"}";
-                byte[] responseBytes = error.getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(500, responseBytes.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(responseBytes);
-                }
+                sendError(exchange, e);
             }
         });
     }
@@ -103,6 +115,13 @@ public class RestServer {
     public void start() {
         server.start();
         System.out.println("RestServer started on port " + server.getAddress().getPort());
+    }
+
+    /**
+     * Returns the port the server is bound to (useful when created with port 0).
+     */
+    public int getPort() {
+        return server.getAddress().getPort();
     }
 
     public void stop() {
