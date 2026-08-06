@@ -26,11 +26,13 @@ public class HttpMembershipTransport implements MembershipTransport {
     private final HttpClient httpClient;
     private final ObjectMapper mapper;
     private final String localNodeId;
+    private final String bearerToken;
 
-    public HttpMembershipTransport(NodeDirectory directory, ObjectMapper mapper, String localNodeId) {
+    public HttpMembershipTransport(NodeDirectory directory, ObjectMapper mapper, String localNodeId, String bearerToken) {
         this.directory = directory;
         this.mapper = mapper;
         this.localNodeId = localNodeId;
+        this.bearerToken = bearerToken;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(2))
                 .build();
@@ -67,6 +69,8 @@ public class HttpMembershipTransport implements MembershipTransport {
                     .uri(baseUri.resolve("/cluster/v1/gossip/exchange"))
                     .timeout(REQUEST_TIMEOUT)
                     .header("Content-Type", "application/json")
+                    .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer(bearerToken))
+                    .header(HttpAuth.NODE_ID, localNodeId)
                     .POST(HttpRequest.BodyPublishers.ofString(payload))
                     .build();
 

@@ -32,6 +32,10 @@ public class GossipHandler implements HttpHandler {
         try {
             GossipExchangeRequest req = mapper.readValue(exchange.getRequestBody(), GossipExchangeRequest.class);
             ClusterProtocol.validate(req);
+            if (!AuthFilter.authenticatedSender(exchange, req.sourceNodeId())) {
+                sendError(exchange, 403, "Forbidden: source node mismatch");
+                return;
+            }
             gossip.receiveGossip(req.sourceNodeId(), req.state());
 
             GossipExchangeResponse resp = new GossipExchangeResponse(

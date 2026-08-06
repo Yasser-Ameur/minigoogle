@@ -1,12 +1,14 @@
 package com.minigoogle.cluster.transport.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.ClusterSecurity;
 import com.minigoogle.cluster.GossipProtocol;
 import com.minigoogle.cluster.GossipProtocol.GossipNodeState;
 import com.minigoogle.cluster.GossipProtocol.NodeStatus;
 import com.minigoogle.cluster.transport.ClusterProtocol;
 import com.minigoogle.cluster.transport.dto.GossipExchangeRequest;
 import com.minigoogle.cluster.transport.dto.GossipExchangeResponse;
+import com.sun.net.httpserver.HttpContext;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,14 +30,17 @@ class GossipHandlerTest {
     private ObjectMapper mapper;
     private HttpClient client;
     private GossipProtocol gossip;
+    private ClusterSecurity security;
 
     @BeforeEach
     void setUp() throws IOException {
         mapper = new ObjectMapper();
         gossip = new GossipProtocol("local-node");
+        security = new ClusterSecurity("test-secret");
         server = HttpServer.create(new InetSocketAddress(0), 0);
         port = server.getAddress().getPort();
-        server.createContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, "local-node"));
+        HttpContext context = server.createContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, "local-node"));
+        context.getFilters().add(new AuthFilter(security));
         server.start();
         client = HttpClient.newHttpClient();
     }
@@ -52,6 +57,8 @@ class GossipHandlerTest {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(java.net.URI.create("http://localhost:" + port + "/cluster/v1/gossip/exchange"))
                 .header("Content-Type", "application/json")
+                .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer(security.deriveToken(req.sourceNodeId())))
+                .header(HttpAuth.NODE_ID, req.sourceNodeId())
                 .POST(HttpRequest.BodyPublishers.ofString(payload))
                 .build();
         return client.send(request, HttpResponse.BodyHandlers.ofString());
@@ -99,9 +106,69 @@ class GossipHandlerTest {
     void testGetMethodNotAllowed() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(java.net.URI.create("http://localhost:" + port + "/cluster/v1/gossip/exchange"))
+                .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer(security.deriveToken("peer-1")))
+                .header(HttpAuth.NODE_ID, "peer-1")
                 .GET()
                 .build();
         HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
         assertEquals(405, resp.statusCode());
+    }
+
+    @Test
+    void testUnauthenticatedRequestRejected() throws Exception {
+        GossipNodeState peerState = new GossipNodeState("peer-1", 3, NodeStatus.ALIVE, System.currentTimeMillis());
+        GossipExchangeRequest req = new GossipExchangeRequest(
+                1, "req-401", "corr-401", "peer-1", 0L, Map.of("peer-1", peerState));
+
+        String payload = mapper.writeValueAsString(req);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(java.net.URI.create("http://localhost:" + port + "/cluster/v1/gossip/exchange"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(payload))
+                .build();
+        HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(401, resp.statusCode());
+        assertFalse(gossip.getMembershipTable().containsKey("peer-1"));
+    }
+
+    @Test
+    void testInvalidTokenRejected() throws Exception {
+        GossipNodeState peerState = new GossipNodeState("peer-1", 3, NodeStatus.ALIVE, System.currentTimeMillis());
+        GossipExchangeRequest req = new GossipExchangeRequest(
+                1, "req-401b", "corr-401b", "peer-1", 0L, Map.of("peer-1", peerState));
+
+        String payload = mapper.writeValueAsString(req);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(java.net.URI.create("http://localhost:" + port + "/cluster/v1/gossip/exchange"))
+                .header("Content-Type", "application/json")
+                .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer("not-a-real-token"))
+                .header(HttpAuth.NODE_ID, "peer-1")
+                .POST(HttpRequest.BodyPublishers.ofString(payload))
+                .build();
+        HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(401, resp.statusCode());
+    }
+
+    @Test
+    void testSourceNodeMismatchRejected() throws Exception {
+        GossipNodeState peerState = new GossipNodeState("peer-1", 3, NodeStatus.ALIVE, System.currentTimeMillis());
+        // Valid token for "local-node", but the envelope claims "peer-1".
+        GossipExchangeRequest req = new GossipExchangeRequest(
+                1, "req-403", "corr-403", "peer-1", 0L, Map.of("peer-1", peerState));
+
+        String payload = mapper.writeValueAsString(req);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(java.net.URI.create("http://localhost:" + port + "/cluster/v1/gossip/exchange"))
+                .header("Content-Type", "application/json")
+                .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer(security.deriveToken("local-node")))
+                .header(HttpAuth.NODE_ID, "local-node")
+                .POST(HttpRequest.BodyPublishers.ofString(payload))
+                .build();
+        HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(403, resp.statusCode());
+        assertFalse(gossip.getMembershipTable().containsKey("peer-1"));
     }
 }

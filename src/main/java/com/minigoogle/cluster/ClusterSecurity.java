@@ -28,6 +28,19 @@ public class ClusterSecurity {
     }
 
     /**
+     * Builds a {@code ClusterSecurity} with a freshly generated random secret.
+     *
+     * <p>Intended for standalone/single-node setups and tests where the same
+     * JVM constructs both the client and the server, so the secret never needs
+     * to leave the process. Clusters must instead share one secret across nodes
+     * via the {@link #ClusterSecurity(String)} constructor.</p>
+     */
+    public static ClusterSecurity withRandomSecret() {
+        java.util.UUID uuid = java.util.UUID.randomUUID();
+        return new ClusterSecurity(uuid.toString());
+    }
+
+    /**
      * Generates a unique token for a node.
      *
      * @param nodeId The node to generate a token for.
@@ -73,6 +86,52 @@ public class ClusterSecurity {
     }
 
     /**
+     * Derives the deterministic token for a node from the shared cluster secret.
+     *
+     * <p>Every node that holds the same cluster secret derives the same token for
+     * a given node ID, so peers can authenticate each other without distributing
+     * tokens out of band. The value is stable across calls, unlike
+     * {@link #generateToken(String)} which mints a fresh token on every call.</p>
+     *
+     * @param nodeId The node the token belongs to.
+     * @return The derived bearer token for the node.
+     */
+    public String deriveToken(String nodeId) {
+        return sha256(clusterSecretKey + ":" + nodeId);
+    }
+
+    /**
+     * Authenticates a Bearer token against a claimed node identity.
+     *
+     * <p>The token is accepted if it is the deterministic token derived for the
+     * claimed node ID (shared-secret model), or an explicitly registered token
+     * from {@link #generateToken(String)}. Deriving on the claimed ID means a
+     * node can authenticate a peer it has never met — the bootstrap case for
+     * gossip — without relaxing security: forging a claim still requires the
+     * shared cluster secret. Comparisons are constant-time.</p>
+     *
+     * @param authorizationHeader The raw Authorization header value.
+     * @param claimedNodeId       The node ID the caller claims to be (from the
+     *                            transport's {@code X-Node-Id} header).
+     * @return The authenticated node ID, or {@code null} if the token is invalid.
+     */
+    public String authenticate(String authorizationHeader, String claimedNodeId) {
+        if (authorizationHeader == null || !authorizationHeader.startsWith("Bearer ")) {
+            return null;
+        }
+        String token = authorizationHeader.substring("Bearer ".length()).trim();
+        if (claimedNodeId != null && constantTimeEquals(deriveToken(claimedNodeId), token)) {
+            return claimedNodeId;
+        }
+        for (Map.Entry<String, String> entry : registeredTokens.entrySet()) {
+            if (constantTimeEquals(entry.getValue(), token)) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /**
      * Revokes a node's access.
      */
     public void revokeToken(String nodeId) {
@@ -101,5 +160,14 @@ public class ClusterSecurity {
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException("SHA-256 not available", e);
         }
+    }
+
+    /**
+     * Constant-time string comparison to avoid timing side channels.
+     */
+    private static boolean constantTimeEquals(String a, String b) {
+        return MessageDigest.isEqual(
+                a.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                b.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 }

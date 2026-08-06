@@ -47,6 +47,10 @@ public class SearchHandler implements HttpHandler {
         try {
             DispatchQueryRequest req = mapper.readValue(exchange.getRequestBody(), DispatchQueryRequest.class);
             ClusterProtocol.validate(req);
+            if (!AuthFilter.authenticatedSender(exchange, req.sourceNodeId())) {
+                sendError(exchange, 403, "Forbidden: source node mismatch");
+                return;
+            }
 
             if (localSearch == null) {
                 sendError(exchange, 503, "No local search executor configured on this node");

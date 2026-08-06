@@ -1,10 +1,13 @@
 package com.minigoogle.cluster.transport.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.ClusterSecurity;
 import com.minigoogle.cluster.transport.NodeDirectory;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
+import com.sun.net.httpserver.HttpContext;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,6 +27,7 @@ class HttpRaftTransportTest {
     private HttpServer server;
     private int port;
     private ObjectMapper mapper;
+    private ClusterSecurity security;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -31,6 +35,7 @@ class HttpRaftTransportTest {
         port = server.getAddress().getPort();
         server.start();
         mapper = new ObjectMapper();
+        security = new ClusterSecurity("test-secret");
     }
 
     @AfterEach
@@ -38,6 +43,17 @@ class HttpRaftTransportTest {
         if (server != null) {
             server.stop(0);
         }
+    }
+
+    private HttpContext protectContext(String path, HttpHandler handler) {
+        HttpContext context = server.createContext(path, handler);
+        context.getFilters().add(new AuthFilter(security));
+        return context;
+    }
+
+    private HttpRaftTransport transport() {
+        NodeDirectory dir = nodeId -> URI.create("http://localhost:" + port);
+        return new HttpRaftTransport(dir, mapper, "node-1", security.deriveToken("node-1"));
     }
 
     private RequestVoteRequest readRequest(HttpExchange exchange) throws IOException {
@@ -57,7 +73,7 @@ class HttpRaftTransportTest {
 
     @Test
     void testSendRequestVote_Success() throws Exception {
-        server.createContext("/cluster/v1/raft/request-vote", exchange -> {
+        protectContext("/cluster/v1/raft/request-vote", exchange -> {
             RequestVoteRequest req = readRequest(exchange);
             RequestVoteResponse resp = new RequestVoteResponse(
                     req.protocolVersion(),
@@ -71,8 +87,7 @@ class HttpRaftTransportTest {
             writeResponse(exchange, resp);
         });
 
-        NodeDirectory dir = nodeId -> URI.create("http://localhost:" + port);
-        HttpRaftTransport transport = new HttpRaftTransport(dir, mapper, "node-1");
+        HttpRaftTransport transport = transport();
 
         RequestVoteRequest req = new RequestVoteRequest(1, "req-1", "corr-1", "node-1", 0L, "node-1", 5, 10, 4);
         RequestVoteResponse response = transport.sendRequestVote("node-2", req)
@@ -86,12 +101,11 @@ class HttpRaftTransportTest {
 
     @Test
     void testSendRequestVote_ErrorResponse() {
-        server.createContext("/cluster/v1/raft/request-vote", exchange -> {
+        protectContext("/cluster/v1/raft/request-vote", exchange -> {
             exchange.sendResponseHeaders(500, -1);
         });
 
-        NodeDirectory dir = nodeId -> URI.create("http://localhost:" + port);
-        HttpRaftTransport transport = new HttpRaftTransport(dir, mapper, "node-1");
+        HttpRaftTransport transport = transport();
 
         RequestVoteRequest req = new RequestVoteRequest(1, "req-1", "corr-1", "node-1", 0L, "node-1", 5, 10, 4);
         var future = transport.sendRequestVote("node-2", req);
@@ -102,7 +116,7 @@ class HttpRaftTransportTest {
 
     @Test
     void testSendRequestVote_MismatchedCorrelationIdIsRejected() {
-        server.createContext("/cluster/v1/raft/request-vote", exchange -> {
+        protectContext("/cluster/v1/raft/request-vote", exchange -> {
             RequestVoteRequest req = readRequest(exchange);
             // Malicious/buggy peer echoes a different correlation ID
             RequestVoteResponse resp = new RequestVoteResponse(
@@ -117,8 +131,7 @@ class HttpRaftTransportTest {
             writeResponse(exchange, resp);
         });
 
-        NodeDirectory dir = nodeId -> URI.create("http://localhost:" + port);
-        HttpRaftTransport transport = new HttpRaftTransport(dir, mapper, "node-1");
+        HttpRaftTransport transport = transport();
 
         RequestVoteRequest req = new RequestVoteRequest(1, "req-1", "corr-1", "node-1", 0L, "node-1", 5, 10, 4);
         var future = transport.sendRequestVote("node-2", req);

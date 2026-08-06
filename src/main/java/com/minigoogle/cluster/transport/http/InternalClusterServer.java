@@ -1,6 +1,9 @@
 package com.minigoogle.cluster.transport.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.ClusterSecurity;
+import com.sun.net.httpserver.HttpContext;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
@@ -63,5 +66,20 @@ public class InternalClusterServer {
 
     public HttpServer getServer() {
         return server;
+    }
+
+    /**
+     * Registers an internal RPC endpoint behind the bearer-token
+     * {@link AuthFilter}. Every internal endpoint must be registered this way
+     * so that unauthenticated requests are rejected with 401 before the handler
+     * is invoked.
+     *
+     * @param path     The context path, e.g. {@code /cluster/v1/raft/request-vote}.
+     * @param handler  The endpoint handler.
+     * @param security The cluster security manager holding the shared secret.
+     */
+    public void registerProtectedContext(String path, HttpHandler handler, ClusterSecurity security) {
+        HttpContext context = server.createContext(path, handler);
+        context.getFilters().add(new AuthFilter(security));
     }
 }

@@ -1,6 +1,7 @@
 package com.minigoogle.cluster.transport.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.ClusterSecurity;
 import com.minigoogle.cluster.GossipProtocol;
 import com.minigoogle.cluster.GossipProtocol.GossipNodeState;
 import com.minigoogle.cluster.GossipProtocol.NodeStatus;
@@ -46,18 +47,19 @@ class TransportLatencySmokeTest {
         ObjectMapper mapper = new ObjectMapper();
         GossipProtocol gossip = new GossipProtocol("local-node");
         RaftConsensus raft = new RaftConsensus("local-node");
+        ClusterSecurity security = new ClusterSecurity("test-secret");
 
         server = new InternalClusterServer(0, mapper);
-        server.getServer().createContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, "local-node"));
-        server.getServer().createContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, "local-node"));
+        server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, "local-node"), security);
+        server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, "local-node"), security);
         server.start();
 
         int port = server.getServer().getAddress().getPort();
         NodeDirectory directory = nodeId -> URI.create("http://127.0.0.1:" + port);
         peerNodeId = "peer-node";
 
-        membershipTransport = new HttpMembershipTransport(directory, mapper, "local-node");
-        raftTransport = new HttpRaftTransport(directory, mapper, "local-node");
+        membershipTransport = new HttpMembershipTransport(directory, mapper, "local-node", security.deriveToken("local-node"));
+        raftTransport = new HttpRaftTransport(directory, mapper, "local-node", security.deriveToken("local-node"));
     }
 
     @AfterEach

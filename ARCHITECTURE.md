@@ -7915,27 +7915,32 @@ Although MiniGoogle is not exposed publicly,
 
 internal communication should still be protected.
 
-Every node receives
+Every node derives
 
 ```
-Cluster Token
+Cluster Token = SHA-256(sharedSecret : nodeId)
 ```
 
-During startup.
+From a shared cluster secret.
 
 Every request includes
 
 ```
-Authorization
-
-Bearer <token>
+Authorization: Bearer <token>
+X-Node-Id: <sourceNodeId>
 ```
 
-Coordinator validates the token.
+An `AuthFilter` on every internal endpoint validates the token.
+
+The token is derived from the claimed node ID,
+
+so peers can authenticate before membership exists.
+
+A valid token for a different source node ID is rejected (403).
 
 Unauthorized nodes cannot join the cluster.
 
-Future versions may replace this with mutual TLS.
+Unimplemented: mutual TLS remains future work.
 
 ---
 
@@ -15882,7 +15887,25 @@ Every node
 
 must authenticate.
 
-Example
+Implemented:
+
+```
+Bearer Token
+
+Authorization: Bearer <token>
+
+X-Node-Id: <nodeId>
+```
+
+Validated by
+
+an `AuthFilter` on every internal endpoint.
+
+Unauthorized machines
+
+cannot join.
+
+Not yet implemented (future work):
 
 ```
 TLS
@@ -15891,12 +15914,6 @@ TLS
 
 Mutual Certificates
 ```
-
-Unauthorized machines
-
-cannot join.
-
----
 
 Every API
 
@@ -15910,13 +15927,17 @@ Authorization
 Audit Logging
 ```
 
+Authentication is implemented for internal RPCs.
+
+Authorization and audit logging are not yet implemented.
+
 Cluster metadata
 
 is encrypted.
 
 Sensitive traffic
 
-uses TLS.
+uses TLS — not yet implemented.
 
 ---
 
@@ -16431,7 +16452,12 @@ Defense in depth:
 
 - version validation rejects incompatible peers
 - correlation matching rejects spoofed replies
-- `ClusterSecurity` issues per-node bearer tokens
+- every request authenticates via `Authorization: Bearer <token>`
+  and `X-Node-Id` against `ClusterSecurity`
+- an `AuthFilter` on every internal endpoint rejects invalid credentials
+  with 401 before the handler runs
+- the envelope `sourceNodeId` is bound to the authenticated identity:
+  a mismatch is rejected with 403
 
 An attacker that cannot present a valid token is excluded before any message is processed.
 
@@ -16856,7 +16882,19 @@ Future support
 
 Internal node communication
 
-uses mutual TLS.
+is authenticated with
+
+```
+Authorization: Bearer <token>
+
+X-Node-Id: <nodeId>
+```
+
+Every internal RPC carries
+
+a token derived from the shared cluster secret.
+
+Unimplemented: mutual TLS remains future work.
 
 ---
 

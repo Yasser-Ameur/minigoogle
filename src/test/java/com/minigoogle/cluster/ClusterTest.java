@@ -126,4 +126,34 @@ class ClusterTest {
         assertEquals("node-2", security.validateBearerToken("Bearer " + originalToken));
         assertNull(security.validateBearerToken("invalid"));
     }
+
+    @Test
+    void testDeriveTokenIsDeterministicPerNode() {
+        ClusterSecurity security = new ClusterSecurity("shared-secret");
+
+        assertEquals(security.deriveToken("node-1"), security.deriveToken("node-1"));
+        assertNotEquals(security.deriveToken("node-1"), security.deriveToken("node-2"));
+        // A second instance sharing the secret derives the same token (peer verification)
+        assertEquals(security.deriveToken("node-1"), new ClusterSecurity("shared-secret").deriveToken("node-1"));
+        assertNotEquals(security.deriveToken("node-1"), new ClusterSecurity("other-secret").deriveToken("node-1"));
+    }
+
+    @Test
+    void testAuthenticateAcceptsClaimedNodeAndRejectsForgeries() {
+        ClusterSecurity security = new ClusterSecurity("shared-secret");
+
+        // Valid claim: token derived for the claimed node ID
+        assertEquals("node-1", security.authenticate("Bearer " + security.deriveToken("node-1"), "node-1"));
+        // Missing auth header
+        assertNull(security.authenticate(null, "node-1"));
+        // Non-Bearer scheme
+        assertNull(security.authenticate("Basic abc", "node-1"));
+        // Token for a different node than claimed
+        assertNull(security.authenticate("Bearer " + security.deriveToken("node-2"), "node-1"));
+        // Unknown secret produces an invalid token
+        assertNull(security.authenticate("Bearer " + new ClusterSecurity("other-secret").deriveToken("node-1"), "node-1"));
+        // Registered (minted) tokens still authenticate, regardless of the claim
+        String minted = security.generateToken("node-3");
+        assertEquals("node-3", security.authenticate("Bearer " + minted, "anything"));
+    }
 }

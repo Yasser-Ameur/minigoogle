@@ -72,6 +72,32 @@ public class ClusterNode {
      */
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                ClusterSecurity.withRandomSecret());
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node.
+     *
+     * <p>Every internal endpoint is registered behind a bearer-token
+     * {@code AuthFilter}; each transport attaches the node's derived token to
+     * every request. Peers must share the same {@link ClusterSecurity} secret,
+     * otherwise their derived tokens will not validate.</p>
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security) throws IOException {
         this.nodeId = nodeId;
         ObjectMapper mapper = new ObjectMapper();
         this.server = new InternalClusterServer(port, mapper);
@@ -80,9 +106,10 @@ public class ClusterNode {
         this.ring = new ConsistentHashRing();
         ring.addNode(nodeId); // Always include self
 
-        HttpMembershipTransport membershipTransport = new HttpMembershipTransport(directory, mapper, nodeId);
-        HttpRaftTransport raftTransport = new HttpRaftTransport(directory, mapper, nodeId);
-        HttpSearchTransport searchTransport = new HttpSearchTransport(directory, mapper, nodeId);
+        String bearerToken = security.deriveToken(nodeId);
+        HttpMembershipTransport membershipTransport = new HttpMembershipTransport(directory, mapper, nodeId, bearerToken);
+        HttpRaftTransport raftTransport = new HttpRaftTransport(directory, mapper, nodeId, bearerToken);
+        HttpSearchTransport searchTransport = new HttpSearchTransport(directory, mapper, nodeId, bearerToken);
 
         this.gossip = new GossipProtocol(nodeId, gossipInterval, gossipTimeout, membershipTransport);
         gossip.addListener(new RingMembershipListener(ring));
@@ -91,10 +118,10 @@ public class ClusterNode {
         // campaigns against nodes that gossip currently believes are alive.
         this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes);
 
-        server.getServer().createContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId));
-        server.getServer().createContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId));
-        server.getServer().createContext("/cluster/v1/raft/append-entries", new RaftHandler(raft, mapper, nodeId));
-        server.getServer().createContext("/cluster/v1/search/dispatch", new SearchHandler(localSearch, mapper, nodeId));
+        server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
+        server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
+        server.registerProtectedContext("/cluster/v1/raft/append-entries", new RaftHandler(raft, mapper, nodeId), security);
+        server.registerProtectedContext("/cluster/v1/search/dispatch", new SearchHandler(localSearch, mapper, nodeId), security);
 
         this.transports = List.of(membershipTransport, raftTransport, searchTransport);
     }

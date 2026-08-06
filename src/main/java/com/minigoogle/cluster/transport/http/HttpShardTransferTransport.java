@@ -19,11 +19,13 @@ public class HttpShardTransferTransport implements ShardTransferTransport {
     private final HttpClient httpClient;
     private final ObjectMapper mapper;
     private final String localNodeId;
+    private final String bearerToken;
 
-    public HttpShardTransferTransport(NodeDirectory directory, ObjectMapper mapper, String localNodeId) {
+    public HttpShardTransferTransport(NodeDirectory directory, ObjectMapper mapper, String localNodeId, String bearerToken) {
         this.directory = directory;
         this.mapper = mapper;
         this.localNodeId = localNodeId;
+        this.bearerToken = bearerToken;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
@@ -78,6 +80,8 @@ public class HttpShardTransferTransport implements ShardTransferTransport {
                     .uri(baseUri.resolve(path))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", "application/json")
+                    .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer(bearerToken))
+                    .header(HttpAuth.NODE_ID, localNodeId)
                     .POST(HttpRequest.BodyPublishers.ofString(payload))
                     .build();
 

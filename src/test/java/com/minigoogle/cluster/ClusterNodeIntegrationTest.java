@@ -55,9 +55,11 @@ class ClusterNodeIntegrationTest {
         SearchExecutor node2Search = new LocalSearchExecutor(2, (query, topK) -> List.of(
                 new SearchResult("http://node-2/result", "Node 2: " + query, "remote shard", 0.85, 0.7, 0.15)));
 
-        node1 = new ClusterNode("node-1", 9091, directory, gossipInterval, timeout, raftElection, raftHeartbeat, null);
-        node2 = new ClusterNode("node-2", 9092, directory, gossipInterval, timeout, raftElection, raftHeartbeat, node2Search);
-        node3 = new ClusterNode("node-3", 9093, directory, gossipInterval, timeout, raftElection, raftHeartbeat, null);
+        ClusterSecurity security = new ClusterSecurity("integration-secret");
+
+        node1 = new ClusterNode("node-1", 9091, directory, gossipInterval, timeout, raftElection, raftHeartbeat, null, security);
+        node2 = new ClusterNode("node-2", 9092, directory, gossipInterval, timeout, raftElection, raftHeartbeat, node2Search, security);
+        node3 = new ClusterNode("node-3", 9093, directory, gossipInterval, timeout, raftElection, raftHeartbeat, null, security);
 
         // Pre-populate some seed knowledge to bootstrap gossip without a proper discovery layer yet
         // In real life, seed nodes are injected at startup
@@ -162,7 +164,8 @@ class ClusterNodeIntegrationTest {
                 "Gossip did not converge: " + node1.getGossip().getLiveNodes());
 
         ObjectMapper mapper = new ObjectMapper();
-        HttpSearchTransport transport = new HttpSearchTransport(directory, mapper, "node-1");
+        ClusterSecurity security = new ClusterSecurity("integration-secret");
+        HttpSearchTransport transport = new HttpSearchTransport(directory, mapper, "node-1", security.deriveToken("node-1"));
 
         List<LocalSearchExecutor> localExecutors = List.of(new LocalSearchExecutor(1, (query, topK) -> List.of(
                 new SearchResult("http://node-1/result", "Node 1: " + query, "local shard", 0.9, 0.8, 0.1))));

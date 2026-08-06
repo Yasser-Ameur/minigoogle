@@ -1,13 +1,16 @@
 package com.minigoogle.cluster.transport.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.ClusterSecurity;
 import com.minigoogle.cluster.transport.NodeDirectory;
 import com.minigoogle.cluster.transport.dto.DispatchQueryRequest;
 import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.distributed.query.model.LocalSearchResponse;
 import com.minigoogle.distributed.query.model.QueryContext;
 import com.minigoogle.network.dto.SearchResult;
+import com.sun.net.httpserver.HttpContext;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,6 +31,7 @@ class HttpSearchTransportTest {
     private int port;
     private ObjectMapper mapper;
     private SearchExecutor local;
+    private ClusterSecurity security;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -35,6 +39,7 @@ class HttpSearchTransportTest {
         port = server.getAddress().getPort();
         server.start();
         mapper = new ObjectMapper();
+        security = new ClusterSecurity("test-secret");
         local = context -> new LocalSearchResponse(
                 7,
                 List.of(new SearchResult("http://shard/doc", "Doc", "snippet", 0.95, 0.8, 0.15)),
@@ -49,15 +54,25 @@ class HttpSearchTransportTest {
         }
     }
 
+    private HttpContext protectContext(String path, HttpHandler handler) {
+        HttpContext context = server.createContext(path, handler);
+        context.getFilters().add(new AuthFilter(security));
+        return context;
+    }
+
     private NodeDirectory directoryFor(String nodeId) {
         return target -> target.equals(nodeId) ? URI.create("http://localhost:" + port) : null;
     }
 
+    private HttpSearchTransport transport() {
+        return new HttpSearchTransport(directoryFor("node-2"), mapper, "node-1", security.deriveToken("node-1"));
+    }
+
     @Test
     void testDispatchQueryRoundTrip() throws Exception {
-        server.createContext("/cluster/v1/search/dispatch", new SearchHandler(local, mapper, "node-2"));
+        protectContext("/cluster/v1/search/dispatch", new SearchHandler(local, mapper, "node-2"));
 
-        HttpSearchTransport transport = new HttpSearchTransport(directoryFor("node-2"), mapper, "node-1");
+        HttpSearchTransport transport = transport();
         QueryContext context = new QueryContext("distributed systems", 10, Duration.ofSeconds(5));
 
         LocalSearchResponse response = transport.dispatchQuery("node-2", context)
@@ -73,7 +88,7 @@ class HttpSearchTransportTest {
     @Test
     void testWireRequestCarriesQueryAndBudget() throws Exception {
         final DispatchQueryRequest[] captured = new DispatchQueryRequest[1];
-        server.createContext("/cluster/v1/search/dispatch", exchange -> {
+        protectContext("/cluster/v1/search/dispatch", exchange -> {
             try (InputStream is = exchange.getRequestBody()) {
                 captured[0] = mapper.readValue(is, DispatchQueryRequest.class);
             }
@@ -86,7 +101,7 @@ class HttpSearchTransportTest {
             exchange.close();
         });
 
-        HttpSearchTransport transport = new HttpSearchTransport(directoryFor("node-2"), mapper, "node-1");
+        HttpSearchTransport transport = transport();
         QueryContext context = new QueryContext("the query", 5, Duration.ofSeconds(3));
 
         transport.dispatchQuery("node-2", context).get(5, TimeUnit.SECONDS);
@@ -101,12 +116,12 @@ class HttpSearchTransportTest {
 
     @Test
     void testErrorStatusFailsFuture() throws Exception {
-        server.createContext("/cluster/v1/search/dispatch", exchange -> {
+        protectContext("/cluster/v1/search/dispatch", exchange -> {
             exchange.sendResponseHeaders(500, -1);
             exchange.close();
         });
 
-        HttpSearchTransport transport = new HttpSearchTransport(directoryFor("node-2"), mapper, "node-1");
+        HttpSearchTransport transport = transport();
         QueryContext context = new QueryContext("query", 10, Duration.ofSeconds(5));
 
         Exception ex = assertThrows(Exception.class,
@@ -116,7 +131,7 @@ class HttpSearchTransportTest {
 
     @Test
     void testUnknownNodeFailsFuture() {
-        HttpSearchTransport transport = new HttpSearchTransport(directoryFor("node-2"), mapper, "node-1");
+        HttpSearchTransport transport = transport();
         QueryContext context = new QueryContext("query", 10, Duration.ofSeconds(5));
 
         Exception ex = assertThrows(Exception.class,

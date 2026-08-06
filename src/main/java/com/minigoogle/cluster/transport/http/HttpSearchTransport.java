@@ -29,11 +29,13 @@ public class HttpSearchTransport implements SearchTransport {
     private final HttpClient httpClient;
     private final ObjectMapper mapper;
     private final String localNodeId;
+    private final String bearerToken;
 
-    public HttpSearchTransport(NodeDirectory directory, ObjectMapper mapper, String localNodeId) {
+    public HttpSearchTransport(NodeDirectory directory, ObjectMapper mapper, String localNodeId, String bearerToken) {
         this.directory = directory;
         this.mapper = mapper;
         this.localNodeId = localNodeId;
+        this.bearerToken = bearerToken;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(2))
                 .build();
@@ -72,6 +74,8 @@ public class HttpSearchTransport implements SearchTransport {
                     .uri(baseUri.resolve("/cluster/v1/search/dispatch"))
                     .timeout(Duration.ofMillis(Math.min(remainingTimeMs, 5000)))
                     .header("Content-Type", "application/json")
+                    .header(HttpAuth.AUTHORIZATION, HttpAuth.bearer(bearerToken))
+                    .header(HttpAuth.NODE_ID, localNodeId)
                     .POST(HttpRequest.BodyPublishers.ofString(payload))
                     .build();
 
