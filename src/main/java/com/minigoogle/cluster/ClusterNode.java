@@ -16,6 +16,7 @@ import com.minigoogle.cluster.transport.http.SearchHandler;
 import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.storage.filesystem.StorageLayout;
 import com.minigoogle.storage.metadata.RaftAppliedStore;
+import com.minigoogle.storage.metadata.RaftConfigurationStore;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
 import com.minigoogle.storage.metadata.RaftSnapshotStore;
 import com.minigoogle.storage.wal.WriteAheadLog;
@@ -150,7 +151,8 @@ public class ClusterNode {
                        ClusterSecurity security, Path storageDirectory) throws IOException {
         this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
                 security, createRaftMetadataStore(storageDirectory), createRaftLog(storageDirectory),
-                null, null, createRaftSnapshotStore(storageDirectory), SNAPSHOT_INTERVAL);
+                null, null, createRaftSnapshotStore(storageDirectory), SNAPSHOT_INTERVAL,
+                createRaftConfigurationStore(storageDirectory));
     }
 
     /**
@@ -290,6 +292,56 @@ public class ClusterNode {
                        ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog,
                        ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
                        RaftSnapshotStore snapshotStore, int snapshotInterval) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, raftMetadataStore, raftLog, stateMachine, appliedStore, snapshotStore, snapshotInterval, null);
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with explicit
+     * Raft metadata store, replicated log, replicated key-value state machine,
+     * snapshot-driven log compaction, and a durable committed configuration for
+     * membership reconfiguration.
+     *
+     * <p>In addition to the {@code snapshotStore}/{@code snapshotInterval}
+     * behavior, the committed configuration is persisted to {@code configStore}
+     * so a node restarted on the same directory resumes with the same member
+     * set (and quorum) before gossip converges. The {@link #initializeConfig(List)}
+     * operation establishes the bootstrap configuration once; afterwards
+     * membership is driven exclusively by {@link #addNode(String)} and
+     * {@link #removeNode(String)}, which return only after the change commits.
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param raftMetadataStore    Store for {@code currentTerm} and
+     *                             {@code votedFor}, or {@code null} to keep the
+     *                             metadata in memory only.
+     * @param raftLog              The replicated log, or {@code null} for a
+     *                             memory-only log.
+     * @param stateMachine         The replicated key-value state machine, or
+     *                             {@code null} to disable the client operations.
+     * @param appliedStore         Store for the apply watermark, or {@code null}
+     *                             to keep it in memory only.
+     * @param snapshotStore        Store for state-machine snapshots, or
+     *                             {@code null} to disable log compaction.
+     * @param snapshotInterval     Entries between snapshots; ignored when
+     *                             {@code snapshotStore} is {@code null}.
+     * @param configStore          Store for the committed configuration, or
+     *                             {@code null} to keep it in memory only.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog,
+                       ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
+                       RaftSnapshotStore snapshotStore, int snapshotInterval,
+                       RaftConfigurationStore configStore) throws IOException {
         this.nodeId = nodeId;
         this.kv = stateMachine;
         ObjectMapper mapper = new ObjectMapper();
@@ -312,7 +364,7 @@ public class ClusterNode {
         this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes,
                 raftMetadataStore == null ? RaftMetadataStore.inMemory() : raftMetadataStore,
                 raftLog == null ? RaftLog.inMemory() : raftLog,
-                stateMachine, appliedStore, snapshotStore, snapshotInterval);
+                stateMachine, appliedStore, snapshotStore, snapshotInterval, configStore);
 
         server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
@@ -356,6 +408,13 @@ public class ClusterNode {
         return new RaftSnapshotStore(new StorageLayout(storageDirectory).getRaftSnapshotPath());
     }
 
+    private static RaftConfigurationStore createRaftConfigurationStore(Path storageDirectory) {
+        if (storageDirectory == null) {
+            return RaftConfigurationStore.inMemory();
+        }
+        return new RaftConfigurationStore(new StorageLayout(storageDirectory).getRaftConfigPath());
+    }
+
     public void start() {
         server.start();
         for (ClusterTransport transport : transports) {
@@ -388,6 +447,86 @@ public class ClusterNode {
 
     public InternalClusterServer getServer() {
         return server;
+    }
+
+    /**
+     * Establishes the bootstrap configuration: the member set the cluster
+     * starts with (self plus the seed peers). Persisted so a restart restores
+     * it before gossip converges. Allowed only once, before any config change
+     * has been committed; afterwards membership is driven exclusively by
+     * {@link #addNode(String)} and {@link #removeNode(String)}.
+     *
+     * @param members The initial members; must include this node.
+     * @throws IllegalStateException If a configuration is already established.
+     */
+    public void initializeConfig(List<String> members) {
+        raft.initializeConfig(members);
+    }
+
+    /**
+     * Adds a server to the cluster through the replicated log. Returns only
+     * after the config-change entry is committed by a majority and applied, so
+     * a successful return is durable. The joining server need not be running:
+     * the change commits on the old configuration's majority, and the new
+     * server catches up when it joins (via log replication or InstallSnapshot).
+     *
+     * @param nodeId The node ID to add.
+     * @throws NotLeaderException If this node is not the leader, a change is
+     *                            already pending, or commit is not reached
+     *                            before the operation timeout.
+     */
+    public void addNode(String nodeId) {
+        changeConfig(ConfigChange.ChangeType.ADD, nodeId);
+    }
+
+    /**
+     * Removes a server from the cluster through the replicated log. Returns
+     * only after the config-change entry is committed by a majority and
+     * applied. The removed server stops counting toward the quorum once the
+     * change commits; a leader that removes itself steps down so the survivors
+     * re-elect.
+     *
+     * @param nodeId The node ID to remove.
+     * @throws NotLeaderException If this node is not the leader, a change is
+     *                            already pending, or commit is not reached
+     *                            before the operation timeout.
+     */
+    public void removeNode(String nodeId) {
+        changeConfig(ConfigChange.ChangeType.REMOVE, nodeId);
+    }
+
+    /**
+     * @return The committed configuration, or the empty configuration before
+     *         {@link #initializeConfig(List)} is called.
+     */
+    public ClusterConfiguration getCommittedConfig() {
+        return raft.getCommittedConfig();
+    }
+
+    private void changeConfig(ConfigChange.ChangeType type, String nodeId) {
+        int index;
+        try {
+            index = raft.appendConfigChange(new ConfigChange(type, nodeId));
+        } catch (IllegalStateException e) {
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Node " + this.nodeId + " cannot apply " + type + " of " + nodeId + ": " + e.getMessage());
+        }
+        long deadline = System.currentTimeMillis() + OPERATION_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            ClusterConfiguration committed = raft.getCommittedConfig();
+            if (type == ConfigChange.ChangeType.ADD ? committed.contains(nodeId) : !committed.contains(nodeId)) {
+                return;
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new NotLeaderException(raft.getCurrentLeader(),
+                        "Interrupted waiting for config change to commit on " + this.nodeId);
+            }
+        }
+        throw new NotLeaderException(raft.getCurrentLeader(),
+                "Config change " + type + " of " + nodeId + " timed out on " + this.nodeId + " (entry " + index + " not committed)");
     }
 
     /**

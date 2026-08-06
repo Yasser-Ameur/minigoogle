@@ -19,6 +19,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 public class HttpRaftTransport implements RaftTransport {
@@ -91,7 +92,8 @@ public class HttpRaftTransport implements RaftTransport {
                 request.prevLogIndex(),
                 request.prevLogTerm(),
                 request.entries(),
-                request.leaderCommit()
+                request.leaderCommit(),
+                request.config() == null ? List.of() : request.config()
         );
     }
 
@@ -106,7 +108,8 @@ public class HttpRaftTransport implements RaftTransport {
                 request.term(),
                 request.lastIncludedIndex(),
                 request.lastIncludedTerm(),
-                request.data()
+                request.data(),
+                request.config() == null ? List.of() : request.config()
         );
     }
 

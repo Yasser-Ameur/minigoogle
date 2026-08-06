@@ -69,4 +69,13 @@ public class StorageLayout {
     public Path getRaftSnapshotPath() {
         return baseDirectory.resolve("raft-snapshot.bin");
     }
+
+    /**
+     * @return The path to the file holding this node's durable Raft committed
+     *         configuration (the member set the consensus layer uses for
+     *         quorum).
+     */
+    public Path getRaftConfigPath() {
+        return baseDirectory.resolve("raft-config.bin");
+    }
 }

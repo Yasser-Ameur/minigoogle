@@ -8405,6 +8405,8 @@ Each node stores
 
     raft-applied.bin
 
+    raft-config.bin
+
     raft-snapshot.bin
 ```
 
@@ -8413,6 +8415,8 @@ Every shard lives inside its own directory.
 Moving a shard becomes as simple as copying one folder.
 
 `raft-snapshot.bin` is the latest state-machine snapshot (storage.metadata.RaftSnapshotStore, magic "RSNP"). Every `snapshotInterval` committed entries the applied state is captured there and the `raft-log.bin` prefix is compacted, so a restarted node rebuilds the KV from snapshot + compacted tail instead of replaying history. Once the log is compacted, the snapshot carries the log base: `raft-snapshot.bin` and `raft-log.bin` must be deleted together, never one alone (a rebuilt node just rejoins from scratch).
+
+`raft-config.bin` (storage.metadata.RaftConfigurationStore, magic "RCON") is the last committed membership configuration. It is written when a config entry commits or a snapshot installs a config, and restored on startup so a restarted node knows its cluster — and a stable majority — before gossip converges. It is an operator-deletable cache like `raft-applied.bin`: deleting it returns the node to bootstrap mode until the next `initializeConfig` call.
 
 ---
 
@@ -15393,9 +15397,11 @@ ClusterNode exposes linearizable operations over the leader: put/delete append a
 
 A leader that loses leadership before its write commits surfaces NotLeaderException to the caller rather than a false acknowledgement, preserving linearizability.
 
+Membership reconfiguration is implemented (Phase 6, RFC docs/rfc/raft-membership-reconfiguration.md). A committed configuration (cluster.ClusterConfiguration) replaces gossip liveness as the quorum source once it is established: majorityThreshold() is derived from the committed config (plus the pending target config during a one-server-at-a-time change), not from the live-node set, so a partitioned node cannot shrink the majority into a split-brain. ClusterNode exposes initializeConfig(add), addNode(nodeId), and removeNode(nodeId): each change is an ordinary log entry (cluster.ConfigChange, op 0x03), committed and applied by every node, and persisted to raft-config.bin. Config travels in snapshots (RSNP v2) and in the AppendEntries and InstallSnapshot RPCs, so a new node joining a compacted cluster adopts the config it joined. A leader that commits its own removal sends a final heartbeat and steps down; a removed follower receives one final AppendEntries carrying the new commit index so it stops counting itself. The quorum cannot shrink below the committed config even if gossip marks members dead, and a second change is rejected while one is pending.
+
 Not yet implemented (future work):
 
-Follower-served reads and membership reconfiguration.
+Follower-served reads.
 
 ---
 

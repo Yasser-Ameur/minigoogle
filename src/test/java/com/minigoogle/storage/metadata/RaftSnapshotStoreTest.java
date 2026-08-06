@@ -1,9 +1,11 @@
 package com.minigoogle.storage.metadata;
 
+import com.minigoogle.cluster.ClusterConfiguration;
 import com.minigoogle.cluster.RaftSnapshot;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -147,9 +149,45 @@ class RaftSnapshotStoreTest {
     }
 
     @Test
+    void testConfigRoundTripV2() throws IOException {
+        Path file = snapshotFile(tempDir());
+        RaftSnapshotStore store = new RaftSnapshotStore(file);
+        store.save(new RaftSnapshot(42, 7, DATA, ClusterConfiguration.of("node-1", "node-2", "node-3")));
+
+        RaftSnapshot loaded = store.load();
+        assertNotNull(loaded);
+        assertEquals(42, loaded.lastIncludedIndex());
+        assertEquals(7, loaded.lastIncludedTerm());
+        assertArrayEquals(DATA, loaded.data());
+        assertEquals(ClusterConfiguration.of("node-1", "node-2", "node-3"), loaded.config());
+        assertTrue(loaded.config().contains("node-2"));
+    }
+
+    @Test
+    void testV1FileLoadsWithEmptyConfig() throws IOException {
+        Path file = snapshotFile(tempDir());
+        ByteBuffer buffer = ByteBuffer.allocate(4 + 1 + 4 + 4 + 4 + DATA.length);
+        buffer.putInt(0x52534E50); // "RSNP"
+        buffer.put((byte) 1);      // version 1, no config section
+        buffer.putInt(12);
+        buffer.putInt(3);
+        buffer.putInt(DATA.length);
+        buffer.put(DATA);
+        Files.write(file, buffer.array());
+
+        RaftSnapshot loaded = new RaftSnapshotStore(file).load();
+        assertNotNull(loaded);
+        assertEquals(12, loaded.lastIncludedIndex());
+        assertEquals(3, loaded.lastIncludedTerm());
+        assertArrayEquals(DATA, loaded.data());
+        assertEquals(ClusterConfiguration.EMPTY, loaded.config(),
+                "A v1 snapshot carries no committed configuration");
+    }
+
+    @Test
     void testInMemoryStoreDoesNothing() throws IOException {
         RaftSnapshotStore store = RaftSnapshotStore.inMemory();
-        store.save(new RaftSnapshot(7, 2, DATA));
+        store.save(new RaftSnapshot(7, 2, DATA, ClusterConfiguration.of("node-1")));
 
         assertNull(store.load());
     }

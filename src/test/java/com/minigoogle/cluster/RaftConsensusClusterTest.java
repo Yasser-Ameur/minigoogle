@@ -215,7 +215,7 @@ class RaftConsensusClusterTest {
                 int term = forcedTerms.getOrDefault(targetNodeId, request.term());
                 if (target != null) {
                     success = target.receiveInstallSnapshot(request.leaderId(), request.term(),
-                            request.lastIncludedIndex(), request.lastIncludedTerm(), request.data());
+                            request.lastIncludedIndex(), request.lastIncludedTerm(), request.data(), request.config());
                     term = forcedTerms.getOrDefault(targetNodeId, target.getCurrentTerm());
                 }
                 return new InstallSnapshotResponse(

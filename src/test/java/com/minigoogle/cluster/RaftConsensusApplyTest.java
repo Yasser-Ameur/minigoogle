@@ -359,7 +359,7 @@ class RaftConsensusApplyTest {
                 int term = request.term();
                 if (target != null) {
                     success = target.receiveInstallSnapshot(request.leaderId(), request.term(),
-                            request.lastIncludedIndex(), request.lastIncludedTerm(), request.data());
+                            request.lastIncludedIndex(), request.lastIncludedTerm(), request.data(), request.config());
                     term = target.getCurrentTerm();
                 }
                 return new InstallSnapshotResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),

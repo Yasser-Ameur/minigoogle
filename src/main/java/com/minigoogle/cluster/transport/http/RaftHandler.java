@@ -64,7 +64,7 @@ public class RaftHandler implements HttpHandler {
                     return;
                 }
                 boolean success = raft.receiveAppendEntries(req.leaderId(), req.term(),
-                        req.prevLogIndex(), req.prevLogTerm(), req.entries(), req.leaderCommit());
+                        req.prevLogIndex(), req.prevLogTerm(), req.entries(), req.leaderCommit(), req.config());
                 AppendEntriesResponse resp = new AppendEntriesResponse(
                         ClusterProtocol.PROTOCOL_VERSION,
                         req.requestId(),
@@ -83,7 +83,7 @@ public class RaftHandler implements HttpHandler {
                     return;
                 }
                 boolean success = raft.receiveInstallSnapshot(req.leaderId(), req.term(),
-                        req.lastIncludedIndex(), req.lastIncludedTerm(), req.data());
+                        req.lastIncludedIndex(), req.lastIncludedTerm(), req.data(), req.config());
                 InstallSnapshotResponse resp = new InstallSnapshotResponse(
                         ClusterProtocol.PROTOCOL_VERSION,
                         req.requestId(),
