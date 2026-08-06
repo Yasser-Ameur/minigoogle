@@ -44,4 +44,12 @@ public class StorageLayout {
     public Path getRaftMetadataPath() {
         return baseDirectory.resolve("raft-metadata.bin");
     }
+
+    /**
+     * @return The path to the file holding this node's durable Raft log
+     *         (the write-ahead log replay of replicated entries).
+     */
+    public Path getRaftLogPath() {
+        return baseDirectory.resolve("raft-log.bin");
+    }
 }

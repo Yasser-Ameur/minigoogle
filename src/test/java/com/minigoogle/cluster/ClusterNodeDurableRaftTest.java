@@ -72,4 +72,42 @@ class ClusterNodeDurableRaftTest {
             node.stop();
         }
     }
+
+    @Test
+    void testRaftLogSurvivesNodeRestart() throws IOException {
+        ClusterSecurity security = new ClusterSecurity("restart-secret");
+        Path nodeStorage = Files.createTempDirectory("cluster-node-log-storage");
+        nodeStorage.toFile().deleteOnExit();
+        long electionTimeout = 60_000; // keep the node out of auto-election during the test
+
+        ClusterNode node = new ClusterNode("node-c", 9099, directory(9099),
+                100, 500, electionTimeout, 150, null, security, nodeStorage);
+        node.start();
+        try {
+            // Drive the leader manually, then append an entry through the real
+            // append pipeline so it is fsynced to the raft log WAL.
+            node.getRaft().startElection();
+            assertTrue(node.getRaft().receiveVote(), "A single-node cluster must win its own election");
+            node.getRaft().becomeLeader();
+            int index = node.getRaft().appendEntry("durable".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            assertEquals(1, index);
+            assertEquals(1, node.getRaft().getLastLogIndex());
+            assertEquals(1, node.getRaft().getLastLogTerm());
+            assertTrue(Files.exists(nodeStorage.resolve("raft-log.bin")),
+                    "The raft log file must exist after an append");
+        } finally {
+            node.stop();
+        }
+
+        // A fresh process on the same storage directory replays the log.
+        ClusterNode restarted = new ClusterNode("node-c", 9099, directory(9099),
+                100, 500, electionTimeout, 150, null, security, nodeStorage);
+        restarted.start();
+        try {
+            assertEquals(1, restarted.getRaft().getLastLogIndex(), "Restarted node must replay its raft log");
+            assertEquals(1, restarted.getRaft().getLastLogTerm(), "Restarted node must restore the entry's term");
+        } finally {
+            restarted.stop();
+        }
+    }
 }

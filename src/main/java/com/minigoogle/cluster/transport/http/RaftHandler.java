@@ -42,7 +42,8 @@ public class RaftHandler implements HttpHandler {
                     sendError(exchange, 403, "Forbidden: source node mismatch");
                     return;
                 }
-                boolean granted = raft.receiveVoteRequest(req.candidateId(), req.term());
+                boolean granted = raft.receiveVoteRequest(req.candidateId(), req.term(),
+                        req.lastLogIndex(), req.lastLogTerm());
                 RequestVoteResponse resp = new RequestVoteResponse(
                         ClusterProtocol.PROTOCOL_VERSION,
                         req.requestId(),
@@ -60,7 +61,8 @@ public class RaftHandler implements HttpHandler {
                     sendError(exchange, 403, "Forbidden: source node mismatch");
                     return;
                 }
-                raft.receiveHeartbeat(req.leaderId(), req.term());
+                boolean success = raft.receiveAppendEntries(req.leaderId(), req.term(),
+                        req.prevLogIndex(), req.prevLogTerm(), req.entries(), req.leaderCommit());
                 AppendEntriesResponse resp = new AppendEntriesResponse(
                         ClusterProtocol.PROTOCOL_VERSION,
                         req.requestId(),
@@ -68,7 +70,7 @@ public class RaftHandler implements HttpHandler {
                         localNodeId,
                         ClusterProtocol.now(),
                         raft.getCurrentTerm(),
-                        true
+                        success
                 );
                 sendResponse(exchange, resp);
             } else {

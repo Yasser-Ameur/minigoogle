@@ -1,9 +1,8 @@
 package com.minigoogle.storage.wal;
 
 import com.minigoogle.storage.serialization.BinaryReader;
-import com.minigoogle.storage.serialization.BinaryWriter;
 import java.io.IOException;
-import java.nio.MappedByteBuffer;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -27,11 +26,6 @@ public class WriteAheadLog {
     }
     
     public void append(byte operationType, byte[] payload) throws IOException {
-        try (BinaryWriter writer = new BinaryWriter(logPath, 4096)) { // open in append mode if using standard open options properly
-             // Note: using FileChannel with APPEND mode directly might be needed for proper WAL append,
-             // but here we just write an entry. For a robust WAL, this append needs to truly append without truncating.
-        }
-        // Actually, let's fix BinaryWriter append mode for WAL specifically:
         try (FileChannel channel = FileChannel.open(logPath, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
             java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1 + 4 + payload.length);
             buf.put(operationType);
@@ -52,14 +46,22 @@ public class WriteAheadLog {
         }
         
         try (FileChannel channel = FileChannel.open(logPath, StandardOpenOption.READ)) {
-            MappedByteBuffer mmap = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
-            BinaryReader reader = new BinaryReader(mmap);
-            
+            // readAllBytes (not mmap): a lingering mapped view would prevent a
+            // subsequent clear()/truncate rewrite on some platforms (Windows).
+            ByteBuffer buf = ByteBuffer.allocate(Math.toIntExact(channel.size()));
+            while (buf.hasRemaining()) {
+                if (channel.read(buf) < 0) {
+                    break;
+                }
+            }
+            buf.flip();
+            BinaryReader reader = new BinaryReader(buf);
+
             while (reader.hasRemaining()) {
                 byte op = reader.readByte();
                 int len = reader.readInt();
                 byte[] payload = new byte[len];
-                mmap.get(payload);
+                buf.get(payload);
                 entries.add(new WalEntry(op, payload));
             }
         }

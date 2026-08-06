@@ -14,6 +14,7 @@ import com.minigoogle.cluster.transport.http.SearchHandler;
 import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.storage.filesystem.StorageLayout;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
+import com.minigoogle.storage.wal.WriteAheadLog;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -131,7 +132,7 @@ public class ClusterNode {
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, Path storageDirectory) throws IOException {
         this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
-                security, createRaftMetadataStore(storageDirectory));
+                security, createRaftMetadataStore(storageDirectory), createRaftLog(storageDirectory));
     }
 
     /**
@@ -155,6 +156,33 @@ public class ClusterNode {
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, RaftMetadataStore raftMetadataStore) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, raftMetadataStore, RaftLog.inMemory());
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with explicit
+     * Raft metadata store and replicated log.
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param raftMetadataStore    Store for {@code currentTerm} and
+     *                             {@code votedFor}, or {@code null} to keep the
+     *                             metadata in memory only.
+     * @param raftLog              The replicated log, or {@code null} for a
+     *                             memory-only log.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog) throws IOException {
         this.nodeId = nodeId;
         ObjectMapper mapper = new ObjectMapper();
         this.server = new InternalClusterServer(port, mapper);
@@ -174,7 +202,8 @@ public class ClusterNode {
         // Raft resolves its peers from the gossip membership table, so it only
         // campaigns against nodes that gossip currently believes are alive.
         this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes,
-                raftMetadataStore == null ? RaftMetadataStore.inMemory() : raftMetadataStore);
+                raftMetadataStore == null ? RaftMetadataStore.inMemory() : raftMetadataStore,
+                raftLog == null ? RaftLog.inMemory() : raftLog);
 
         server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
@@ -189,6 +218,17 @@ public class ClusterNode {
             return RaftMetadataStore.inMemory();
         }
         return new RaftMetadataStore(new StorageLayout(storageDirectory).getRaftMetadataPath());
+    }
+
+    private static RaftLog createRaftLog(Path storageDirectory) {
+        if (storageDirectory == null) {
+            return RaftLog.inMemory();
+        }
+        try {
+            return new RaftLog(new WriteAheadLog(new StorageLayout(storageDirectory).getRaftLogPath()));
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException("Failed to load raft log; refusing to start", e);
+        }
     }
 
     public void start() {

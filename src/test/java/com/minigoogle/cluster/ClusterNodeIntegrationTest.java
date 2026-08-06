@@ -149,6 +149,39 @@ class ClusterNodeIntegrationTest {
         assertTrue(leader.getCurrentTerm() >= 1, "Elected leader should hold a real term");
     }
 
+    @Test
+    void testRaftEntryReplicatesAndCommitsOverHttp() throws InterruptedException {
+        assertTrue(waitUntil(this::allLiveSetsConverged, CONVERGENCE_DEADLINE_MS),
+                "Gossip did not converge: " + node1.getGossip().getLiveNodes());
+        assertTrue(waitUntil(() -> exactlyOneLeader(), CONVERGENCE_DEADLINE_MS),
+                "No single leader elected over the transport");
+
+        RaftConsensus leader = currentLeader();
+        int index = leader.appendEntry("replicate-me".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        assertTrue(waitUntil(() -> followersReplicated(index), CONVERGENCE_DEADLINE_MS),
+                "The entry must replicate to every follower over real HTTP");
+        assertTrue(waitUntil(() -> leader.getCommitIndex() >= index, CONVERGENCE_DEADLINE_MS),
+                "The leader must commit the entry once a majority has replicated it");
+    }
+
+    private RaftConsensus currentLeader() {
+        if (node1.getRaft().getState() == RaftConsensus.RaftState.LEADER) return node1.getRaft();
+        if (node2.getRaft().getState() == RaftConsensus.RaftState.LEADER) return node2.getRaft();
+        if (node3.getRaft().getState() == RaftConsensus.RaftState.LEADER) return node3.getRaft();
+        throw new AssertionError("No leader found");
+    }
+
+    private boolean followersReplicated(int index) {
+        for (ClusterNode node : List.of(node1, node2, node3)) {
+            if (node.getRaft().getState() != RaftConsensus.RaftState.LEADER
+                    && node.getRaft().getLastLogIndex() < index) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private boolean exactlyOneLeader() {
         long leaders = 0;
         if (node1.getRaft().getState() == RaftConsensus.RaftState.LEADER) leaders++;

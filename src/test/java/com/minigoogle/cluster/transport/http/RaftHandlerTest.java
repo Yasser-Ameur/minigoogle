@@ -103,7 +103,7 @@ class RaftHandlerTest {
     void testAppendEntriesEchoesMetadata() throws Exception {
         com.minigoogle.cluster.transport.dto.AppendEntriesRequest req =
                 new com.minigoogle.cluster.transport.dto.AppendEntriesRequest(
-                        1, "ae-req-1", "ae-corr-1", "leader-1", 0L, "leader-1", 2, 1, 1, java.util.List.of(), 1);
+                        1, "ae-req-1", "ae-corr-1", "leader-1", 0L, "leader-1", 2, 0, 0, java.util.List.of(), 0);
 
         HttpResponse<String> resp = post("/cluster/v1/raft/append-entries", req, "leader-1");
 
@@ -114,6 +114,24 @@ class RaftHandlerTest {
         assertEquals("ae-corr-1", body.correlationId());
         assertEquals("local-node", body.sourceNodeId());
         assertTrue(body.success());
+        assertEquals(2, body.term());
+        assertEquals(2, raft.getCurrentTerm());
+    }
+
+    @Test
+    void testAppendEntriesRejectedOnLogMismatch() throws Exception {
+        // prevLogIndex 1 is past the end of this node's empty log: the RPC must
+        // be acknowledged with success=false (the leader then backs off).
+        com.minigoogle.cluster.transport.dto.AppendEntriesRequest req =
+                new com.minigoogle.cluster.transport.dto.AppendEntriesRequest(
+                        1, "ae-req-reject", "ae-corr-reject", "leader-1", 0L, "leader-1", 2, 1, 1, java.util.List.of(), 0);
+
+        HttpResponse<String> resp = post("/cluster/v1/raft/append-entries", req, "leader-1");
+
+        assertEquals(200, resp.statusCode());
+        com.minigoogle.cluster.transport.dto.AppendEntriesResponse body =
+                mapper.readValue(resp.body(), com.minigoogle.cluster.transport.dto.AppendEntriesResponse.class);
+        assertFalse(body.success());
     }
 
     @Test

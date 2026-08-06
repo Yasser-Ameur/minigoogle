@@ -8400,6 +8400,8 @@ Each node stores
     /shard-7
 
     raft-metadata.bin
+
+    raft-log.bin
 ```
 
 Every shard lives inside its own directory.
@@ -15375,9 +15377,13 @@ Leader election is implemented over the internal transport.
 
 Election metadata (currentTerm, votedFor) is persisted before every vote reply and restored on restart via a crash-consistent RaftMetadataStore, so a restarted node never double-votes or regresses its term.
 
+Full log replication is implemented: leaders append entries to a RaftLog (com.minigoogle.cluster) and replicate them through AppendEntries RPCs; followers run the log-consistency check, truncate conflicting tails, and reply success only on a match; the leader advances commitIndex only when a current-term entry sits on a majority of peers. Vote requests carry the candidate's last log index/term and are denied to candidates whose log is behind, so a committed entry can never be overwritten by a newly elected leader.
+
+The replicated log is durable: entries are fsynced to raft-log.bin (a WriteAheadLog) before acknowledgment, and a restarted node replays its log on startup.
+
 Not yet implemented (future work):
 
-Full log replication (lastLogIndex and lastLogTerm remain at 0).
+Applying the committed log to a state machine (nothing consumes the log yet), snapshotting/compaction, and membership reconfiguration.
 
 ---
 
@@ -15427,7 +15433,7 @@ The durable index WAL (storage.wal.WriteAheadLog) provides append + fsync + repl
 
 Raft election metadata is persisted in a separate crash-consistent file (storage.metadata.RaftMetadataStore) so a restart never re-issues a vote for a term it already voted in.
 
-Full log replication over the WAL remains future work.
+The Raft log reuses the same WAL format (storage.wal.WriteAheadLog) for crash recovery of replicated entries: each entry is framed [4-byte term][payload] with a dedicated operation type, appended with fsync, and replayed into the in-memory log on startup. Conflict truncation rewrites the WAL with the retained prefix.
 
 ---
 
