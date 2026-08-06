@@ -8398,6 +8398,8 @@ Each node stores
     /shard-4
 
     /shard-7
+
+    raft-metadata.bin
 ```
 
 Every shard lives inside its own directory.
@@ -15367,6 +15369,16 @@ Nothing becomes permanent
 
 until a majority agrees.
 
+Implementation status:
+
+Leader election is implemented over the internal transport.
+
+Election metadata (currentTerm, votedFor) is persisted before every vote reply and restored on restart via a crash-consistent RaftMetadataStore, so a restarted node never double-votes or regresses its term.
+
+Not yet implemented (future work):
+
+Full log replication (lastLogIndex and lastLogTerm remain at 0).
+
 ---
 
 # 8. Write-Ahead Logging (WAL)
@@ -15408,6 +15420,14 @@ Recover
 ```
 
 No committed operation is lost.
+
+Implementation status:
+
+The durable index WAL (storage.wal.WriteAheadLog) provides append + fsync + replay.
+
+Raft election metadata is persisted in a separate crash-consistent file (storage.metadata.RaftMetadataStore) so a restart never re-issues a vote for a term it already voted in.
+
+Full log replication over the WAL remains future work.
 
 ---
 

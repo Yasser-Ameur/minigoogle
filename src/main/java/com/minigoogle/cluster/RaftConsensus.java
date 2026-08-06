@@ -6,7 +6,11 @@ import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
+import com.minigoogle.storage.metadata.RaftMetadata;
+import com.minigoogle.storage.metadata.RaftMetadataStore;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -28,6 +32,11 @@ import java.util.function.Supplier;
  * When a {@link RaftTransport} is injected, elections and heartbeats cross
  * the wire: candidates send RequestVote RPCs, the leader sends AppendEntries
  * heartbeats, and any higher term observed in a response steps the node down.
+ *
+ * Election metadata ({@code currentTerm} and {@code votedFor}) is persisted
+ * through an optional {@link RaftMetadataStore}: it is written before every
+ * vote reply and every term transition, and restored on construction, so a
+ * node never double-votes or regresses its term across a restart.
  */
 public class RaftConsensus {
 
@@ -40,6 +49,7 @@ public class RaftConsensus {
 
     private final RaftTransport transport;
     private final Supplier<List<String>> peerSupplier;
+    private final RaftMetadataStore metadataStore;
 
     // Log replication is not implemented; the position stays at 0.
     private volatile int lastLogIndex;
@@ -105,12 +115,33 @@ public class RaftConsensus {
      */
     public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize,
                          RaftTransport transport, Supplier<List<String>> peerSupplier) {
+        this(nodeId, electionTimeoutMs, heartbeatIntervalMs, clusterSize, transport, peerSupplier,
+                RaftMetadataStore.inMemory());
+    }
+
+    /**
+     * Full configuration with transport, peer discovery, and durable election
+     * metadata. Restores the persisted {@code currentTerm} and {@code votedFor}
+     * on construction so a restart never double-votes or regresses its term.
+     * A corrupt metadata file fails startup fast (unchecked) rather than
+     * silently resetting a vote.
+     *
+     * @param nodeId              The unique identifier for this node.
+     * @param electionTimeoutMs   The election timeout in milliseconds.
+     * @param heartbeatIntervalMs The heartbeat interval in milliseconds.
+     * @param clusterSize         Fallback cluster size when no peer supplier is given.
+     * @param transport           The transport for cluster RPCs, or {@code null} for in-memory operation.
+     * @param peerSupplier        Supplies the current peer IDs, or {@code null} to rely on {@code clusterSize}.
+     * @param metadataStore       The store for {@code currentTerm} and {@code votedFor}, or {@code null}
+     *                            to keep the metadata in memory only.
+     */
+    public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize,
+                         RaftTransport transport, Supplier<List<String>> peerSupplier,
+                         RaftMetadataStore metadataStore) {
         this.nodeId = nodeId;
         this.state = RaftState.FOLLOWER;
         this.currentLeader = null;
-        this.currentTerm = 0;
         this.votesReceived = 0;
-        this.votedFor = null;
         this.lastLogIndex = 0;
         this.lastLogTerm = 0;
         this.commitIndex = 0;
@@ -119,6 +150,10 @@ public class RaftConsensus {
         this.clusterSize = clusterSize;
         this.transport = transport;
         this.peerSupplier = peerSupplier;
+        this.metadataStore = metadataStore == null ? RaftMetadataStore.inMemory() : metadataStore;
+        RaftMetadata restored = restoreMetadata();
+        this.currentTerm = restored.currentTerm();
+        this.votedFor = restored.votedFor();
     }
 
     /**
@@ -148,10 +183,14 @@ public class RaftConsensus {
      */
     public synchronized void receiveHeartbeat(String leaderId, int term) {
         if (term >= currentTerm) {
+            boolean termChanged = term > currentTerm;
             currentTerm = term;
             currentLeader = leaderId;
             state = RaftState.FOLLOWER;
             votesReceived = 0;
+            if (termChanged) {
+                persistMetadata();
+            }
         }
         scheduleElectionTimeout();
     }
@@ -168,11 +207,13 @@ public class RaftConsensus {
             state = RaftState.FOLLOWER;
             votesReceived = 0;
             votedFor = candidateId;
+            persistMetadata();
             scheduleElectionTimeout();
             return true; // Vote for the candidate with higher term
         }
         if (term == currentTerm && (votedFor == null || votedFor.equals(candidateId))) {
             votedFor = candidateId;
+            persistMetadata();
             scheduleElectionTimeout();
             return true;
         }
@@ -192,6 +233,7 @@ public class RaftConsensus {
         votesReceived = 1; // Vote for self
         votedFor = nodeId;
         currentLeader = null;
+        persistMetadata();
         requestVotesFromPeers();
         scheduleElectionTimeout();
     }
@@ -318,7 +360,35 @@ public class RaftConsensus {
         currentLeader = null;
         votesReceived = 0;
         votedFor = null;
+        persistMetadata();
         scheduleElectionTimeout();
+    }
+
+    /**
+     * Restores the persisted {@code currentTerm} and {@code votedFor}. Fails
+     * startup fast if the metadata file exists but cannot be parsed, rather
+     * than silently forgetting a vote.
+     */
+    private RaftMetadata restoreMetadata() {
+        try {
+            return metadataStore.load();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to load raft metadata; refusing to start", e);
+        }
+    }
+
+    /**
+     * Durably records the current term and vote. Invoked before any vote
+     * reply or term transition is exposed. A persistence failure aborts the
+     * operation: the grant has not been made durable and must not be
+     * acknowledged.
+     */
+    private void persistMetadata() {
+        try {
+            metadataStore.persist(currentTerm, votedFor);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to persist raft metadata", e);
+        }
     }
 
     /**

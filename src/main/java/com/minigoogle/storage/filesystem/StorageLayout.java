@@ -36,4 +36,12 @@ public class StorageLayout {
     public Path getSegmentDirectory(int shardId, String segmentId) {
         return getShardDirectory(shardId).resolve("segment-" + segmentId);
     }
+
+    /**
+     * @return The path to the file holding this node's durable Raft election
+     *         metadata ({@code currentTerm}, {@code votedFor}).
+     */
+    public Path getRaftMetadataPath() {
+        return baseDirectory.resolve("raft-metadata.bin");
+    }
 }

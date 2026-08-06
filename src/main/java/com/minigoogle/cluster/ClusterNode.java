@@ -12,8 +12,11 @@ import com.minigoogle.cluster.transport.http.InternalClusterServer;
 import com.minigoogle.cluster.transport.http.RaftHandler;
 import com.minigoogle.cluster.transport.http.SearchHandler;
 import com.minigoogle.distributed.query.execution.SearchExecutor;
+import com.minigoogle.storage.filesystem.StorageLayout;
+import com.minigoogle.storage.metadata.RaftMetadataStore;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.List;
 
 /**
@@ -98,6 +101,60 @@ public class ClusterNode {
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, RaftMetadataStore.inMemory());
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with durable Raft
+     * election metadata rooted at {@code storageDirectory}.
+     *
+     * <p>Raft's {@code currentTerm} and {@code votedFor} are persisted to
+     * {@code <storageDirectory>/raft-metadata.bin} before every vote reply, so
+     * a node restarted on the same directory resumes with the same term and
+     * vote and can never double-vote or regress its term.</p>
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param storageDirectory     Base directory for durable cluster state, or
+     *                             {@code null} to keep Raft metadata in memory.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, Path storageDirectory) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, createRaftMetadataStore(storageDirectory));
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with an explicit
+     * Raft metadata store.
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param raftMetadataStore    Store for {@code currentTerm} and
+     *                             {@code votedFor}, or {@code null} to keep the
+     *                             metadata in memory only.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, RaftMetadataStore raftMetadataStore) throws IOException {
         this.nodeId = nodeId;
         ObjectMapper mapper = new ObjectMapper();
         this.server = new InternalClusterServer(port, mapper);
@@ -116,7 +173,8 @@ public class ClusterNode {
 
         // Raft resolves its peers from the gossip membership table, so it only
         // campaigns against nodes that gossip currently believes are alive.
-        this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes);
+        this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes,
+                raftMetadataStore == null ? RaftMetadataStore.inMemory() : raftMetadataStore);
 
         server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
@@ -124,6 +182,13 @@ public class ClusterNode {
         server.registerProtectedContext("/cluster/v1/search/dispatch", new SearchHandler(localSearch, mapper, nodeId), security);
 
         this.transports = List.of(membershipTransport, raftTransport, searchTransport);
+    }
+
+    private static RaftMetadataStore createRaftMetadataStore(Path storageDirectory) {
+        if (storageDirectory == null) {
+            return RaftMetadataStore.inMemory();
+        }
+        return new RaftMetadataStore(new StorageLayout(storageDirectory).getRaftMetadataPath());
     }
 
     public void start() {
