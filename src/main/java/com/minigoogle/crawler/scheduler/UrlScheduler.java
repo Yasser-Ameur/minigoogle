@@ -30,6 +30,7 @@ public class UrlScheduler {
     private final ConcurrentHashMap<String, DomainQueue> domainQueues;
     private final Map<String, Integer> domainAuthority;
     private final Map<String, Integer> domainLinkCount;
+    private final ConcurrentHashMap<String, Long> domainCrawlDelays;
     private final ReentrantLock schedulerLock;
     private int lastDispatchedDomainIndex;
 
@@ -37,6 +38,7 @@ public class UrlScheduler {
         this.domainQueues = new ConcurrentHashMap<>();
         this.domainAuthority = new ConcurrentHashMap<>();
         this.domainLinkCount = new ConcurrentHashMap<>();
+        this.domainCrawlDelays = new ConcurrentHashMap<>();
         this.schedulerLock = new ReentrantLock();
         this.lastDispatchedDomainIndex = 0;
     }
@@ -47,10 +49,55 @@ public class UrlScheduler {
 
         DomainQueue domainQueue = domainQueues.computeIfAbsent(
             task.getDomain(),
-            d -> new DomainQueue(d, DEFAULT_CRAWL_DELAY_MS)
+            d -> new DomainQueue(d, crawlDelayFor(d))
         );
         domainQueue.enqueue(task);
         logger.debug("Submitted task to scheduler: {} with priority {}", task.getUrl(), task.getPriority());
+    }
+
+    /**
+     * Re-enters a restored task into its domain queue without recomputing its
+     * priority or changing its state, preserving snapshot fidelity. Eligible
+     * restored tasks keep their {@code nextAllowedFetch} backoff, which is
+     * honored at dispatch time.
+     */
+    public void requeueRestored(CrawlTask task) {
+        DomainQueue domainQueue = domainQueues.computeIfAbsent(
+            task.getDomain(),
+            d -> new DomainQueue(d, crawlDelayFor(d))
+        );
+        domainQueue.enqueue(task);
+        logger.debug("Requeued restored task: {}", task.getUrl());
+    }
+
+    /**
+     * Re-queues completed (INDEXED/FETCHED) tasks whose {@code nextCrawl}
+     * deadline has passed so they are fetched again. Returns the number of
+     * tasks resubmitted.
+     */
+    public int resubmitDueRecrawls(Map<String, CrawlTask> registry) {
+        schedulerLock.lock();
+        try {
+            int resubmitted = 0;
+            for (CrawlTask task : registry.values()) {
+                com.minigoogle.crawler.model.UrlState state = task.getState();
+                Instant nextCrawl = task.getNextCrawl();
+                if ((state == com.minigoogle.crawler.model.UrlState.INDEXED
+                        || state == com.minigoogle.crawler.model.UrlState.FETCHED)
+                        && nextCrawl != null
+                        && !nextCrawl.isAfter(Instant.now())) {
+                    task.requeue();
+                    submitTask(task);
+                    resubmitted++;
+                }
+            }
+            if (resubmitted > 0) {
+                logger.info("Resubmitted {} due recrawl task(s)", resubmitted);
+            }
+            return resubmitted;
+        } finally {
+            schedulerLock.unlock();
+        }
     }
 
     public Optional<CrawlTask> nextEligibleTask() {
@@ -107,10 +154,17 @@ public class UrlScheduler {
     }
 
     public void updateCrawlDelay(String domain, long crawlDelayMillis) {
+        if (crawlDelayMillis <= 0) return;
+        domainCrawlDelays.put(domain, crawlDelayMillis);
         DomainQueue queue = domainQueues.get(domain);
         if (queue != null) {
-            logger.info("Updated crawl delay for {} to {}ms", domain, crawlDelayMillis);
+            queue.setCrawlDelayMillis(crawlDelayMillis);
         }
+        logger.info("Updated crawl delay for {} to {}ms", domain, crawlDelayMillis);
+    }
+
+    private long crawlDelayFor(String domain) {
+        return domainCrawlDelays.getOrDefault(domain, DEFAULT_CRAWL_DELAY_MS);
     }
 
     public int computePriority(CrawlTask task) {

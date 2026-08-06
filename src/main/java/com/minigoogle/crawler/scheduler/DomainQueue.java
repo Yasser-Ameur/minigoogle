@@ -23,15 +23,15 @@ public class DomainQueue {
     private static final int BUCKET_MEDIUM_MIN = 30;
 
     private final String domain;
-    private final long defaultCrawlDelayMillis;
     private final LinkedList<CrawlTask>[] buckets;
     private final ReentrantLock lock;
+    private volatile long crawlDelayMillis;
     private Instant lastFetchTime;
 
     @SuppressWarnings("unchecked")
     public DomainQueue(String domain, long defaultCrawlDelayMillis) {
         this.domain = domain;
-        this.defaultCrawlDelayMillis = defaultCrawlDelayMillis;
+        this.crawlDelayMillis = defaultCrawlDelayMillis;
         this.buckets = new LinkedList[4];
         for (int i = 0; i < 4; i++) {
             this.buckets[i] = new LinkedList<>();
@@ -58,17 +58,30 @@ public class DomainQueue {
             Instant now = Instant.now();
             long elapsed = Duration.between(lastFetchTime, now).toMillis();
 
-            if (elapsed < defaultCrawlDelayMillis) {
+            if (elapsed < crawlDelayMillis) {
                 return null;
             }
 
             for (int i = 0; i < 4; i++) {
-                if (!buckets[i].isEmpty()) {
-                    CrawlTask task = buckets[i].pollFirst();
-                    lastFetchTime = now;
-                    logger.debug("Dispatched task from domain {}: {} (bucket: {}, remaining: {})",
-                        domain, task.getUrl(), bucketName(i), size());
-                    return task;
+                LinkedList<CrawlTask> bucket = buckets[i];
+                if (bucket.isEmpty()) continue;
+
+                java.util.List<CrawlTask> deferred = new java.util.ArrayList<>();
+                while (!bucket.isEmpty()) {
+                    CrawlTask task = bucket.pollFirst();
+                    if (!task.getNextAllowedFetch().isAfter(now)) {
+                        if (!deferred.isEmpty()) {
+                            bucket.addAll(0, deferred);
+                        }
+                        lastFetchTime = now;
+                        logger.debug("Dispatched task from domain {}: {} (bucket: {}, remaining: {})",
+                            domain, task.getUrl(), bucketName(i), size());
+                        return task;
+                    }
+                    deferred.add(task);
+                }
+                if (!deferred.isEmpty()) {
+                    bucket.addAll(deferred);
                 }
             }
             return null;
@@ -77,11 +90,16 @@ public class DomainQueue {
         }
     }
 
+    public void setCrawlDelayMillis(long crawlDelayMillis) {
+        this.crawlDelayMillis = crawlDelayMillis;
+        logger.debug("Set crawl delay for {} to {}ms", domain, crawlDelayMillis);
+    }
+
     public long getRemainingDelayMillis() {
         lock.lock();
         try {
             long elapsed = Duration.between(lastFetchTime, Instant.now()).toMillis();
-            return Math.max(0, defaultCrawlDelayMillis - elapsed);
+            return Math.max(0, crawlDelayMillis - elapsed);
         } finally {
             lock.unlock();
         }

@@ -92,6 +92,30 @@ class DomainQueueTest {
         assertTrue(remaining > 0, "Should have remaining delay after fetch");
     }
 
+    @Test
+    void testSetCrawlDelayMillis() throws InterruptedException {
+        DomainQueue shortDelayQueue = new DomainQueue("example.com", 1000);
+        shortDelayQueue.setCrawlDelayMillis(80);
+
+        shortDelayQueue.enqueue(createTask("https://example.com/page1"));
+        shortDelayQueue.enqueue(createTask("https://example.com/page2"));
+
+        assertNotNull(shortDelayQueue.pollEligible());
+        Thread.sleep(120);
+
+        assertNotNull(shortDelayQueue.pollEligible(), "Updated delay should allow polling after it elapses");
+    }
+
+    @Test
+    void testPollHonorsPerTaskBackoff() {
+        CrawlTask task = createTask("https://example.com/page1");
+        task.setNextAllowedFetch(Instant.now().plusSeconds(60));
+        queue.enqueue(task);
+
+        assertNull(queue.pollEligible(), "Task should not be dispatched before its backoff elapses");
+        assertEquals(1, queue.size(), "Deferred task should remain queued");
+    }
+
     private CrawlTask createTask(String url) {
         URI uri = URI.create(url);
         return new CrawlTask(uri, "example.com", 0, Instant.now());

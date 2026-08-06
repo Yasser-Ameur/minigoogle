@@ -131,6 +131,79 @@ class UrlSchedulerTest {
         assertTrue(scheduler.getActiveDomains().contains("github.com"));
     }
 
+    @Test
+    void testRetryTaskNotDispatchedBeforeBackoffElapses() {
+        CrawlTask task = createTask("https://example.com/page1", "example.com");
+        scheduler.submitTask(task);
+        scheduler.nextEligibleTask();
+
+        scheduler.onTaskFailed(task);
+
+        assertEquals(UrlState.RETRY, task.getState());
+        assertEquals(1, task.getRetryCount());
+
+        Optional<CrawlTask> early = scheduler.nextEligibleTask();
+        assertTrue(early.isEmpty(), "Retry task should not be dispatched before its backoff elapses");
+    }
+
+    @Test
+    void testUpdateCrawlDelayAppliesToExistingQueue() {
+        scheduler.submitTask(createTask("https://example.com/page1", "example.com"));
+
+        scheduler.updateCrawlDelay("example.com", 5000);
+
+        assertTrue(scheduler.nextEligibleTask().isPresent());
+        assertTrue(scheduler.nextEligibleTask().isEmpty(), "Longer delay should gate immediate second dispatch");
+    }
+
+    @Test
+    void testUpdateCrawlDelayAppliesToNewQueues() {
+        scheduler.updateCrawlDelay("example.com", 5000);
+        scheduler.submitTask(createTask("https://example.com/page1", "example.com"));
+
+        assertTrue(scheduler.nextEligibleTask().isPresent());
+        assertTrue(scheduler.nextEligibleTask().isEmpty(), "New queue should inherit the configured delay");
+    }
+
+    @Test
+    void testZeroCrawlDelayKeepsDefaultPoliteness() {
+        scheduler.updateCrawlDelay("example.com", 0);
+        scheduler.submitTask(createTask("https://example.com/page1", "example.com"));
+
+        assertTrue(scheduler.nextEligibleTask().isPresent());
+        assertTrue(scheduler.nextEligibleTask().isEmpty(), "Default politeness delay should still apply");
+    }
+
+    @Test
+    void testResubmitDueRecrawls() {
+        CrawlTask task = createTask("https://example.com/page1", "example.com");
+        task.setState(UrlState.INDEXED);
+        task.setNextCrawl(Instant.now().minusSeconds(60));
+        java.util.Map<String, CrawlTask> registry = new java.util.HashMap<>();
+        registry.put(task.getUrl().toString(), task);
+
+        int resubmitted = scheduler.resubmitDueRecrawls(registry);
+
+        assertEquals(1, resubmitted);
+        assertEquals(1, scheduler.getQueueSize());
+        assertEquals(UrlState.QUEUED, task.getState());
+    }
+
+    @Test
+    void testResubmitSkipsNotYetDueRecrawls() {
+        CrawlTask task = createTask("https://example.com/page1", "example.com");
+        task.setState(UrlState.INDEXED);
+        task.setNextCrawl(Instant.now().plusSeconds(60));
+        java.util.Map<String, CrawlTask> registry = new java.util.HashMap<>();
+        registry.put(task.getUrl().toString(), task);
+
+        int resubmitted = scheduler.resubmitDueRecrawls(registry);
+
+        assertEquals(0, resubmitted);
+        assertEquals(0, scheduler.getQueueSize());
+        assertEquals(UrlState.INDEXED, task.getState());
+    }
+
     private CrawlTask createTask(String url, String domain) {
         URI uri = URI.create(url);
         return new CrawlTask(uri, domain, 0, Instant.now());

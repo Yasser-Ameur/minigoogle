@@ -10,16 +10,16 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 /**
  * Robots.txt parser and fetcher with crawl-delay rate-limit enforcement.
- * Downloads and parses robots.txt for each domain, caches the resulting rules,
- * and provides path-level allow/disallow decisions with longest-prefix matching.
+ * Downloads and parses robots.txt for each origin, providing path-level
+ * allow/disallow decisions with longest-prefix matching and per-origin
+ * crawl-delay discovery. Fetches honor the request's scheme and port and
+ * fall back from HTTPS to HTTP when the primary scheme is unreachable.
  */
 public class RobotsManager {
 
@@ -28,7 +28,6 @@ public class RobotsManager {
     private static final String BOT_NAME = "MiniGoogleBot";
 
     private final HttpClient client;
-    private final ConcurrentHashMap<String, Rules> domainRules = new ConcurrentHashMap<>();
 
     public RobotsManager() {
         this.client = HttpClient.newBuilder()
@@ -38,61 +37,88 @@ public class RobotsManager {
 
     public boolean isAllowed(URI uri) {
         if (uri == null || uri.getHost() == null) return false;
-        String host = uri.getHost().toLowerCase();
-        
-        Rules rules = domainRules.computeIfAbsent(host, this::fetchAndParseRobots);
-        
-        String path = uri.getPath();
-        if (path == null || path.isEmpty()) path = "/";
-        
-        return rules.isAllowed(path);
+        return fetchAndParseRobots(uri).isAllowed(pathOf(uri));
     }
-    
+
     public long getCrawlDelayMillis(URI uri) {
-         if (uri == null || uri.getHost() == null) return 0;
-         String host = uri.getHost().toLowerCase();
-         Rules rules = domainRules.getOrDefault(host, Rules.DEFAULT);
-         return rules.crawlDelaySeconds() * 1000L;
+        if (uri == null || uri.getHost() == null) return 0;
+        return fetchAndParseRobots(uri).crawlDelaySeconds() * 1000L;
     }
 
-    private Rules fetchAndParseRobots(String host) {
-        try {
-            URI robotsUri = new URI("https", null, host, -1, "/robots.txt", null, null);
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(robotsUri)
-                .timeout(Duration.ofSeconds(5))
-                .header("User-Agent", USER_AGENT)
-                .GET()
-                .build();
+    /**
+     * Fetches and parses robots.txt for the origin of {@code uri}.
+     * Tries the request's scheme first, then HTTPS and HTTP as fallbacks.
+     * Status handling: 200 parses rules; 401/403 disallow the whole site;
+     * 404/410 means no rules exist (allow everything); other statuses default
+     * to allowing. Any network failure also defaults to allowing so crawling
+     * is never hard-blocked by an unreachable robots endpoint.
+     */
+    public Rules fetchAndParseRobots(URI uri) {
+        if (uri == null || uri.getHost() == null) return Rules.DEFAULT;
+        String host = uri.getHost().toLowerCase();
+        int port = uri.getPort();
 
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            
-            if (response.statusCode() == 200) {
-                return parseRobotsTxt(response.body());
+        Set<String> schemes = new LinkedHashSet<>();
+        schemes.add(uri.getScheme() != null ? uri.getScheme() : "https");
+        schemes.add("https");
+        schemes.add("http");
+
+        for (String scheme : schemes) {
+            try {
+                URI robotsUri = new URI(scheme, null, host, port >= 0 ? port : -1, "/robots.txt", null, null);
+                HttpRequest request = HttpRequest.newBuilder()
+                    .uri(robotsUri)
+                    .timeout(Duration.ofSeconds(5))
+                    .header("User-Agent", USER_AGENT)
+                    .GET()
+                    .build();
+
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                int status = response.statusCode();
+
+                if (status == 200) {
+                    return parseRobotsTxt(response.body());
+                }
+                if (status == 401 || status == 403) {
+                    logger.warn("robots.txt for {} returned {}, disallowing entire site", robotsUri, status);
+                    return Rules.DISALLOW_ALL;
+                }
+                if (status == 404 || status == 410) {
+                    logger.debug("robots.txt for {} not found ({}), assuming no restrictions", robotsUri, status);
+                    return Rules.DEFAULT;
+                }
+                logger.debug("robots.txt for {} returned {}, assuming no restrictions", robotsUri, status);
+                return Rules.DEFAULT;
+            } catch (Exception e) {
+                logger.debug("Could not fetch robots.txt via {}://{}:{}, trying next scheme. Error: {}",
+                    scheme, host, port, e.getMessage());
             }
-        } catch (Exception e) {
-            logger.warn("Could not fetch robots.txt for {}, assuming allowed. Error: {}", host, e.getMessage());
         }
         return Rules.DEFAULT;
+    }
+
+    private static String pathOf(URI uri) {
+        String path = uri.getPath();
+        return (path == null || path.isEmpty()) ? "/" : path;
     }
 
     private Rules parseRobotsTxt(String content) {
         Map<String, Boolean> pathsAllowed = new HashMap<>();
         long crawlDelay = 0;
-        
+
         boolean inUserAgentBlock = false;
-        
+
         String[] lines = content.split("\\r?\\n");
         for (String line : lines) {
             line = line.trim();
             if (line.isEmpty() || line.startsWith("#")) continue;
-            
+
             String[] parts = line.split(":", 2);
             if (parts.length != 2) continue;
-            
+
             String key = parts[0].trim().toLowerCase();
             String value = parts[1].trim();
-            
+
             if (key.equals("user-agent")) {
                 inUserAgentBlock = value.equalsIgnoreCase(BOT_NAME) || value.equals("*");
             } else if (inUserAgentBlock) {
@@ -102,23 +128,30 @@ public class RobotsManager {
                     if (!value.isEmpty()) pathsAllowed.put(value, true);
                 } else if (key.equals("crawl-delay")) {
                     try {
-                        crawlDelay = Long.parseLong(value);
+                        crawlDelay = (long) Double.parseDouble(value);
                     } catch (NumberFormatException ignored) {}
                 }
             }
         }
-        
-        return new Rules(pathsAllowed, crawlDelay);
+
+        return new Rules(pathsAllowed, crawlDelay, true);
     }
 
-    record Rules(Map<String, Boolean> pathRules, long crawlDelaySeconds) {
-        static final Rules DEFAULT = new Rules(Collections.emptyMap(), 0);
-        
+    /**
+     * Parsed robots.txt rules for a single origin with longest-prefix matching.
+     * A path matches the most specific rule; if no rule matches, the decision
+     * falls back to {@code defaultAllowed}.
+     */
+    public record Rules(Map<String, Boolean> pathRules, long crawlDelaySeconds, boolean defaultAllowed) {
+        static final Rules DEFAULT = new Rules(Collections.emptyMap(), 0, true);
+        static final Rules DISALLOW_ALL = new Rules(Collections.emptyMap(), 0, false);
+
         boolean isAllowed(String path) {
-            // Find most specific match
+            if (path == null || path.isEmpty()) path = "/";
+
             String longestMatch = "";
-            Boolean allowed = true;
-            
+            Boolean allowed = null;
+
             for (Map.Entry<String, Boolean> entry : pathRules.entrySet()) {
                 String rulePath = entry.getKey();
                 if (path.startsWith(rulePath) && rulePath.length() > longestMatch.length()) {
@@ -126,7 +159,7 @@ public class RobotsManager {
                     allowed = entry.getValue();
                 }
             }
-            return allowed;
+            return allowed != null ? allowed : defaultAllowed;
         }
     }
 }

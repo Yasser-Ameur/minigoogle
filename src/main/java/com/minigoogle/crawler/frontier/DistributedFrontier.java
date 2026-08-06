@@ -35,6 +35,7 @@ public class DistributedFrontier {
     private volatile long totalAssigned;
     private volatile long totalCompleted;
     private volatile long totalFailed;
+    private volatile java.util.function.Function<URI, Instant> recrawlPolicy;
 
     public DistributedFrontier(int bloomFilterExpectedElements, double bloomFilterFalsePositiveRate, long heartbeatTimeoutMillis) {
         this.bloomFilter = new BloomFilter(bloomFilterExpectedElements, bloomFilterFalsePositiveRate);
@@ -80,11 +81,17 @@ public class DistributedFrontier {
         try {
             Optional<CrawlTask> taskOpt = scheduler.nextEligibleTask();
             if (taskOpt.isEmpty()) {
+                int resubmitted = scheduler.resubmitDueRecrawls(taskRegistry);
+                if (resubmitted > 0) {
+                    taskOpt = scheduler.nextEligibleTask();
+                }
+            }
+            if (taskOpt.isEmpty()) {
                 return Optional.empty();
             }
 
             CrawlTask task = taskOpt.get();
-            if (task.getState() != UrlState.QUEUED) {
+            if (task.getState() != UrlState.QUEUED && task.getState() != UrlState.RETRY) {
                 return Optional.empty();
             }
 
@@ -107,6 +114,9 @@ public class DistributedFrontier {
         CrawlTask task = taskRegistry.get(urlString);
         if (task != null) {
             task.markIndexed();
+            if (recrawlPolicy != null) {
+                task.setNextCrawl(recrawlPolicy.apply(task.getUrl()));
+            }
             totalCompleted++;
             scheduler.onTaskCompleted(urlString);
             logger.debug("Task completed: {}", urlString);
@@ -141,6 +151,7 @@ public class DistributedFrontier {
             CrawlTask currentTask = heartbeat.getCurrentTask();
             if (currentTask != null) {
                 currentTask.requeue();
+                scheduler.submitTask(currentTask);
                 recoveredTasks.add(currentTask);
                 logger.warn("Recovered task from failed worker {}: {}", workerId, currentTask.getUrl());
             }
@@ -149,6 +160,7 @@ public class DistributedFrontier {
         for (CrawlTask task : taskRegistry.values()) {
             if (task.getState() == UrlState.ASSIGNED && workerId.equals(task.getAssignedWorkerId())) {
                 task.requeue();
+                scheduler.submitTask(task);
                 recoveredTasks.add(task);
                 logger.warn("Recovered orphaned task from worker {}: {}", workerId, task.getUrl());
             }
@@ -193,6 +205,33 @@ public class DistributedFrontier {
 
     public void restoreTask(CrawlTask task) {
         taskRegistry.put(task.getUrl().toString(), task);
+    }
+
+    /**
+     * Re-enters restored QUEUED/RETRY tasks into the scheduler so they can be
+     * dispatched after a restart. Snapshot state and priority are preserved;
+     * per-task {@code nextAllowedFetch} backoff is still honored at dispatch.
+     */
+    public void rehydrateScheduler() {
+        int requeued = 0;
+        for (CrawlTask task : taskRegistry.values()) {
+            UrlState state = task.getState();
+            if (state == UrlState.QUEUED || state == UrlState.RETRY) {
+                scheduler.requeueRestored(task);
+                requeued++;
+            }
+        }
+        if (requeued > 0) {
+            logger.info("Rehydrated {} task(s) into the scheduler", requeued);
+        }
+    }
+
+    /**
+     * Sets the policy used to compute the next crawl time for completed tasks.
+     * When null (default), completed tasks are not automatically recrawled.
+     */
+    public void setRecrawlPolicy(java.util.function.Function<URI, Instant> recrawlPolicy) {
+        this.recrawlPolicy = recrawlPolicy;
     }
 
     public void restoreWorkerHeartbeat(WorkerHeartbeat heartbeat) {

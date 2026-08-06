@@ -55,6 +55,7 @@ public class CrawlCoordinator {
     public CrawlCoordinator(int numWorkers) {
         this.numWorkers = numWorkers;
         this.frontier = new DistributedFrontier(BLOOM_FILTER_EXPECTED_ELEMENTS, BLOOM_FILTER_FALSE_POSITIVE_RATE, HEARTBEAT_TIMEOUT_MS);
+        this.frontier.setRecrawlPolicy(this::nextRecrawlInstant);
         this.normalizer = new StandardUrlNormalizer();
         this.robotsCache = new RobotsCache(new RobotsManager());
         this.snapshot = new FrontierSnapshot(SNAPSHOT_DIR);
@@ -138,6 +139,7 @@ public class CrawlCoordinator {
         try {
             FrontierSnapshot.SnapshotResult result = FrontierSnapshot.restore(frontier, SNAPSHOT_DIR);
             if (result.restored()) {
+                frontier.rehydrateScheduler();
                 logger.info("Restored from snapshot: {} tasks in registry", frontier.getRegistrySize());
                 if (result.robotsCache() != null) {
                     logger.info("Restored robots cache with {} entries", result.robotsCache().cachedDomainCount());
@@ -168,6 +170,11 @@ public class CrawlCoordinator {
                 frontier.addUrl(uri, depth);
                 frontier.getScheduler().incrementLinkCount(uri.getHost().toLowerCase());
 
+                long crawlDelay = robotsCache.getCrawlDelayMillis(uri);
+                if (crawlDelay > 0) {
+                    frontier.getScheduler().updateCrawlDelay(uri.getHost().toLowerCase(), crawlDelay);
+                }
+
                 CrawlTask task = frontier.getTask(uri.toString());
                 if (task != null) {
                     task.setNextCrawl(computeNextCrawl(uri));
@@ -180,28 +187,36 @@ public class CrawlCoordinator {
         }
     }
 
+    private Instant nextRecrawlInstant(URI uri) {
+        return Instant.now().plus(recrawlInterval(uri));
+    }
+
     private Instant computeNextCrawl(URI uri) {
+        return nextRecrawlInstant(uri);
+    }
+
+    private Duration recrawlInterval(URI uri) {
         String host = uri.getHost().toLowerCase();
         String path = uri.getPath() != null ? uri.getPath().toLowerCase() : "";
 
         if (host.contains("wikipedia.org") || host.contains("wikimedia.org")) {
-            return Instant.now().plus(WIKI_RECRAWL_INTERVAL);
+            return WIKI_RECRAWL_INTERVAL;
         }
 
         if (host.endsWith(".edu") || host.endsWith(".ac.uk") || host.endsWith(".edu.au")) {
-            return Instant.now().plus(UNIVERSITY_RECRAWL_INTERVAL);
+            return UNIVERSITY_RECRAWL_INTERVAL;
         }
 
         if (path.endsWith(".pdf") || path.endsWith(".doc") || path.endsWith(".docx") ||
             path.endsWith(".ps") || path.endsWith(".epub")) {
-            return Instant.now().plus(ARCHIVE_RECRAWL_INTERVAL);
+            return ARCHIVE_RECRAWL_INTERVAL;
         }
 
         if (path.endsWith("/wiki") || host.contains("wiki")) {
-            return Instant.now().plus(Duration.ofMinutes(60));
+            return Duration.ofMinutes(60);
         }
 
-        return Instant.now().plus(DEFAULT_RECRAWL_INTERVAL);
+        return DEFAULT_RECRAWL_INTERVAL;
     }
 
     private void startHealthChecker() {

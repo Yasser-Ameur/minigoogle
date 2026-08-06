@@ -156,4 +156,66 @@ class DistributedFrontierTest {
         assertTrue(task2.isPresent());
         assertNotEquals(task1.get().getDomain(), task2.get().getDomain());
     }
+
+    @Test
+    void testRehydrateSchedulerRestoresQueuedTasks() {
+        CrawlTask task1 = new CrawlTask(URI.create("https://example.com"), "example.com", 0, Instant.now());
+        task1.setState(UrlState.QUEUED);
+        CrawlTask task2 = new CrawlTask(URI.create("https://google.com"), "google.com", 0, Instant.now());
+        task2.setState(UrlState.QUEUED);
+
+        frontier.restoreTask(task1);
+        frontier.restoreTask(task2);
+
+        assertEquals(0, frontier.getScheduler().getQueueSize(), "Restored tasks are not in the scheduler yet");
+
+        frontier.rehydrateScheduler();
+
+        assertEquals(2, frontier.getScheduler().getQueueSize());
+        Optional<CrawlTask> dispatched = frontier.requestWork("worker-1");
+        assertTrue(dispatched.isPresent());
+        assertEquals(UrlState.ASSIGNED, dispatched.get().getState());
+    }
+
+    @Test
+    void testRehydratedRetryTaskCanBeDispatched() {
+        CrawlTask task = new CrawlTask(URI.create("https://example.com"), "example.com", 0, Instant.now());
+        task.setState(UrlState.RETRY);
+
+        frontier.restoreTask(task);
+        frontier.rehydrateScheduler();
+
+        Optional<CrawlTask> dispatched = frontier.requestWork("worker-1");
+        assertTrue(dispatched.isPresent(), "Restored retry task should be dispatchable");
+        assertEquals(UrlState.ASSIGNED, dispatched.get().getState());
+    }
+
+    @Test
+    void testCompleteTaskReschedulesNextCrawl() throws InterruptedException {
+        frontier.setRecrawlPolicy(uri -> Instant.now().minus(Duration.ofHours(1)));
+        frontier.addUrl(URI.create("https://example.com"), 0);
+        frontier.getScheduler().updateCrawlDelay("example.com", 50);
+
+        CrawlTask task = frontier.requestWork("worker-1").orElseThrow();
+        frontier.completeTask(task.getUrl().toString());
+
+        assertEquals(UrlState.INDEXED, task.getState());
+
+        Thread.sleep(80);
+        Optional<CrawlTask> recrawled = frontier.requestWork("worker-1");
+        assertTrue(recrawled.isPresent(), "Due recrawl task should be re-dispatched");
+        assertEquals("https://example.com", recrawled.get().getUrl().toString());
+        assertEquals(UrlState.ASSIGNED, recrawled.get().getState());
+    }
+
+    @Test
+    void testNoRecrawlBeforeNextCrawlDue() {
+        frontier.setRecrawlPolicy(uri -> Instant.now().plus(Duration.ofHours(24)));
+
+        frontier.addUrl(URI.create("https://example.com"), 0);
+        CrawlTask task = frontier.requestWork("worker-1").orElseThrow();
+        frontier.completeTask(task.getUrl().toString());
+
+        assertTrue(frontier.requestWork("worker-1").isEmpty(), "Not-yet-due tasks should not be recrawled");
+    }
 }
