@@ -161,6 +161,8 @@ class ClusterNodeSnapshotIntegrationTest {
             assertEquals(20, leader.getRaft().getLastApplied(), "Every entry must commit on the leader");
             assertTrue(leader.getRaft().getLogFirstIndex() > 7,
                     "The leader must compact the log past node-3's position");
+            assertTrue(waitUntil(() -> bothCompactedPast(List.of(node1, node2), 7), CONVERGENCE_DEADLINE_MS),
+                    "Both surviving nodes must compact past node-3's position so neither can serve the tail via log replication");
 
             // A fresh node-3 process rejoins on the same port. Its next index
             // falls below the leader's first retained index, so it must be
@@ -318,6 +320,15 @@ class ClusterNodeSnapshotIntegrationTest {
     private boolean appliedOn(List<ClusterNode> nodes, int index) {
         for (ClusterNode node : nodes) {
             if (node.getRaft().getLastApplied() < index) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean bothCompactedPast(List<ClusterNode> nodes, int index) {
+        for (ClusterNode node : nodes) {
+            if (node.getRaft().getLogFirstIndex() <= index) {
                 return false;
             }
         }

@@ -8,6 +8,8 @@ import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
 import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
 import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
+import com.minigoogle.cluster.transport.dto.ReadIndexRequest;
+import com.minigoogle.cluster.transport.dto.ReadIndexResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import com.sun.net.httpserver.HttpExchange;
@@ -92,6 +94,25 @@ public class RaftHandler implements HttpHandler {
                         ClusterProtocol.now(),
                         raft.getCurrentTerm(),
                         success
+                );
+                sendResponse(exchange, resp);
+            } else if (path.endsWith("/read-index")) {
+                ReadIndexRequest req = mapper.readValue(exchange.getRequestBody(), ReadIndexRequest.class);
+                ClusterProtocol.validate(req);
+                if (!AuthFilter.authenticatedSender(exchange, req.sourceNodeId())) {
+                    sendError(exchange, 403, "Forbidden: source node mismatch");
+                    return;
+                }
+                RaftConsensus.ReadIndexResult result = raft.readIndex();
+                ReadIndexResponse resp = new ReadIndexResponse(
+                        ClusterProtocol.PROTOCOL_VERSION,
+                        req.requestId(),
+                        req.correlationId(),
+                        localNodeId,
+                        ClusterProtocol.now(),
+                        result.term(),
+                        result.commitIndex(),
+                        result.success()
                 );
                 sendResponse(exchange, resp);
             } else {

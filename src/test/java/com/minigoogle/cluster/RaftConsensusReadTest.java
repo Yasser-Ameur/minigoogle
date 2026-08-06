@@ -6,6 +6,8 @@ import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
 import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
 import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
+import com.minigoogle.cluster.transport.dto.ReadIndexRequest;
+import com.minigoogle.cluster.transport.dto.ReadIndexResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
@@ -161,6 +163,73 @@ class RaftConsensusReadTest {
         }
     }
 
+    @Test
+    void testReadIndexOnLeaderReturnsQuorumConfirmedIndex() {
+        FakeRaftTransport transport = new FakeRaftTransport();
+        RaftConsensus leader = new RaftConsensus("leader", ELECTION_TIMEOUT_MS, HEARTBEAT_MS, 2,
+                transport, () -> List.of("leader", "follower"));
+        RaftConsensus follower = new RaftConsensus("follower", ELECTION_TIMEOUT_MS, HEARTBEAT_MS, 2,
+                transport, () -> List.of("leader", "follower"));
+        transport.register(leader);
+        transport.register(follower);
+
+        try {
+            makeLeader(leader);
+            RaftConsensus.ReadIndexResult result = leader.readIndex();
+            assertTrue(result.success(), "A leader with a live quorum must hand out a read index");
+            assertEquals(leader.getCommitIndex(), result.commitIndex());
+            assertEquals(leader.getCurrentTerm(), result.term());
+            assertEquals("leader", result.leaderId());
+        } finally {
+            leader.stop();
+            follower.stop();
+            transport.shutdown();
+        }
+    }
+
+    @Test
+    void testReadIndexOnPartitionedLeaderFails() {
+        FakeRaftTransport transport = new FakeRaftTransport();
+        RaftConsensus leader = new RaftConsensus("leader", ELECTION_TIMEOUT_MS, HEARTBEAT_MS, 2,
+                transport, () -> List.of("leader", "follower"));
+        RaftConsensus follower = new RaftConsensus("follower", ELECTION_TIMEOUT_MS, HEARTBEAT_MS, 2,
+                transport, () -> List.of("leader", "follower"));
+        transport.register(leader);
+        transport.register(follower);
+
+        try {
+            makeLeader(leader);
+            transport.goSilent("follower");
+            RaftConsensus.ReadIndexResult result = leader.readIndex();
+            assertFalse(result.success(), "A partitioned leader must not hand out a read index");
+        } finally {
+            leader.stop();
+            follower.stop();
+            transport.shutdown();
+        }
+    }
+
+    @Test
+    void testReadIndexOnFollowerFails() {
+        FakeRaftTransport transport = new FakeRaftTransport();
+        RaftConsensus leader = new RaftConsensus("leader", ELECTION_TIMEOUT_MS, HEARTBEAT_MS, 2,
+                transport, () -> List.of("leader", "follower"));
+        RaftConsensus follower = new RaftConsensus("follower", ELECTION_TIMEOUT_MS, HEARTBEAT_MS, 2,
+                transport, () -> List.of("leader", "follower"));
+        transport.register(leader);
+        transport.register(follower);
+
+        try {
+            makeLeader(leader);
+            RaftConsensus.ReadIndexResult result = follower.readIndex();
+            assertFalse(result.success(), "A follower must not hand out a read index");
+        } finally {
+            leader.stop();
+            follower.stop();
+            transport.shutdown();
+        }
+    }
+
     private void makeLeader(RaftConsensus node) {
         node.startElection();
         assertTrue(node.receiveVote(), "Majority must win the election");
@@ -253,6 +322,20 @@ class RaftConsensusReadTest {
                 }
                 return new InstallSnapshotResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),
                         request.correlationId(), targetNodeId, System.currentTimeMillis(), term, success);
+            }, executor);
+        }
+        @Override
+        public CompletableFuture<ReadIndexResponse> sendReadIndex(String targetNodeId, ReadIndexRequest request) {
+            return CompletableFuture.supplyAsync(() -> {
+                RaftConsensus target = nodes.get(targetNodeId);
+                if (target == null) {
+                    return new ReadIndexResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),
+                            request.correlationId(), targetNodeId, System.currentTimeMillis(), 0, 0, false);
+                }
+                RaftConsensus.ReadIndexResult result = target.readIndex();
+                return new ReadIndexResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),
+                        request.correlationId(), targetNodeId, System.currentTimeMillis(),
+                        result.term(), result.commitIndex(), result.success());
             }, executor);
         }
     }

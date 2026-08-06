@@ -5,7 +5,10 @@ import com.minigoogle.cluster.state.KvCommand;
 import com.minigoogle.cluster.state.ReplicatedKeyValueStore;
 import com.minigoogle.cluster.transport.ClusterTransport;
 import com.minigoogle.cluster.transport.NodeDirectory;
+import com.minigoogle.cluster.transport.RaftTransport;
 import com.minigoogle.cluster.transport.SearchTransport;
+import com.minigoogle.cluster.transport.dto.ReadIndexRequest;
+import com.minigoogle.cluster.transport.dto.ReadIndexResponse;
 import com.minigoogle.cluster.transport.http.GossipHandler;
 import com.minigoogle.cluster.transport.http.HttpMembershipTransport;
 import com.minigoogle.cluster.transport.http.HttpRaftTransport;
@@ -23,7 +26,10 @@ import com.minigoogle.storage.wal.WriteAheadLog;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -53,6 +59,7 @@ public class ClusterNode {
     private final RaftConsensus raft;
     private final ConsistentHashRing ring;
     private final List<ClusterTransport> transports;
+    private final RaftTransport raftTransport;
     private final ReplicatedKeyValueStore kv;
 
     public ClusterNode(String nodeId, int port, NodeDirectory directory) throws IOException {
@@ -370,8 +377,10 @@ public class ClusterNode {
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/append-entries", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/install-snapshot", new RaftHandler(raft, mapper, nodeId), security);
+        server.registerProtectedContext("/cluster/v1/raft/read-index", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/search/dispatch", new SearchHandler(localSearch, mapper, nodeId), security);
 
+        this.raftTransport = raftTransport;
         this.transports = List.of(membershipTransport, raftTransport, searchTransport);
     }
 
@@ -555,25 +564,121 @@ public class ClusterNode {
     }
 
     /**
-     * Linearly reads the value for {@code key}. The read is served only after
-     * a read-index barrier confirms this node is still the leader for its term,
-     * so a partitioned leader cannot return stale state.
+     * Linearly applies {@code entries} as a single atomic transaction: every
+     * put commits together or none of them do. Returns only after the
+     * transaction entry is committed by a majority and applied. A transaction
+     * is one log entry, so it cannot partially apply even if a leader changes
+     * mid-commit.
+     *
+     * @param entries The key/value pairs to write.
+     * @throws NotLeaderException If this node is not the leader, or commit is
+     *                            not reached before the operation timeout.
+     */
+    public void putAll(Map<String, byte[]> entries) {
+        ensureStateMachine();
+        if (entries.isEmpty()) {
+            return;
+        }
+        List<KvCommand.TxnOp> ops = new ArrayList<>(entries.size());
+        for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+            ops.add(new KvCommand.TxnOp(KvCommand.OP_PUT, entry.getKey(), entry.getValue()));
+        }
+        appendAndWait(KvCommand.encodeTxn(ops));
+    }
+
+    /**
+     * Linearly deletes {@code keys} as a single atomic transaction: every key
+     * is removed together or none of them are.
+     *
+     * @param keys The keys to delete.
+     * @throws NotLeaderException If this node is not the leader, or commit is
+     *                            not reached before the operation timeout.
+     */
+    public void deleteAll(Collection<String> keys) {
+        ensureStateMachine();
+        if (keys.isEmpty()) {
+            return;
+        }
+        List<KvCommand.TxnOp> ops = new ArrayList<>(keys.size());
+        for (String key : keys) {
+            ops.add(new KvCommand.TxnOp(KvCommand.OP_DELETE, key, null));
+        }
+        appendAndWait(KvCommand.encodeTxn(ops));
+    }
+
+    /**
+     * Linearly reads the value for {@code key}. On the leader, the read is
+     * served only after a read-index barrier confirms the node is still the
+     * leader for its term, so a partitioned leader cannot return stale state.
+     * On a follower, the read is served locally once the leader hands out a
+     * linearizable read index and the follower has applied through it — the
+     * follower serves from its own committed log instead of redirecting.
      *
      * @return The stored value, or {@code null} if absent.
-     * @throws NotLeaderException If this node is not the leader or cannot
-     *                            establish a read barrier.
+     * @throws NotLeaderException If no leader is reachable or a linearizable
+     *                            read index cannot be established.
      */
     public byte[] get(String key) {
         ensureStateMachine();
-        if (raft.getState() != RaftConsensus.RaftState.LEADER) {
-            throw new NotLeaderException(raft.getCurrentLeader(),
-                    "Node " + nodeId + " is not the leader; leader is " + raft.getCurrentLeader());
+        if (raft.getState() == RaftConsensus.RaftState.LEADER) {
+            if (!raft.prepareReadBarrier()) {
+                throw new NotLeaderException(raft.getCurrentLeader(),
+                        "Node " + nodeId + " could not establish a read barrier (no quorum)");
+            }
+            return kv.get(key);
         }
-        if (!raft.prepareReadBarrier()) {
-            throw new NotLeaderException(raft.getCurrentLeader(),
-                    "Node " + nodeId + " could not establish a read barrier (no quorum)");
+        return getFromLeaderReadIndex(key);
+    }
+
+    /**
+     * Serves a follower read: ask the leader for its current commit index
+     * (confirmed linearizable by its own read barrier), then wait until this
+     * node has applied through that index and read the local state machine.
+     * Because the index is quorum-confirmed, reading a committed index locally
+     * is as safe as a leader read.
+     */
+    private byte[] getFromLeaderReadIndex(String key) {
+        String leaderId = raft.getCurrentLeader();
+        if (leaderId == null) {
+            throw new NotLeaderException(null,
+                    "Node " + nodeId + " has no known leader to serve a read from");
         }
-        return kv.get(key);
+        ReadIndexResponse response;
+        try {
+            response = raftTransport.sendReadIndex(leaderId, new ReadIndexRequest(
+                    com.minigoogle.cluster.transport.ClusterProtocol.PROTOCOL_VERSION,
+                    com.minigoogle.cluster.transport.ClusterProtocol.newId(),
+                    com.minigoogle.cluster.transport.ClusterProtocol.newId(),
+                    nodeId,
+                    com.minigoogle.cluster.transport.ClusterProtocol.now()
+            )).get(OPERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new NotLeaderException(leaderId,
+                    "Interrupted obtaining a read index from leader " + leaderId, e);
+        } catch (java.util.concurrent.ExecutionException | TimeoutException e) {
+            throw new NotLeaderException(leaderId,
+                    "Failed to obtain a read index from leader " + leaderId, e);
+        }
+        if (!response.success()) {
+            throw new NotLeaderException(leaderId,
+                    "Leader " + leaderId + " could not establish a read barrier");
+        }
+        long deadline = System.currentTimeMillis() + OPERATION_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if (raft.getLastApplied() >= response.commitIndex()) {
+                return kv.get(key);
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new NotLeaderException(leaderId,
+                        "Interrupted waiting to apply read index " + response.commitIndex(), e);
+            }
+        }
+        throw new NotLeaderException(leaderId,
+                "Node " + nodeId + " timed out applying to read index " + response.commitIndex());
     }
 
     private void ensureStateMachine() {

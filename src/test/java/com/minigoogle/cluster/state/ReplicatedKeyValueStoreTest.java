@@ -4,6 +4,7 @@ import com.minigoogle.cluster.LogEntry;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -172,5 +173,57 @@ class ReplicatedKeyValueStoreTest {
 
         ReplicatedKeyValueStore store = new ReplicatedKeyValueStore();
         assertThrows(IllegalArgumentException.class, () -> store.restore(truncated));
+    }
+
+    @Test
+    void testApplyTxnAppliesEveryOp() {
+        ReplicatedKeyValueStore store = new ReplicatedKeyValueStore();
+        store.apply(new LogEntry(1, 1, KvCommand.encodePut("k", V1)));
+        store.apply(new LogEntry(2, 1, KvCommand.encodeTxn(List.of(
+                new KvCommand.TxnOp(KvCommand.OP_PUT, "a", V2),
+                new KvCommand.TxnOp(KvCommand.OP_DELETE, "k", null),
+                new KvCommand.TxnOp(KvCommand.OP_PUT, "b", V1)))));
+
+        assertNull(store.get("k"), "Delete inside a txn must apply");
+        assertArrayEquals(V2, store.get("a"), "Every put inside a txn must apply");
+        assertArrayEquals(V1, store.get("b"));
+        assertEquals(2, store.getAppliedIndex());
+    }
+
+    @Test
+    void testTxnRebuildsDeterministicState() {
+        byte[] txn = KvCommand.encodeTxn(List.of(
+                new KvCommand.TxnOp(KvCommand.OP_PUT, "a", V2),
+                new KvCommand.TxnOp(KvCommand.OP_PUT, "b", V1),
+                new KvCommand.TxnOp(KvCommand.OP_DELETE, "a", null)));
+
+        ReplicatedKeyValueStore first = new ReplicatedKeyValueStore();
+        first.apply(new LogEntry(1, 1, txn));
+        first.apply(new LogEntry(2, 1, KvCommand.encodePut("k", V1)));
+
+        ReplicatedKeyValueStore rebuilt = new ReplicatedKeyValueStore();
+        rebuilt.apply(new LogEntry(1, 1, txn));
+        rebuilt.apply(new LogEntry(2, 1, KvCommand.encodePut("k", V1)));
+
+        assertNull(rebuilt.get("a"));
+        assertArrayEquals(V1, rebuilt.get("b"));
+        assertArrayEquals(V1, rebuilt.get("k"));
+        assertEquals(2, rebuilt.getAppliedIndex());
+    }
+
+    @Test
+    void testTxnSnapshotRoundTrip() {
+        ReplicatedKeyValueStore source = new ReplicatedKeyValueStore();
+        source.apply(new LogEntry(1, 1, KvCommand.encodeTxn(List.of(
+                new KvCommand.TxnOp(KvCommand.OP_PUT, "a", V1),
+                new KvCommand.TxnOp(KvCommand.OP_PUT, "b", V2)))));
+        source.apply(new LogEntry(2, 1, KvCommand.encodeDelete("a")));
+
+        byte[] snapshot = source.snapshot();
+
+        ReplicatedKeyValueStore restored = new ReplicatedKeyValueStore();
+        restored.restore(snapshot);
+        assertNull(restored.get("a"));
+        assertArrayEquals(V2, restored.get("b"));
     }
 }

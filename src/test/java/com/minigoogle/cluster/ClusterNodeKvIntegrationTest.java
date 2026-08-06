@@ -118,14 +118,31 @@ class ClusterNodeKvIntegrationTest {
         NotLeaderException putEx = assertThrows(NotLeaderException.class, () -> follower.put("k2", V));
         assertEquals(leader.getRaft().getNodeId(), putEx.getLeaderId(), "The exception must name the real leader");
 
-        NotLeaderException getEx = assertThrows(NotLeaderException.class, () -> follower.get("k"));
-        assertEquals(leader.getRaft().getNodeId(), getEx.getLeaderId());
-
         assertThrows(NotLeaderException.class, () -> follower.delete("k2"));
 
         // Redirecting to the leader succeeds.
         leader.put("k2", V);
         assertArrayEquals(V, leader.get("k2"));
+    }
+
+    @Test
+    void testFollowerServesLinearizableRead() throws InterruptedException {
+        convergeAndElect();
+
+        ClusterNode leader = currentLeader();
+        leader.put("k", V);
+        assertTrue(waitUntil(() -> appliedOnAllFollowers(1), CONVERGENCE_DEADLINE_MS),
+                "The committed write must reach every follower");
+
+        ClusterNode follower = allNodes().stream()
+                .filter(n -> n != leader)
+                .findFirst().orElseThrow();
+        assertNotEquals(RaftConsensus.RaftState.LEADER, follower.getRaft().getState(),
+                "Precondition: the serving node must be a follower");
+
+        assertArrayEquals(V, follower.get("k"),
+                "A follower must serve a linearizable read via the leader's read index");
+        assertNull(follower.get("missing"), "Absent keys must read null on a follower too");
     }
 
     @Test
@@ -138,6 +155,71 @@ class ClusterNodeKvIntegrationTest {
 
         leader.delete("k");
         assertNull(leader.get("k"));
+    }
+
+    @Test
+    void testPutAllCommitsAtomicallyOnEveryNode() throws InterruptedException {
+        convergeAndElect();
+
+        ClusterNode leader = currentLeader();
+        byte[] v1 = "v1".getBytes(StandardCharsets.UTF_8);
+        byte[] v2 = "v2".getBytes(StandardCharsets.UTF_8);
+        leader.put("pre", V);
+        leader.putAll(Map.of("txn:a", v1, "txn:b", v2));
+
+        assertArrayEquals(v1, leader.get("txn:a"), "Leader must read its own transaction writes");
+        assertArrayEquals(v2, leader.get("txn:b"));
+        assertArrayEquals(V, leader.get("pre"), "Non-transaction state must be unaffected");
+
+        int applied = leader.getRaft().getLastApplied();
+        assertTrue(waitUntil(() -> appliedOnAllFollowers(applied), CONVERGENCE_DEADLINE_MS),
+                "The transaction must apply to every follower");
+        assertArrayEquals(v1, store1.get("txn:a"));
+        assertArrayEquals(v2, store1.get("txn:b"));
+        assertArrayEquals(v1, store2.get("txn:a"));
+        assertArrayEquals(v2, store2.get("txn:b"));
+        assertArrayEquals(v1, store3.get("txn:a"));
+        assertArrayEquals(v2, store3.get("txn:b"));
+    }
+
+    @Test
+    void testDeleteAllCommitsAtomicallyOnEveryNode() throws InterruptedException {
+        convergeAndElect();
+
+        ClusterNode leader = currentLeader();
+        byte[] v1 = "v1".getBytes(StandardCharsets.UTF_8);
+        leader.putAll(Map.of("txn:a", v1, "txn:b", v1, "txn:c", v1));
+        assertArrayEquals(v1, leader.get("txn:a"));
+
+        leader.deleteAll(Set.of("txn:a", "txn:b"));
+        assertNull(leader.get("txn:a"));
+        assertNull(leader.get("txn:b"));
+        assertArrayEquals(v1, leader.get("txn:c"), "Keys outside the transaction must survive");
+
+        int applied = leader.getRaft().getLastApplied();
+        assertTrue(waitUntil(() -> appliedOnAllFollowers(applied), CONVERGENCE_DEADLINE_MS),
+                "The delete transaction must apply to every follower");
+        assertNull(store1.get("txn:a"));
+        assertNull(store2.get("txn:b"));
+        assertNull(store3.get("txn:a"));
+        assertArrayEquals(v1, store3.get("txn:c"));
+    }
+
+    @Test
+    void testFollowerTransactionRaisesNotLeaderException() throws InterruptedException {
+        convergeAndElect();
+
+        ClusterNode leader = currentLeader();
+        leader.put("k", V);
+        assertTrue(waitUntil(() -> appliedOnAllFollowers(1), CONVERGENCE_DEADLINE_MS),
+                "The committed write must reach every follower");
+
+        ClusterNode follower = allNodes().stream()
+                .filter(n -> n != leader)
+                .findFirst().orElseThrow();
+
+        assertThrows(NotLeaderException.class, () -> follower.putAll(Map.of("a", V, "b", V)));
+        assertThrows(NotLeaderException.class, () -> follower.deleteAll(Set.of("a", "b")));
     }
 
     @Test

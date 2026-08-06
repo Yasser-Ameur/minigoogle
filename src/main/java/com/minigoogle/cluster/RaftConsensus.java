@@ -1487,4 +1487,36 @@ public class RaftConsensus {
         CANDIDATE,
         LEADER
     }
+
+    /**
+     * Serves a follower's read-index request. A leader answers only after its
+     * own read barrier confirms it still leads the round's term, so the index
+     * it returns is linearizable: a partitioned leader reports failure rather
+     * than a stale index. A non-leader (or a leader whose barrier fails)
+     * returns {@code success = false}.
+     *
+     * @return The leader's term and commit index, with {@code success} set when
+     *         the returned index is a safe linearizable read index.
+     */
+    public ReadIndexResult readIndex() {
+        synchronized (this) {
+            if (state != RaftState.LEADER) {
+                return new ReadIndexResult(false, currentTerm, commitIndex, currentLeader);
+            }
+        }
+        boolean barrier = prepareReadBarrier();
+        synchronized (this) {
+            if (!barrier || state != RaftState.LEADER) {
+                return new ReadIndexResult(false, currentTerm, commitIndex, currentLeader);
+            }
+            return new ReadIndexResult(true, currentTerm, commitIndex, nodeId);
+        }
+    }
+
+    /**
+     * The outcome of {@link #readIndex()}: whether {@code commitIndex} in
+     * {@code term} is a safe linearizable read index.
+     */
+    public record ReadIndexResult(boolean success, int term, int commitIndex, String leaderId) {
+    }
 }

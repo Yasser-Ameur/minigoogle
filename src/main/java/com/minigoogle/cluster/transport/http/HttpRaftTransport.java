@@ -11,6 +11,8 @@ import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
 import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
 import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
+import com.minigoogle.cluster.transport.dto.ReadIndexRequest;
+import com.minigoogle.cluster.transport.dto.ReadIndexResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 
@@ -63,6 +65,21 @@ public class HttpRaftTransport implements RaftTransport {
     @Override
     public CompletableFuture<InstallSnapshotResponse> sendInstallSnapshot(String targetNodeId, InstallSnapshotRequest request) {
         return sendPost(targetNodeId, "/cluster/v1/raft/install-snapshot", stampMetadata(request), InstallSnapshotResponse.class);
+    }
+
+    @Override
+    public CompletableFuture<ReadIndexResponse> sendReadIndex(String targetNodeId, ReadIndexRequest request) {
+        return sendPost(targetNodeId, "/cluster/v1/raft/read-index", stampMetadata(request), ReadIndexResponse.class);
+    }
+
+    private ReadIndexRequest stampMetadata(ReadIndexRequest request) {
+        return new ReadIndexRequest(
+                ClusterProtocol.PROTOCOL_VERSION,
+                ClusterProtocol.newId(),
+                request.correlationId(),
+                localNodeId,
+                ClusterProtocol.now()
+        );
     }
 
     private RequestVoteRequest stampMetadata(RequestVoteRequest request) {

@@ -33,16 +33,26 @@ public class ReplicatedKeyValueStore implements StateMachine {
 
     @Override
     public void apply(LogEntry entry) {
-        KvCommand.DecodedCommand command = KvCommand.decode(entry.payload());
-        if (command.op() == KvCommand.OP_PUT) {
-            store.put(command.key(), command.value());
+        byte[] payload = entry.payload();
+        if (KvCommand.isTxnFrame(payload)) {
+            for (KvCommand.DecodedCommand command : KvCommand.decodeTxn(payload)) {
+                applyCommand(command);
+            }
         } else {
-            store.remove(command.key());
+            applyCommand(KvCommand.decode(payload));
         }
         appliedIndex.set(entry.index());
         CompletableFuture<Void> waiter = waiters.remove(entry.index());
         if (waiter != null) {
             waiter.complete(null);
+        }
+    }
+
+    private void applyCommand(KvCommand.DecodedCommand command) {
+        if (command.op() == KvCommand.OP_PUT) {
+            store.put(command.key(), command.value());
+        } else {
+            store.remove(command.key());
         }
     }
 
