@@ -18,7 +18,7 @@ import java.util.function.BiFunction;
  * It receives a query, executes it against the local index,
  * and returns only the Top-K results to minimize network transfer.</p>
  */
-public class LocalSearchExecutor {
+public class LocalSearchExecutor implements SearchExecutor {
 
     /**
      * Functional interface for the actual search implementation.

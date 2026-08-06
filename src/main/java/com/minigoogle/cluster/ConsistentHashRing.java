@@ -117,6 +117,10 @@ public class ConsistentHashRing {
         return nodePositions.size();
     }
 
+    public List<String> getAllNodes() {
+        return new ArrayList<>(nodePositions.keySet());
+    }
+
     /**
      * @return The total number of virtual nodes on the ring.
      */

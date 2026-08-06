@@ -37,13 +37,13 @@ public class DistributedExecutor {
      * @param timeoutMs      Maximum time to wait for shard responses.
      * @return Collected results from all shards that responded in time.
      */
-    public List<LocalSearchResponse> scatter(List<LocalSearchExecutor> shardExecutors,
+    public List<LocalSearchResponse> scatter(List<SearchExecutor> shardExecutors,
                                               QueryContext context,
                                               long timeoutMs) {
         List<Future<LocalSearchResponse>> futures = new ArrayList<>(shardExecutors.size());
 
         // Launch all shard searches simultaneously
-        for (LocalSearchExecutor shardExecutor : shardExecutors) {
+        for (SearchExecutor shardExecutor : shardExecutors) {
             futures.add(executor.submit(() -> shardExecutor.execute(context)));
         }
 

@@ -96,7 +96,7 @@ class DistributedQueryTest {
     @Test
     void testDistributedExecutorScatterGather() {
         // Create 3 fake shard executors that return canned results
-        List<LocalSearchExecutor> executors = new ArrayList<>();
+        List<com.minigoogle.distributed.query.execution.SearchExecutor> executors = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             final int shardId = i;
             executors.add(new LocalSearchExecutor(shardId, (query, topK) ->
@@ -129,7 +129,11 @@ class DistributedQueryTest {
         );
 
         DistributedSearchCoordinator coordinator = new DistributedSearchCoordinator(
-                executors, 4, Duration.ofSeconds(5), 100
+                q -> List.of("local-node"), // Mock QueryRouter always returns local node
+                null, // null SearchTransport since we only execute locally
+                executors,
+                "local-node",
+                4, Duration.ofSeconds(5), 100
         );
 
         SearchResponse response = coordinator.search("compiler optimization", 3);

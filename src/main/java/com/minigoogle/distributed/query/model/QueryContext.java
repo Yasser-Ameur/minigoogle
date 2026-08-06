@@ -17,7 +17,25 @@ public class QueryContext {
     private final int topK;
 
     public QueryContext(String query, int topK, Duration timeout) {
-        this.requestId = UUID.randomUUID();
+        this(query, topK, timeout, UUID.randomUUID());
+    }
+
+    /**
+     * Creates a query context with an explicit request ID.
+     *
+     * <p>Used by remote shard nodes that receive a dispatched query: the
+     * coordinator's request ID is carried on the wire so the entire
+     * scatter-gather fan-out shares one trace ID. The start time is reset
+     * locally so the remaining-time budget is computed against the
+     * receiving node's own clock.
+     *
+     * @param query     The raw query string.
+     * @param topK      The number of top results to return.
+     * @param timeout   The time budget for this shard's execution.
+     * @param requestId The traceable request ID (typically from the coordinator).
+     */
+    public QueryContext(String query, int topK, Duration timeout, UUID requestId) {
+        this.requestId = requestId;
         this.startTime = Instant.now();
         this.timeout = timeout;
         this.query = query;

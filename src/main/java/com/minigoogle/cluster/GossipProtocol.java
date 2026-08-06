@@ -2,12 +2,15 @@ package com.minigoogle.cluster;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+
+import com.minigoogle.cluster.transport.MembershipTransport;
 
 /**
  * Gossip protocol for cluster membership and failure detection.
@@ -26,10 +29,13 @@ public class GossipProtocol {
 
     private final String nodeId;
     private final Map<String, GossipNodeState> membershipTable = new ConcurrentHashMap<>();
+    private final List<MembershipListener> listeners = new CopyOnWriteArrayList<>();
     private final Random random = new Random();
     private ScheduledExecutorService scheduler;
     private final long gossipIntervalMs;
     private final long failureTimeoutMs;
+
+    private final MembershipTransport transport;
 
     /**
      * Creates a gossip protocol node with full configuration.
@@ -37,22 +43,32 @@ public class GossipProtocol {
      * @param nodeId            The unique identifier for this node.
      * @param gossipIntervalMs  The interval between gossip rounds in milliseconds.
      * @param failureTimeoutMs  The timeout after which a node is considered suspect.
+     * @param transport         The transport layer for cluster communication.
      */
-    public GossipProtocol(String nodeId, long gossipIntervalMs, long failureTimeoutMs) {
+    public GossipProtocol(String nodeId, long gossipIntervalMs, long failureTimeoutMs, MembershipTransport transport) {
         this.nodeId = nodeId;
         this.gossipIntervalMs = gossipIntervalMs;
         this.failureTimeoutMs = failureTimeoutMs;
+        this.transport = transport;
         // Add self
         membershipTable.put(nodeId, new GossipNodeState(nodeId, 0, NodeStatus.ALIVE, System.currentTimeMillis()));
     }
 
     /**
-     * Creates a gossip protocol node with default intervals.
+     * Creates a gossip protocol node with default intervals and transport.
      *
-     * @param nodeId The unique identifier for this node.
+     * @param nodeId    The unique identifier for this node.
+     * @param transport The transport layer for cluster communication.
+     */
+    public GossipProtocol(String nodeId, MembershipTransport transport) {
+        this(nodeId, 1000, 5000, transport);
+    }
+    
+    /**
+     * Legacy constructor for tests without transport.
      */
     public GossipProtocol(String nodeId) {
-        this(nodeId, 1000, 5000);
+        this(nodeId, 1000, 5000, null);
     }
 
     /**
@@ -77,6 +93,15 @@ public class GossipProtocol {
     }
 
     /**
+     * Registers a listener to be notified of membership changes.
+     *
+     * @param listener The listener to add.
+     */
+    public void addListener(MembershipListener listener) {
+        listeners.add(listener);
+    }
+
+    /**
      * Processes an incoming gossip message from another node.
      *
      * @param senderId     The sending node's ID.
@@ -88,8 +113,22 @@ public class GossipProtocol {
             GossipNodeState remote = entry.getValue();
             GossipNodeState local = membershipTable.get(key);
 
-            if (local == null || remote.heartbeatCounter() > local.heartbeatCounter()) {
+            if (local == null) {
+                // New node discovered
                 membershipTable.put(key, remote);
+                if (remote.status() == NodeStatus.ALIVE) {
+                    for (MembershipListener l : listeners) {
+                        l.onNodeJoined(key);
+                    }
+                }
+            } else if (remote.heartbeatCounter() > local.heartbeatCounter()) {
+                membershipTable.put(key, remote);
+                // Transition: was not ALIVE, now ALIVE => joined
+                if (local.status() != NodeStatus.ALIVE && remote.status() == NodeStatus.ALIVE) {
+                    for (MembershipListener l : listeners) {
+                        l.onNodeJoined(key);
+                    }
+                }
             }
         }
     }
@@ -121,9 +160,12 @@ public class GossipProtocol {
      */
     public void confirmDead(String targetNodeId) {
         GossipNodeState state = membershipTable.get(targetNodeId);
-        if (state != null) {
+        if (state != null && state.status() != NodeStatus.DEAD) {
             membershipTable.put(targetNodeId, new GossipNodeState(
                     targetNodeId, state.heartbeatCounter(), NodeStatus.DEAD, System.currentTimeMillis()));
+            for (MembershipListener l : listeners) {
+                l.onNodeLeft(targetNodeId);
+            }
         }
     }
 
@@ -132,6 +174,20 @@ public class GossipProtocol {
      */
     public Map<String, GossipNodeState> getMembershipTable() {
         return Map.copyOf(membershipTable);
+    }
+
+    /**
+     * Seeds a peer into the membership table for bootstrap discovery.
+     * This is how a node learns about initial cluster members before gossip converges.
+     *
+     * @param peerId The node ID of the seed peer.
+     */
+    public void seedPeer(String peerId) {
+        if (membershipTable.putIfAbsent(peerId, new GossipNodeState(peerId, 0, NodeStatus.ALIVE, System.currentTimeMillis())) == null) {
+            for (MembershipListener l : listeners) {
+                l.onNodeJoined(peerId);
+            }
+        }
     }
 
     /**
@@ -173,13 +229,20 @@ public class GossipProtocol {
         heartbeat();
         checkForFailures();
 
-        List<String> liveNodes = getLiveNodes();
-        if (liveNodes.isEmpty()) return;
+        List<String> peers = getLiveNodes();
+        peers.remove(nodeId);
+        if (peers.isEmpty()) return;
 
         // Pick a random live peer to exchange state with
-        String peer = liveNodes.get(random.nextInt(liveNodes.size()));
-        // In a real implementation, this would send the membership table over the network
-        // Here we just log the event
+        String peer = peers.get(random.nextInt(peers.size()));
+        
+        if (transport != null) {
+            transport.exchangeState(peer, Map.copyOf(membershipTable))
+                     .exceptionally(ex -> {
+                         // On failure, rely on normal failure detection
+                         return null;
+                     });
+        }
     }
 
     public enum NodeStatus {

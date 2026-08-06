@@ -14939,6 +14939,7 @@ This chapter is where MiniGoogle evolves from an excellent academic project into
 17. Security
 18. Package Structure
 19. Complete Cluster Lifecycle
+20. Cluster Transport Protocol
 
 ---
 
@@ -16081,6 +16082,392 @@ Broadcasting cluster state to every node scales poorly. Gossip spreads updates e
 ```
 
 MiniGoogle has now evolved into a resilient distributed platform capable of surviving machine failures, network partitions, rolling upgrades, and large-scale deployments.
+
+---
+
+# 20. Cluster Transport Protocol
+
+Until now the cluster algorithms ran *logically*.
+
+Gossip exchanged state in memory.
+
+Raft elected a leader in memory.
+
+Nothing crossed the wire.
+
+That changes now.
+
+Every node in MiniGoogle speaks one internal language.
+
+A single, versioned, traceable RPC protocol.
+
+---
+
+## Why an Internal Protocol?
+
+External REST is for humans.
+
+Internal RPC is for machines.
+
+```
+External (REST)          Internal (RPC)
+-------------            -----------------
+/api/v1/search           /cluster/v1/search/dispatch
+human-readable JSON      compact, versioned envelopes
+public                  private to the cluster
+timeouts: seconds       timeouts: milliseconds
+```
+
+The two are separated on purpose:
+
+- REST is stable and versioned for API consumers.
+- RPC may evolve quickly as the cluster internals change.
+- A burst of cluster traffic must never starve the public API.
+
+Each node therefore runs a **dedicated internal RPC server**.
+
+---
+
+## The Wire Envelope
+
+Every message carries the same metadata.
+
+This makes each message:
+
+- self-describing
+- traceable
+- version-checkable
+
+```
+protocolVersion   current wire version (bumped on incompatible changes)
+requestId         identifies the logical request
+correlationId     matches a response to its request
+sourceNodeId      which node produced the message
+timestamp         epoch milliseconds at creation
+```
+
+The envelope is a Java interface: `ClusterMessage`.
+
+Every request and response record implements it.
+
+---
+
+## Protocol Versioning
+
+A node that misparses an incompatible peer is worse than a node that rejects it.
+
+So the version is checked before anything else.
+
+```
+incoming message
+        |
+        v
+version == PROTOCOL_VERSION ?
+        |
+   +----+----+
+   |         |
+  yes       no
+   |         |
+   |      ProtocolViolationException  -> HTTP 400
+   v
+ process
+```
+
+Bump the version whenever the on-the-wire layout changes incompatibly:
+
+- new required field
+- removed field
+- reordering
+- type change
+
+---
+
+## Correlation Matching
+
+Asynchronous replies are matched by correlation ID.
+
+The client generates a fresh correlation ID per request.
+
+The handler echoes it back.
+
+The client rejects a mismatched reply as a protocol violation.
+
+```
+Client                     Server
+  |                          |
+  |  request (corr=abc123)   |
+  |------------------------->|
+  |                          |
+  |  response (corr=abc123)  |
+  |<-------------------------|
+  |
+  corr matches -> accept
+```
+
+A buggy or malicious peer that returns a wrong correlation ID is rejected explicitly.
+
+---
+
+## The Four Transports
+
+The cluster has four kinds of traffic.
+
+Each gets its own transport interface.
+
+| Transport | Purpose |
+|-----------|---------|
+| `MembershipTransport` | gossip state exchange |
+| `RaftTransport` | request-vote, append-entries |
+| `SearchTransport` | fan-out queries to shard nodes |
+| `ShardTransferTransport` | move shard chunks during rebalancing |
+
+All four share the envelope and the validation rules.
+
+All four are asynchronous (`CompletableFuture`).
+
+---
+
+## Node Directory
+
+Nodes know each other by ID, not by address.
+
+A `NodeDirectory` resolves a node ID to its base URI.
+
+```
+nodeId -> http://10.0.0.7:9091
+```
+
+This decouples the protocol from the network topology.
+
+A node can be moved to a new address without touching the transport code.
+
+---
+
+## The Internal RPC Server
+
+One `HttpServer` per node, a bounded worker pool, and one handler per endpoint.
+
+The worker pool is capped so a burst of cluster RPCs cannot exhaust the JVM.
+
+Handlers are registered before the server starts.
+
+```
+/cluster/v1/gossip/exchange      GossipHandler
+/cluster/v1/raft/request-vote    RaftHandler
+/cluster/v1/raft/append-entries  RaftHandler
+/cluster/v1/search/dispatch      SearchHandler
+```
+
+Every handler follows the same shape:
+
+1. reject non-POST methods with 405
+2. parse the envelope
+3. validate the protocol version
+4. process
+5. respond with the echoed metadata
+
+---
+
+## Gossip Exchange
+
+Each gossip round picks a random live peer.
+
+The local membership table is sent over the wire.
+
+```
+Node A                        Node B
+  |                              |
+  |  GossipExchangeRequest       |
+  |  (state, corr)               |
+  |----------------------------->|
+  |                              | merge state,
+  |                              | fire join/leave events
+  |  GossipExchangeResponse      |
+  |  (accepted, corr)            |
+  |<-----------------------------|
+```
+
+New nodes discovered this way:
+
+- are inserted into the membership table
+- notify listeners
+- the consistent hash ring adds them automatically
+
+Seeded peers bootstrap discovery before gossip converges.
+
+---
+
+## Raft RPCs
+
+Leader election and heartbeats travel the same protocol.
+
+Request-vote:
+
+```
+candidate -> peer   RequestVoteRequest
+                    (candidateId, term, lastLogIndex, lastLogTerm)
+peer -> candidate   RequestVoteResponse
+                    (term, voteGranted)
+```
+
+Append-entries (heartbeat + log replication):
+
+```
+leader -> follower  AppendEntriesRequest
+                    (leaderId, term, prevLogIndex, entries)
+follower -> leader  AppendEntriesResponse
+                    (term, success)
+```
+
+A higher term wins a vote.
+
+Heartbeats reset the follower election timeout.
+
+---
+
+## Query Dispatch
+
+The coordinator scatters a query to every target shard over the wire.
+
+The request carries only what a shard needs:
+
+```
+query            the query text
+topK             how many local results to return
+remainingTimeMs  the coordinator's remaining budget
+```
+
+The receiving node rebuilds a `QueryContext` from these fields:
+
+- fresh local start time
+- the coordinator's request ID preserved for tracing
+- the deadline respected across the whole fan-out
+
+```
+Coordinator                    Shard Node
+    |                              |
+    |  DispatchQueryRequest        |
+    |  (query, topK, budget)       |
+    |----------------------------->|
+    |                              | run local Top-K
+    |  LocalSearchResponse         |
+    |  (shardId, results, hits)    |
+    |<-----------------------------|
+```
+
+The shard returns only its local Top-K.
+
+Not the whole posting list.
+
+The wire stays small.
+
+A shard without a local search configured replies 503, and the coordinator simply skips it.
+
+---
+
+## Shard Transfer
+
+Rebalancing streams shards in chunks.
+
+```
+start  ->  /shards/{id}/transfer/start
+chunks ->  /shards/{id}/transfer/chunk   (offset + data + checksum)
+commit ->  /shards/{id}/transfer/commit
+```
+
+Each chunk is a full envelope.
+
+Checksums catch corruption in flight.
+
+---
+
+## Timeouts
+
+Every RPC carries a deadline.
+
+The HTTP client bounds its own wait by the caller's remaining budget.
+
+A hung peer cannot outlive the scatter deadline.
+
+```
+RemoteSearchExecutor.execute
+        |
+        v
+dispatchQuery(...).get(remainingTimeMs)
+        |
+   +----+----+
+   |         |
+ success   timeout -> shard is skipped
+```
+
+Slow shards degrade gracefully:
+
+the cluster returns partial results instead of failing the query.
+
+---
+
+## Failure Handling
+
+Transport failures are expected, not exceptional.
+
+- unknown node -> failed future ("Unknown node")
+- HTTP error    -> failed future
+- mismatch      -> protocol violation
+- timeout       -> shard skipped
+
+Gossip treats a failed exchange as ordinary:
+
+the peer is not contacted next round.
+
+Failure detection handles the rest.
+
+---
+
+## Security
+
+The internal protocol is private to the cluster.
+
+Defense in depth:
+
+- version validation rejects incompatible peers
+- correlation matching rejects spoofed replies
+- `ClusterSecurity` issues per-node bearer tokens
+
+An attacker that cannot present a valid token is excluded before any message is processed.
+
+---
+
+## How It Ties Together
+
+Chapters 6, 7, 12, and 13 described the algorithms.
+
+This chapter is the pipe between them.
+
+```
+         MembershipTransport
+                |
+   Gossip -> ring -> routing
+                |
+         RaftTransport
+                |
+   election -> heartbeats -> shard assignment
+                |
+         SearchTransport
+                |
+   coordinator -> shards -> merged Top-K
+                |
+      ShardTransferTransport
+                |
+   rebalancer -> chunked shard moves
+```
+
+One protocol.
+
+One envelope.
+
+Four flows.
+
+Every machine speaks the same language.
 
 ---
 

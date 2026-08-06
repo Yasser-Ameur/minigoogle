@@ -1,16 +1,21 @@
 package com.minigoogle.distributed.query.coordinator;
 
+import com.minigoogle.cluster.transport.SearchTransport;
 import com.minigoogle.distributed.query.cache.DistributedQueryCache;
 import com.minigoogle.distributed.query.execution.DistributedExecutor;
 import com.minigoogle.distributed.query.execution.LocalSearchExecutor;
+import com.minigoogle.distributed.query.execution.RemoteSearchExecutor;
+import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.distributed.query.merge.GlobalResultMerger;
 import com.minigoogle.distributed.query.model.LocalSearchResponse;
 import com.minigoogle.distributed.query.model.QueryContext;
+import com.minigoogle.distributed.query.routing.QueryRouter;
 import com.minigoogle.distributed.query.timeout.TimeoutManager;
 import com.minigoogle.network.dto.SearchResult;
 import com.minigoogle.network.dto.SearchResponse;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -33,16 +38,27 @@ public class DistributedSearchCoordinator {
     private final GlobalResultMerger merger;
     private final TimeoutManager timeoutManager;
     private final DistributedQueryCache cache;
-    private final List<LocalSearchExecutor> shardExecutors;
+    
+    private final QueryRouter router;
+    private final SearchTransport transport;
+    private final List<LocalSearchExecutor> localExecutors;
+    private final String localNodeId;
     private final Duration defaultTimeout;
 
     public DistributedSearchCoordinator(
-            List<LocalSearchExecutor> shardExecutors,
+            QueryRouter router,
+            SearchTransport transport,
+            List<LocalSearchExecutor> localExecutors,
+            String localNodeId,
             int parallelism,
             Duration defaultTimeout,
             int cacheSize
     ) {
-        this.shardExecutors = shardExecutors;
+        this.router = router;
+        this.transport = transport;
+        this.localExecutors = localExecutors;
+        this.localNodeId = localNodeId;
+        
         this.executor = new DistributedExecutor(parallelism);
         this.merger = new GlobalResultMerger();
         this.timeoutManager = new TimeoutManager();
@@ -70,15 +86,26 @@ public class DistributedSearchCoordinator {
         // 2. Create query context
         QueryContext context = new QueryContext(query, topK, defaultTimeout);
 
-        // 3. Scatter to all shards with timeout
-        long scatterBudget = timeoutManager.getScatterBudgetMs(context);
-        List<LocalSearchResponse> shardResponses = executor.scatter(shardExecutors, context, scatterBudget);
+        // 3. Resolve targets and create executors
+        List<String> targetNodeIds = router.resolveTargets(query);
+        List<SearchExecutor> targetExecutors = new ArrayList<>();
+        for (String targetNodeId : targetNodeIds) {
+            if (targetNodeId.equals(localNodeId)) {
+                targetExecutors.addAll(localExecutors);
+            } else {
+                targetExecutors.add(new RemoteSearchExecutor(targetNodeId, transport));
+            }
+        }
 
-        // 4. Merge results
+        // 4. Scatter to all shards with timeout
+        long scatterBudget = timeoutManager.getScatterBudgetMs(context);
+        List<LocalSearchResponse> shardResponses = executor.scatter(targetExecutors, context, scatterBudget);
+
+        // 5. Merge results
         List<SearchResult> mergedResults = merger.merge(shardResponses, topK);
         int totalHits = merger.computeTotalHits(shardResponses);
 
-        // 5. Cache the result
+        // 6. Cache the result
         cache.put(query, mergedResults);
 
         long elapsed = System.currentTimeMillis() - startMs;
