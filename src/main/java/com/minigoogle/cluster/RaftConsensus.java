@@ -1,8 +1,19 @@
 package com.minigoogle.cluster;
 
+import com.minigoogle.cluster.transport.ClusterProtocol;
+import com.minigoogle.cluster.transport.RaftTransport;
+import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
+import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
+import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
+import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * Raft consensus protocol for electing a cluster leader.
@@ -14,6 +25,9 @@ import java.util.concurrent.TimeUnit;
  *   If the leader fails, a candidate wins an election and becomes leader.
  *
  * This implementation covers the leader election portion of Raft.
+ * When a {@link RaftTransport} is injected, elections and heartbeats cross
+ * the wire: candidates send RequestVote RPCs, the leader sends AppendEntries
+ * heartbeats, and any higher term observed in a response steps the node down.
  */
 public class RaftConsensus {
 
@@ -22,6 +36,15 @@ public class RaftConsensus {
     private volatile String currentLeader;
     private volatile int currentTerm;
     private volatile int votesReceived;
+    private volatile String votedFor;
+
+    private final RaftTransport transport;
+    private final Supplier<List<String>> peerSupplier;
+
+    // Log replication is not implemented; the position stays at 0.
+    private volatile int lastLogIndex;
+    private volatile int lastLogTerm;
+    private volatile int commitIndex;
 
     private ScheduledExecutorService scheduler;
     private final long electionTimeoutMs;
@@ -37,14 +60,7 @@ public class RaftConsensus {
      * @param clusterSize         The total number of nodes in the cluster.
      */
     public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize) {
-        this.nodeId = nodeId;
-        this.state = RaftState.FOLLOWER;
-        this.currentLeader = null;
-        this.currentTerm = 0;
-        this.votesReceived = 0;
-        this.electionTimeoutMs = electionTimeoutMs;
-        this.heartbeatIntervalMs = heartbeatIntervalMs;
-        this.clusterSize = clusterSize;
+        this(nodeId, electionTimeoutMs, heartbeatIntervalMs, clusterSize, null, null);
     }
 
     /**
@@ -75,6 +91,34 @@ public class RaftConsensus {
      */
     public RaftConsensus(String nodeId) {
         this(nodeId, 5000, 1000, 3);
+    }
+
+    /**
+     * Full configuration with transport and peer discovery.
+     *
+     * @param nodeId              The unique identifier for this node.
+     * @param electionTimeoutMs   The election timeout in milliseconds.
+     * @param heartbeatIntervalMs The heartbeat interval in milliseconds.
+     * @param clusterSize         Fallback cluster size when no peer supplier is given.
+     * @param transport           The transport for cluster RPCs, or {@code null} for in-memory operation.
+     * @param peerSupplier        Supplies the current peer IDs, or {@code null} to rely on {@code clusterSize}.
+     */
+    public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize,
+                         RaftTransport transport, Supplier<List<String>> peerSupplier) {
+        this.nodeId = nodeId;
+        this.state = RaftState.FOLLOWER;
+        this.currentLeader = null;
+        this.currentTerm = 0;
+        this.votesReceived = 0;
+        this.votedFor = null;
+        this.lastLogIndex = 0;
+        this.lastLogTerm = 0;
+        this.commitIndex = 0;
+        this.electionTimeoutMs = electionTimeoutMs;
+        this.heartbeatIntervalMs = heartbeatIntervalMs;
+        this.clusterSize = clusterSize;
+        this.transport = transport;
+        this.peerSupplier = peerSupplier;
     }
 
     /**
@@ -109,6 +153,7 @@ public class RaftConsensus {
             state = RaftState.FOLLOWER;
             votesReceived = 0;
         }
+        scheduleElectionTimeout();
     }
 
     /**
@@ -122,19 +167,33 @@ public class RaftConsensus {
             currentLeader = null;
             state = RaftState.FOLLOWER;
             votesReceived = 0;
+            votedFor = candidateId;
+            scheduleElectionTimeout();
             return true; // Vote for the candidate with higher term
+        }
+        if (term == currentTerm && (votedFor == null || votedFor.equals(candidateId))) {
+            votedFor = candidateId;
+            scheduleElectionTimeout();
+            return true;
         }
         return false;
     }
 
     /**
-     * Starts an election by transitioning to candidate state.
+     * Starts an election by transitioning to candidate state and
+     * requesting votes from every known peer over the transport.
      */
     public synchronized void startElection() {
+        if (state == RaftState.LEADER) {
+            return;
+        }
         state = RaftState.CANDIDATE;
         currentTerm++;
         votesReceived = 1; // Vote for self
+        votedFor = nodeId;
         currentLeader = null;
+        requestVotesFromPeers();
+        scheduleElectionTimeout();
     }
 
     /**
@@ -144,24 +203,44 @@ public class RaftConsensus {
      */
     public synchronized boolean receiveVote() {
         votesReceived++;
-        return votesReceived > getClusterSize() / 2;
+        return votesReceived >= majorityThreshold();
     }
 
     /**
-     * Transitions this node to leader state.
+     * Transitions this node to leader state and starts the heartbeat loop.
      */
     public synchronized void becomeLeader() {
         state = RaftState.LEADER;
         currentLeader = nodeId;
+        scheduleHeartbeats();
     }
 
     /**
-     * Sends heartbeats to all followers (called by the leader).
+     * Sends AppendEntries heartbeats to all followers (called by the leader).
      */
     public synchronized void sendHeartbeats() {
-        if (state == RaftState.LEADER) {
-            // In a real implementation, this would send RPCs to all followers
+        if (state != RaftState.LEADER || transport == null) {
+            return;
         }
+        int term = currentTerm;
+        for (String peer : peers()) {
+            AppendEntriesRequest req = new AppendEntriesRequest(
+                    ClusterProtocol.PROTOCOL_VERSION,
+                    ClusterProtocol.newId(),
+                    ClusterProtocol.newId(),
+                    nodeId,
+                    ClusterProtocol.now(),
+                    nodeId,
+                    term,
+                    lastLogIndex,
+                    lastLogTerm,
+                    List.of(),
+                    commitIndex
+            );
+            transport.sendAppendEntries(peer, req)
+                    .whenComplete((resp, err) -> onAppendEntriesResponse(resp, err));
+        }
+        scheduleHeartbeats();
     }
 
     public String getNodeId() { return nodeId; }
@@ -169,12 +248,117 @@ public class RaftConsensus {
     public String getCurrentLeader() { return currentLeader; }
     public int getCurrentTerm() { return currentTerm; }
 
-    private int getClusterSize() {
-        return clusterSize;
+    /**
+     * Sends a RequestVote RPC to every peer for the current election term.
+     */
+    private void requestVotesFromPeers() {
+        if (transport == null) {
+            return;
+        }
+        int term = currentTerm;
+        for (String peer : peers()) {
+            RequestVoteRequest req = new RequestVoteRequest(
+                    ClusterProtocol.PROTOCOL_VERSION,
+                    ClusterProtocol.newId(),
+                    ClusterProtocol.newId(),
+                    nodeId,
+                    ClusterProtocol.now(),
+                    nodeId,
+                    term,
+                    lastLogIndex,
+                    lastLogTerm
+            );
+            transport.sendRequestVote(peer, req)
+                    .whenComplete((resp, err) -> onVoteResponse(resp, err, term));
+        }
+    }
+
+    /**
+     * Counts a granted vote. A higher term observed in the response wins the
+     * election away from this candidate.
+     */
+    private void onVoteResponse(RequestVoteResponse resp, Throwable err, int termAtSend) {
+        if (err != null) {
+            return;
+        }
+        synchronized (this) {
+            if (state != RaftState.CANDIDATE) {
+                return;
+            }
+            if (resp.term() > currentTerm) {
+                stepDown(resp.term());
+                return;
+            }
+            if (resp.voteGranted() && resp.term() == termAtSend) {
+                votesReceived++;
+                if (votesReceived >= majorityThreshold()) {
+                    becomeLeader();
+                }
+            }
+        }
+    }
+
+    /**
+     * Steps down to follower if a response reports a higher term.
+     */
+    private void onAppendEntriesResponse(AppendEntriesResponse resp, Throwable err) {
+        if (err != null) {
+            return;
+        }
+        synchronized (this) {
+            if (resp.term() > currentTerm) {
+                stepDown(resp.term());
+            }
+        }
+    }
+
+    private void stepDown(int term) {
+        currentTerm = term;
+        state = RaftState.FOLLOWER;
+        currentLeader = null;
+        votesReceived = 0;
+        votedFor = null;
+        scheduleElectionTimeout();
+    }
+
+    /**
+     * @return The peer IDs excluding this node, resolved from the peer supplier.
+     */
+    private List<String> peers() {
+        if (peerSupplier == null) {
+            return List.of();
+        }
+        return peerSupplier.get().stream()
+                .filter(p -> p != null && !p.equals(nodeId))
+                .distinct()
+                .toList();
+    }
+
+    /**
+     * @return The number of votes required to win an election.
+     */
+    private int majorityThreshold() {
+        if (peerSupplier != null) {
+            Set<String> known = new HashSet<>();
+            known.add(nodeId);
+            for (String p : peerSupplier.get()) {
+                if (p != null) {
+                    known.add(p);
+                }
+            }
+            return known.size() / 2 + 1;
+        }
+        return clusterSize / 2 + 1;
+    }
+
+    private void scheduleHeartbeats() {
+        if (scheduler != null && !scheduler.isShutdown() && state == RaftState.LEADER) {
+            scheduler.schedule(this::sendHeartbeats, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
+        }
     }
 
     private void scheduleElectionTimeout() {
-        if (scheduler != null && !scheduler.isShutdown()) {
+        if (scheduler != null && !scheduler.isShutdown() && state != RaftState.LEADER) {
             long jitter = (long) (electionTimeoutMs * 0.5 + Math.random() * electionTimeoutMs * 0.5);
             scheduler.schedule(this::startElection, jitter, TimeUnit.MILLISECONDS);
         }

@@ -39,6 +39,8 @@ class ClusterNodeIntegrationTest {
         // Fast gossip for tests
         long gossipInterval = 100;
         long timeout = 500;
+        long raftElection = 400;
+        long raftHeartbeat = 150;
 
         Map<String, Integer> portMap = new ConcurrentHashMap<>();
         portMap.put("node-1", 9091);
@@ -53,9 +55,9 @@ class ClusterNodeIntegrationTest {
         SearchExecutor node2Search = new LocalSearchExecutor(2, (query, topK) -> List.of(
                 new SearchResult("http://node-2/result", "Node 2: " + query, "remote shard", 0.85, 0.7, 0.15)));
 
-        node1 = new ClusterNode("node-1", 9091, directory, gossipInterval, timeout);
-        node2 = new ClusterNode("node-2", 9092, directory, gossipInterval, timeout, node2Search);
-        node3 = new ClusterNode("node-3", 9093, directory, gossipInterval, timeout);
+        node1 = new ClusterNode("node-1", 9091, directory, gossipInterval, timeout, raftElection, raftHeartbeat, null);
+        node2 = new ClusterNode("node-2", 9092, directory, gossipInterval, timeout, raftElection, raftHeartbeat, node2Search);
+        node3 = new ClusterNode("node-3", 9093, directory, gossipInterval, timeout, raftElection, raftHeartbeat, null);
 
         // Pre-populate some seed knowledge to bootstrap gossip without a proper discovery layer yet
         // In real life, seed nodes are injected at startup
@@ -121,6 +123,36 @@ class ClusterNodeIntegrationTest {
         String owner = node1.getRing().getNode("test-document-123");
         assertTrue(owner.equals("node-1") || owner.equals("node-2") || owner.equals("node-3"),
                 "Key should route to a valid cluster node");
+    }
+
+    @Test
+    void testRaftLeaderElectedOverTransport() throws InterruptedException {
+        // Raft resolves its peers from gossip, so wait for the membership table
+        // to converge before expecting any campaign to reach a majority.
+        assertTrue(waitUntil(this::allLiveSetsConverged, CONVERGENCE_DEADLINE_MS),
+                "Gossip did not converge: " + node1.getGossip().getLiveNodes());
+
+        assertTrue(waitUntil(() -> exactlyOneLeader(), CONVERGENCE_DEADLINE_MS),
+                "No single leader elected over the transport. node-1=" + node1.getRaft().getState()
+                        + " node-2=" + node2.getRaft().getState()
+                        + " node-3=" + node3.getRaft().getState());
+
+        // The leader must be a member of the cluster and hold a real term.
+        int leaders = (node1.getRaft().getState() == RaftConsensus.RaftState.LEADER ? 1 : 0)
+                + (node2.getRaft().getState() == RaftConsensus.RaftState.LEADER ? 1 : 0)
+                + (node3.getRaft().getState() == RaftConsensus.RaftState.LEADER ? 1 : 0);
+        assertEquals(1, leaders);
+        RaftConsensus leader = node1.getRaft().getState() == RaftConsensus.RaftState.LEADER ? node1.getRaft()
+                : node2.getRaft().getState() == RaftConsensus.RaftState.LEADER ? node2.getRaft() : node3.getRaft();
+        assertTrue(leader.getCurrentTerm() >= 1, "Elected leader should hold a real term");
+    }
+
+    private boolean exactlyOneLeader() {
+        long leaders = 0;
+        if (node1.getRaft().getState() == RaftConsensus.RaftState.LEADER) leaders++;
+        if (node2.getRaft().getState() == RaftConsensus.RaftState.LEADER) leaders++;
+        if (node3.getRaft().getState() == RaftConsensus.RaftState.LEADER) leaders++;
+        return leaders == 1;
     }
 
     @Test

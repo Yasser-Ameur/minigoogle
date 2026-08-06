@@ -34,11 +34,11 @@ public class ClusterNode {
     private final List<ClusterTransport> transports;
 
     public ClusterNode(String nodeId, int port, NodeDirectory directory) throws IOException {
-        this(nodeId, port, directory, 1000, 5000, null);
+        this(nodeId, port, directory, 1000, 5000, 5000, 1000, null);
     }
 
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout) throws IOException {
-        this(nodeId, port, directory, gossipInterval, gossipTimeout, null);
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, 5000, 1000, null);
     }
 
     /**
@@ -54,6 +54,24 @@ public class ClusterNode {
      */
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        SearchExecutor localSearch) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, 5000, 1000, localSearch);
+    }
+
+    /**
+     * Creates a fully configured cluster node.
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch) throws IOException {
         this.nodeId = nodeId;
         ObjectMapper mapper = new ObjectMapper();
         this.server = new InternalClusterServer(port, mapper);
@@ -69,7 +87,9 @@ public class ClusterNode {
         this.gossip = new GossipProtocol(nodeId, gossipInterval, gossipTimeout, membershipTransport);
         gossip.addListener(new RingMembershipListener(ring));
 
-        this.raft = new RaftConsensus(nodeId); // Will inject transport later in step 6
+        // Raft resolves its peers from the gossip membership table, so it only
+        // campaigns against nodes that gossip currently believes are alive.
+        this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes);
 
         server.getServer().createContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId));
         server.getServer().createContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId));

@@ -85,6 +85,15 @@ class ClusterTest {
     }
 
     @Test
+    void testRaftVoteNotGrantedTwiceInSameTerm() {
+        RaftConsensus voter = new RaftConsensus("voter");
+        assertTrue(voter.receiveVoteRequest("candidate-a", 1));
+        assertFalse(voter.receiveVoteRequest("candidate-b", 1));
+        // A higher term still wins
+        assertTrue(voter.receiveVoteRequest("candidate-c", 2));
+    }
+
+    @Test
     void testGossipProtocol() {
         GossipProtocol gossip = new GossipProtocol("node-1");
         assertEquals(1, gossip.memberCount());
