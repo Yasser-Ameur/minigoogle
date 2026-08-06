@@ -17,6 +17,7 @@ import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.storage.filesystem.StorageLayout;
 import com.minigoogle.storage.metadata.RaftAppliedStore;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
+import com.minigoogle.storage.metadata.RaftSnapshotStore;
 import com.minigoogle.storage.wal.WriteAheadLog;
 
 import java.io.IOException;
@@ -37,6 +38,13 @@ import java.util.concurrent.TimeoutException;
  */
 public class ClusterNode {
     private static final long OPERATION_TIMEOUT_MS = 10_000;
+
+    /**
+     * Default entries between state-machine snapshots when a node is given a
+     * storage directory. Configurable via the explicit {@code snapshotInterval}
+     * constructor overload.
+     */
+    private static final int SNAPSHOT_INTERVAL = 10_000;
 
     private final String nodeId;
     private final InternalClusterServer server;
@@ -141,7 +149,8 @@ public class ClusterNode {
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, Path storageDirectory) throws IOException {
         this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
-                security, createRaftMetadataStore(storageDirectory), createRaftLog(storageDirectory));
+                security, createRaftMetadataStore(storageDirectory), createRaftLog(storageDirectory),
+                null, null, createRaftSnapshotStore(storageDirectory), SNAPSHOT_INTERVAL);
     }
 
     /**
@@ -232,6 +241,55 @@ public class ClusterNode {
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog,
                        ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, raftMetadataStore, raftLog, stateMachine, appliedStore, null, 0);
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with explicit
+     * Raft metadata store, replicated log, replicated key-value state machine,
+     * and snapshot-driven log compaction.
+     *
+     * <p>Committed entries are applied to {@code stateMachine} in order, and
+     * the apply watermark is durably recorded in {@code appliedStore}, so a
+     * node restarted on the same stores rebuilds the key-value state from its
+     * log without waiting for the next commit. Every {@code snapshotInterval}
+     * committed entries, the applied state is captured into
+     * {@code snapshotStore} and the log prefix is compacted; a follower that
+     * falls below the compacted prefix is caught up with an InstallSnapshot
+     * RPC. A compacted {@code raft-log.bin} tail is only interpretable with the
+     * snapshot's base, so a node given a storage directory opens its log at the
+     * snapshot's last included index.
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param raftMetadataStore    Store for {@code currentTerm} and
+     *                             {@code votedFor}, or {@code null} to keep the
+     *                             metadata in memory only.
+     * @param raftLog              The replicated log, or {@code null} for a
+     *                             memory-only log.
+     * @param stateMachine         The replicated key-value state machine, or
+     *                             {@code null} to disable the client operations.
+     * @param appliedStore         Store for the apply watermark, or {@code null}
+     *                             to keep it in memory only.
+     * @param snapshotStore        Store for state-machine snapshots, or
+     *                             {@code null} to disable log compaction.
+     * @param snapshotInterval     Entries between snapshots; ignored when
+     *                             {@code snapshotStore} is {@code null}.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog,
+                       ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
+                       RaftSnapshotStore snapshotStore, int snapshotInterval) throws IOException {
         this.nodeId = nodeId;
         this.kv = stateMachine;
         ObjectMapper mapper = new ObjectMapper();
@@ -254,11 +312,12 @@ public class ClusterNode {
         this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes,
                 raftMetadataStore == null ? RaftMetadataStore.inMemory() : raftMetadataStore,
                 raftLog == null ? RaftLog.inMemory() : raftLog,
-                stateMachine, appliedStore);
+                stateMachine, appliedStore, snapshotStore, snapshotInterval);
 
         server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/append-entries", new RaftHandler(raft, mapper, nodeId), security);
+        server.registerProtectedContext("/cluster/v1/raft/install-snapshot", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/search/dispatch", new SearchHandler(localSearch, mapper, nodeId), security);
 
         this.transports = List.of(membershipTransport, raftTransport, searchTransport);
@@ -276,10 +335,25 @@ public class ClusterNode {
             return RaftLog.inMemory();
         }
         try {
-            return new RaftLog(new WriteAheadLog(new StorageLayout(storageDirectory).getRaftLogPath()));
+            StorageLayout layout = new StorageLayout(storageDirectory);
+            WriteAheadLog wal = new WriteAheadLog(layout.getRaftLogPath());
+            RaftSnapshot snapshot = new RaftSnapshotStore(layout.getRaftSnapshotPath()).load();
+            if (snapshot == null) {
+                return new RaftLog(wal);
+            }
+            // A compacted WAL tail is only interpretable with the snapshot's
+            // base, so the log is replayed at the snapshot's last included index.
+            return new RaftLog(wal, snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm());
         } catch (IOException e) {
             throw new java.io.UncheckedIOException("Failed to load raft log; refusing to start", e);
         }
+    }
+
+    private static RaftSnapshotStore createRaftSnapshotStore(Path storageDirectory) {
+        if (storageDirectory == null) {
+            return RaftSnapshotStore.inMemory();
+        }
+        return new RaftSnapshotStore(new StorageLayout(storageDirectory).getRaftSnapshotPath());
     }
 
     public void start() {

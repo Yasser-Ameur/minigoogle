@@ -108,4 +108,69 @@ class ReplicatedKeyValueStoreTest {
         assertArrayEquals(V2, rebuilt.get("j"));
         assertEquals(3, rebuilt.getAppliedIndex());
     }
+
+    @Test
+    void testIsSnapshotable() {
+        assertTrue(new ReplicatedKeyValueStore().isSnapshotable());
+    }
+
+    @Test
+    void testSnapshotRoundTrip() {
+        ReplicatedKeyValueStore source = new ReplicatedKeyValueStore();
+        source.apply(new LogEntry(1, 1, KvCommand.encodePut("k", V1)));
+        source.apply(new LogEntry(2, 1, KvCommand.encodePut("j", V2)));
+        source.apply(new LogEntry(3, 2, KvCommand.encodeDelete("k")));
+
+        byte[] snapshot = source.snapshot();
+
+        ReplicatedKeyValueStore restored = new ReplicatedKeyValueStore();
+        restored.restore(snapshot);
+        assertNull(restored.get("k"));
+        assertArrayEquals(V2, restored.get("j"));
+        assertEquals(0, restored.getAppliedIndex(), "restore resets the applied-index counter");
+    }
+
+    @Test
+    void testSnapshotOfEmptyStore() {
+        ReplicatedKeyValueStore source = new ReplicatedKeyValueStore();
+        byte[] snapshot = source.snapshot();
+
+        ReplicatedKeyValueStore restored = new ReplicatedKeyValueStore();
+        restored.restore(snapshot);
+        assertNull(restored.get("k"));
+        assertEquals(0, restored.getAppliedIndex());
+    }
+
+    @Test
+    void testRestoreReplacesPriorState() {
+        ReplicatedKeyValueStore store = new ReplicatedKeyValueStore();
+        store.apply(new LogEntry(1, 1, KvCommand.encodePut("old", V1)));
+
+        ReplicatedKeyValueStore source = new ReplicatedKeyValueStore();
+        source.apply(new LogEntry(1, 1, KvCommand.encodePut("new", V2)));
+
+        store.restore(source.snapshot());
+        assertNull(store.get("old"));
+        assertArrayEquals(V2, store.get("new"));
+    }
+
+    @Test
+    void testRestoreMalformedSnapshotFailsFast() {
+        ReplicatedKeyValueStore store = new ReplicatedKeyValueStore();
+        assertThrows(IllegalArgumentException.class, () -> store.restore(new byte[]{0, 0, 0, 5}));
+        assertThrows(IllegalArgumentException.class, () -> store.restore(new byte[]{0, 0, 0, 0, 1, 1}));
+        assertThrows(IllegalArgumentException.class, () -> store.restore(KvCommand.encodePut("k", V1)));
+    }
+
+    @Test
+    void testRestoreCorruptedAfterValidHeaderFailsFast() {
+        ReplicatedKeyValueStore source = new ReplicatedKeyValueStore();
+        source.apply(new LogEntry(1, 1, KvCommand.encodePut("k", V1)));
+        byte[] snapshot = source.snapshot();
+        byte[] truncated = new byte[snapshot.length - 1];
+        System.arraycopy(snapshot, 0, truncated, 0, truncated.length);
+
+        ReplicatedKeyValueStore store = new ReplicatedKeyValueStore();
+        assertThrows(IllegalArgumentException.class, () -> store.restore(truncated));
+    }
 }

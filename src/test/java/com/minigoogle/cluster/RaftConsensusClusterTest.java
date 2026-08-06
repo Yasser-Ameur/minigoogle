@@ -4,6 +4,8 @@ import com.minigoogle.cluster.transport.ClusterProtocol;
 import com.minigoogle.cluster.transport.RaftTransport;
 import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import org.junit.jupiter.api.Test;
@@ -202,6 +204,28 @@ class RaftConsensusClusterTest {
                         System.currentTimeMillis(),
                         term,
                         true);
+            }, executor);
+        }
+
+        @Override
+        public CompletableFuture<InstallSnapshotResponse> sendInstallSnapshot(String targetNodeId, InstallSnapshotRequest request) {
+            return CompletableFuture.supplyAsync(() -> {
+                RaftConsensus target = nodes.get(targetNodeId);
+                boolean success = false;
+                int term = forcedTerms.getOrDefault(targetNodeId, request.term());
+                if (target != null) {
+                    success = target.receiveInstallSnapshot(request.leaderId(), request.term(),
+                            request.lastIncludedIndex(), request.lastIncludedTerm(), request.data());
+                    term = forcedTerms.getOrDefault(targetNodeId, target.getCurrentTerm());
+                }
+                return new InstallSnapshotResponse(
+                        ClusterProtocol.PROTOCOL_VERSION,
+                        request.requestId(),
+                        request.correlationId(),
+                        targetNodeId,
+                        System.currentTimeMillis(),
+                        term,
+                        success);
             }, executor);
         }
     }

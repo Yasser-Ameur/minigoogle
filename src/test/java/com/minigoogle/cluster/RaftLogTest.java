@@ -104,10 +104,13 @@ class RaftLogTest {
         assertArrayEquals("a".getBytes(StandardCharsets.UTF_8), log.payloadAt(1));
         assertArrayEquals("b".getBytes(StandardCharsets.UTF_8), log.payloadAt(2));
 
-        // Out-of-range truncation must be a no-op.
+        // Truncating at the first retained index drops the whole tail.
         log.truncateFrom(1);
+        assertEquals(0, log.lastIndex());
+
+        // Truncation past the end is still a no-op.
         log.truncateFrom(10);
-        assertEquals(2, log.lastIndex());
+        assertEquals(0, log.lastIndex());
     }
 
     @Test

@@ -4,6 +4,8 @@ import com.minigoogle.cluster.transport.ClusterProtocol;
 import com.minigoogle.cluster.transport.RaftTransport;
 import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
@@ -229,6 +231,27 @@ class RaftConsensusReadTest {
                     term = target.getCurrentTerm();
                 }
                 return new AppendEntriesResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),
+                        request.correlationId(), targetNodeId, System.currentTimeMillis(), term, success);
+            }, executor);
+        }
+
+        @Override
+        public CompletableFuture<InstallSnapshotResponse> sendInstallSnapshot(String targetNodeId, InstallSnapshotRequest request) {
+            return CompletableFuture.supplyAsync(() -> {
+                if (silent.contains(targetNodeId)) {
+                    return new InstallSnapshotResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),
+                            request.correlationId(), targetNodeId, System.currentTimeMillis(),
+                            request.term(), false);
+                }
+                RaftConsensus target = nodes.get(targetNodeId);
+                boolean success = false;
+                int term = request.term();
+                if (target != null) {
+                    success = target.receiveInstallSnapshot(request.leaderId(), request.term(),
+                            request.lastIncludedIndex(), request.lastIncludedTerm(), request.data());
+                    term = target.getCurrentTerm();
+                }
+                return new InstallSnapshotResponse(ClusterProtocol.PROTOCOL_VERSION, request.requestId(),
                         request.correlationId(), targetNodeId, System.currentTimeMillis(), term, success);
             }, executor);
         }

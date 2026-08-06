@@ -3,6 +3,9 @@ package com.minigoogle.cluster.transport.http;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.minigoogle.cluster.ClusterSecurity;
 import com.minigoogle.cluster.RaftConsensus;
+import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import com.sun.net.httpserver.HttpContext;
@@ -39,6 +42,8 @@ class RaftHandlerTest {
         voteContext.getFilters().add(new AuthFilter(security));
         HttpContext entriesContext = server.createContext("/cluster/v1/raft/append-entries", new RaftHandler(raft, mapper, "local-node"));
         entriesContext.getFilters().add(new AuthFilter(security));
+        HttpContext snapshotContext = server.createContext("/cluster/v1/raft/install-snapshot", new RaftHandler(raft, mapper, "local-node"));
+        snapshotContext.getFilters().add(new AuthFilter(security));
         server.start();
         client = HttpClient.newHttpClient();
     }
@@ -132,6 +137,40 @@ class RaftHandlerTest {
         com.minigoogle.cluster.transport.dto.AppendEntriesResponse body =
                 mapper.readValue(resp.body(), com.minigoogle.cluster.transport.dto.AppendEntriesResponse.class);
         assertFalse(body.success());
+    }
+
+    @Test
+    void testInstallSnapshotEchoesMetadata() throws Exception {
+        InstallSnapshotRequest req = new InstallSnapshotRequest(
+                1, "snap-req-1", "snap-corr-1", "leader-1", 0L, "leader-1", 3, 10, 4, new byte[]{1, 2, 3});
+
+        HttpResponse<String> resp = post("/cluster/v1/raft/install-snapshot", req, "leader-1");
+
+        assertEquals(200, resp.statusCode());
+        InstallSnapshotResponse body = mapper.readValue(resp.body(), InstallSnapshotResponse.class);
+        assertEquals("snap-req-1", body.requestId());
+        assertEquals("snap-corr-1", body.correlationId());
+        assertEquals("local-node", body.sourceNodeId());
+        assertTrue(body.success());
+        assertEquals(3, body.term());
+        assertEquals(3, raft.getCurrentTerm());
+        assertEquals(10, raft.getLastApplied());
+    }
+
+    @Test
+    void testInstallSnapshotRejectedOnLowerTerm() throws Exception {
+        // Step this node up to term 5, then a term-3 snapshot must be refused.
+        raft.receiveHeartbeat("leader-5", 5);
+        InstallSnapshotRequest req = new InstallSnapshotRequest(
+                1, "snap-req-2", "snap-corr-2", "leader-1", 0L, "leader-1", 3, 10, 4, new byte[]{1, 2, 3});
+
+        HttpResponse<String> resp = post("/cluster/v1/raft/install-snapshot", req, "leader-1");
+
+        assertEquals(200, resp.statusCode());
+        InstallSnapshotResponse body = mapper.readValue(resp.body(), InstallSnapshotResponse.class);
+        assertFalse(body.success());
+        assertEquals(5, body.term());
+        assertEquals(5, raft.getCurrentTerm());
     }
 
     @Test

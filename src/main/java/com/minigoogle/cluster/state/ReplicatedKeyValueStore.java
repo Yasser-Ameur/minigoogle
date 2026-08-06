@@ -3,6 +3,10 @@ package com.minigoogle.cluster.state;
 import com.minigoogle.cluster.LogEntry;
 import com.minigoogle.cluster.StateMachine;
 
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,6 +58,75 @@ public class ReplicatedKeyValueStore implements StateMachine {
      */
     public int getAppliedIndex() {
         return appliedIndex.get();
+    }
+
+    @Override
+    public boolean isSnapshotable() {
+        return true;
+    }
+
+    /**
+     * Captures the full map. Big-endian framing mirrors {@link KvCommand}:
+     * {@code [4-byte count][ (2-byte key length)(key UTF-8)(4-byte value length)(value) ]*}.
+     * Iteration order is irrelevant because {@link #restore(byte[])} rebuilds
+     * the same map on any node.
+     */
+    @Override
+    public byte[] snapshot() {
+        Map<String, byte[]> copy = new HashMap<>(store);
+        int size = 4;
+        for (Map.Entry<String, byte[]> entry : copy.entrySet()) {
+            size += 2 + entry.getKey().getBytes(StandardCharsets.UTF_8).length + 4 + entry.getValue().length;
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(size);
+        buffer.putInt(copy.size());
+        for (Map.Entry<String, byte[]> entry : copy.entrySet()) {
+            byte[] key = entry.getKey().getBytes(StandardCharsets.UTF_8);
+            buffer.putShort((short) key.length);
+            buffer.put(key);
+            buffer.putInt(entry.getValue().length);
+            buffer.put(entry.getValue());
+        }
+        return buffer.array();
+    }
+
+    /**
+     * Replaces the map with the contents of a {@link #snapshot()}. Decoding is
+     * strict: malformed data fails fast rather than silently producing a
+     * divergent map. The applied-index counter resets to 0; the consensus layer
+     * governs {@code lastApplied} and re-applies the tail above the snapshot.
+     */
+    @Override
+    public void restore(byte[] snapshot) {
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(snapshot);
+            int count = buffer.getInt();
+            if (count < 0) {
+                throw new IllegalArgumentException("Negative entry count in snapshot");
+            }
+            Map<String, byte[]> rebuilt = new HashMap<>(count);
+            for (int i = 0; i < count; i++) {
+                int keyLength = Short.toUnsignedInt(buffer.getShort());
+                byte[] keyBytes = new byte[keyLength];
+                buffer.get(keyBytes);
+                String key = new String(keyBytes, StandardCharsets.UTF_8);
+                int valueLength = buffer.getInt();
+                if (valueLength < 0) {
+                    throw new IllegalArgumentException("Negative value length in snapshot");
+                }
+                byte[] value = new byte[valueLength];
+                buffer.get(value);
+                rebuilt.put(key, value);
+            }
+            if (buffer.hasRemaining()) {
+                throw new IllegalArgumentException("Trailing bytes after snapshot");
+            }
+            store.clear();
+            store.putAll(rebuilt);
+            appliedIndex.set(0);
+        } catch (BufferUnderflowException e) {
+            throw new IllegalArgumentException("Malformed snapshot", e);
+        }
     }
 
     /**

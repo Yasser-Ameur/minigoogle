@@ -4,11 +4,14 @@ import com.minigoogle.cluster.transport.ClusterProtocol;
 import com.minigoogle.cluster.transport.RaftTransport;
 import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import com.minigoogle.storage.metadata.RaftAppliedStore;
 import com.minigoogle.storage.metadata.RaftMetadata;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
+import com.minigoogle.storage.metadata.RaftSnapshotStore;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -74,9 +77,12 @@ public class RaftConsensus {
     private final RaftLog log;
     private final StateMachine stateMachine;
     private final RaftAppliedStore appliedStore;
+    private final RaftSnapshotStore snapshotStore;
+    private final int snapshotInterval;
 
     private volatile int commitIndex;
     private volatile int lastApplied;
+    private volatile int lastSnapshotIndex;
 
     private final Map<String, Integer> nextIndex = new HashMap<>();
     private final Map<String, Integer> matchIndex = new HashMap<>();
@@ -235,12 +241,52 @@ public class RaftConsensus {
                          RaftTransport transport, Supplier<List<String>> peerSupplier,
                          RaftMetadataStore metadataStore, RaftLog log,
                          StateMachine stateMachine, RaftAppliedStore appliedStore) {
+        this(nodeId, electionTimeoutMs, heartbeatIntervalMs, clusterSize, transport, peerSupplier, metadataStore, log,
+                stateMachine, appliedStore, null, 0);
+    }
+
+    /**
+     * Full configuration with transport, peer discovery, durable election
+     * metadata, a durable replicated log, an optional state machine, and
+     * periodic log compaction via state-machine snapshots.
+     *
+     * <p>Every {@code snapshotInterval} committed entries, the consensus layer
+     * captures the state machine's state into the {@link RaftSnapshotStore}
+     * and compacts the log prefix through {@link RaftLog#compact}, so the log
+     * and restart cost stay bounded. On construction the latest snapshot is
+     * restored and only the tail above it is re-applied. A lagging follower
+     * whose next index falls below the leader's first retained index receives
+     * the snapshot over the {@link RaftTransport} InstallSnapshot RPC. Any of
+     * the state-machine-related parameters may be {@code null} to keep the
+     * pre-existing behavior.
+     *
+     * @param nodeId              The unique identifier for this node.
+     * @param electionTimeoutMs   The election timeout in milliseconds.
+     * @param heartbeatIntervalMs The heartbeat interval in milliseconds.
+     * @param clusterSize         Fallback cluster size when no peer supplier is given.
+     * @param transport           The transport for cluster RPCs, or {@code null} for in-memory operation.
+     * @param peerSupplier        Supplies the current peer IDs, or {@code null} to rely on {@code clusterSize}.
+     * @param metadataStore       The store for {@code currentTerm} and {@code votedFor}, or {@code null}
+     *                            to keep the metadata in memory only.
+     * @param log                 The replicated log, or {@code null} for a memory-only log.
+     * @param stateMachine        Consumer of committed entries, or {@code null} for none.
+     * @param appliedStore        Store for the apply watermark, or {@code null} for none.
+     * @param snapshotStore       Store for state-machine snapshots, or {@code null} to disable compaction.
+     * @param snapshotInterval    Entries between snapshots; ignored when
+     *                            {@code snapshotStore} is {@code null}.
+     */
+    public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize,
+                         RaftTransport transport, Supplier<List<String>> peerSupplier,
+                         RaftMetadataStore metadataStore, RaftLog log,
+                         StateMachine stateMachine, RaftAppliedStore appliedStore,
+                         RaftSnapshotStore snapshotStore, int snapshotInterval) {
         this.nodeId = nodeId;
         this.state = RaftState.FOLLOWER;
         this.currentLeader = null;
         this.votesReceived = 0;
         this.commitIndex = 0;
         this.lastApplied = 0;
+        this.lastSnapshotIndex = 0;
         this.electionTimeoutMs = electionTimeoutMs;
         this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.clusterSize = clusterSize;
@@ -250,6 +296,8 @@ public class RaftConsensus {
         this.log = log == null ? RaftLog.inMemory() : log;
         this.stateMachine = stateMachine;
         this.appliedStore = appliedStore;
+        this.snapshotStore = snapshotStore;
+        this.snapshotInterval = snapshotInterval;
         RaftMetadata restored = restoreMetadata();
         this.currentTerm = restored.currentTerm();
         this.votedFor = restored.votedFor();
@@ -470,6 +518,7 @@ public class RaftConsensus {
     public int getCommitIndex() { return commitIndex; }
     public int getLastLogIndex() { return log.lastIndex(); }
     public int getLastLogTerm() { return log.lastTerm(); }
+    public int getLogFirstIndex() { return log.firstIndex(); }
     public int getLastApplied() { return lastApplied; }
 
     /**
@@ -704,9 +753,10 @@ public class RaftConsensus {
 
     /**
      * Applies the newly committed range {@code [lastApplied+1 .. newCommitIndex]}
-     * to the state machine in index order, then records the watermark. Runs
-     * under the consensus lock, so a write ack (which happens only after the
-     * leader's own apply) guarantees the effect is visible to subsequent reads.
+     * to the state machine in index order, then records the watermark and
+     * offers the opportunity to snapshot/compact. Runs under the consensus
+     * lock, so a write ack (which happens only after the leader's own apply)
+     * guarantees the effect is visible to subsequent reads.
      */
     private void applyCommitted(int newCommitIndex) {
         if (stateMachine == null) {
@@ -723,25 +773,76 @@ public class RaftConsensus {
                 throw new UncheckedIOException("Failed to persist raft applied index", e);
             }
         }
+        maybeSnapshot();
     }
 
     /**
-     * Rebuilds the state machine from the persisted committed prefix on
-     * construction. Applying {@code [1 .. lastApplied]} deterministically
-     * reproduces the pre-restart state; the log is durable and therefore at
-     * least as long as the watermark in normal operation.
+     * Periodically captures the applied state into a durable snapshot and
+     * compacts the log prefix. The snapshot is written first, so a crash at any
+     * point loses only the uncommitted tail: everything at or below the
+     * snapshot is covered by the durable snapshot, and the tail entries being
+     * rewritten are uncommitted (the applied watermark is at the snapshot
+     * index at capture time).
      */
-    private void restoreAppliedState() {
-        if (appliedStore == null) {
+    private void maybeSnapshot() {
+        if (snapshotStore == null || stateMachine == null || !stateMachine.isSnapshotable()) {
             return;
         }
-        try {
-            lastApplied = appliedStore.load();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to load raft applied index", e);
+        if (lastApplied - lastSnapshotIndex < snapshotInterval) {
+            return;
         }
+        int term = log.termAt(lastApplied);
+        RaftSnapshot snapshot = new RaftSnapshot(lastApplied, term, stateMachine.snapshot());
+        try {
+            snapshotStore.save(snapshot);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to persist raft snapshot", e);
+        }
+        lastSnapshotIndex = lastApplied;
+        log.compact(lastApplied, term);
+    }
+
+    /**
+     * Rebuilds the state machine on construction. The latest durable snapshot
+     * (if any) is restored and the log is re-based at its last included index,
+     * so a compacted WAL tail replays at the correct absolute indexes; then
+     * the deterministic tail {@code [snapshotIndex+1 .. lastApplied]} is
+     * re-applied. The watermark is floored at the snapshot index so a missing
+     * or stale {@code raft-applied.bin} can never leave the state machine
+     * behind its snapshot.
+     */
+    private void restoreAppliedState() {
+        int snapshotIndex = 0;
+        if (snapshotStore != null) {
+            RaftSnapshot snapshot;
+            try {
+                snapshot = snapshotStore.load();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to load raft snapshot", e);
+            }
+            if (snapshot != null) {
+                log.compact(snapshot.lastIncludedIndex(), snapshot.lastIncludedTerm());
+                lastSnapshotIndex = snapshot.lastIncludedIndex();
+                snapshotIndex = snapshot.lastIncludedIndex();
+                if (stateMachine != null) {
+                    stateMachine.restore(snapshot.data());
+                }
+            }
+        }
+        if (appliedStore == null && snapshotStore == null) {
+            return;
+        }
+        int loaded = 0;
+        if (appliedStore != null) {
+            try {
+                loaded = appliedStore.load();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to load raft applied index", e);
+            }
+        }
+        lastApplied = Math.max(loaded, snapshotIndex);
         if (stateMachine != null) {
-            for (int i = 1; i <= lastApplied; i++) {
+            for (int i = snapshotIndex + 1; i <= lastApplied; i++) {
                 stateMachine.apply(logEntryAt(i));
             }
         }
@@ -779,10 +880,16 @@ public class RaftConsensus {
 
     /**
      * Sends an AppendEntries RPC for one follower, starting at the follower's
-     * next expected index.
+     * next expected index. When that index has been consumed by a snapshot, the
+     * follower is too far behind for append-style replication and receives the
+     * snapshot via {@link #sendInstallSnapshot(String)} instead.
      */
     private void sendAppendEntries(String peer) {
         int next = nextIndex.getOrDefault(peer, log.lastIndex() + 1);
+        if (next < log.firstIndex()) {
+            sendInstallSnapshot(peer);
+            return;
+        }
         int prevLogIndex = next - 1;
         int prevLogTerm = log.termAt(prevLogIndex);
         List<byte[]> entries = log.entriesFrom(next, MAX_ENTRIES_PER_REQUEST);
@@ -803,6 +910,131 @@ public class RaftConsensus {
         );
         transport.sendAppendEntries(peer, req)
                 .whenComplete((resp, err) -> onAppendEntriesResponse(peer, sentPrevLogIndex, sentEntryCount, resp, err));
+    }
+
+    /**
+     * Sends the leader's durable snapshot to a follower that has fallen below
+     * the leader's first retained index. A missing snapshot is a defensive
+     * no-op (compaction only ever happens after a snapshot is saved).
+     */
+    private void sendInstallSnapshot(String peer) {
+        if (snapshotStore == null) {
+            return;
+        }
+        RaftSnapshot snapshot;
+        try {
+            snapshot = snapshotStore.load();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to load raft snapshot for install", e);
+        }
+        if (snapshot == null) {
+            return;
+        }
+        InstallSnapshotRequest req = new InstallSnapshotRequest(
+                ClusterProtocol.PROTOCOL_VERSION,
+                ClusterProtocol.newId(),
+                ClusterProtocol.newId(),
+                nodeId,
+                ClusterProtocol.now(),
+                nodeId,
+                currentTerm,
+                snapshot.lastIncludedIndex(),
+                snapshot.lastIncludedTerm(),
+                snapshot.data()
+        );
+        transport.sendInstallSnapshot(peer, req)
+                .whenComplete((resp, err) -> onInstallSnapshotResponse(peer, snapshot.lastIncludedIndex(), resp, err));
+    }
+
+    /**
+     * Handles an InstallSnapshot response. A higher term steps the leader down.
+     * A success brings the follower up to the snapshot's last included index and
+     * advances the commit index, since the snapshot may cover entries the
+     * leader committed earlier.
+     */
+    private void onInstallSnapshotResponse(String peer, int lastIncludedIndex,
+                                           InstallSnapshotResponse resp, Throwable err) {
+        if (err != null) {
+            return;
+        }
+        synchronized (this) {
+            if (resp.term() > currentTerm) {
+                stepDown(resp.term());
+                return;
+            }
+            if (state != RaftState.LEADER || !resp.success()) {
+                return;
+            }
+            matchIndex.put(peer, Math.max(matchIndex.getOrDefault(peer, 0), lastIncludedIndex));
+            nextIndex.put(peer, matchIndex.get(peer) + 1);
+            advanceCommit();
+        }
+    }
+
+    /**
+     * Handles an InstallSnapshot RPC from a leader. When the snapshot covers
+     * entries the follower has not applied, the follower adopts it: a matching
+     * local log is compacted (its tail is retained), a mismatched or shorter
+     * log is replaced entirely, the state machine is restored, and the applied
+     * watermark advances. A snapshot at or behind the applied watermark is
+     * ignored (the local state is already at least as fresh). A higher term
+     * reverts this node to follower and persists the term before the reply.
+     *
+     * @param leaderId          The leader's node ID.
+     * @param term              The leader's current term.
+     * @param lastIncludedIndex The last log index the snapshot covers.
+     * @param lastIncludedTerm  The term at {@code lastIncludedIndex}.
+     * @param data              The snapshot's state-machine data.
+     * @return true if the snapshot was accepted.
+     */
+    public synchronized boolean receiveInstallSnapshot(String leaderId, int term, int lastIncludedIndex,
+                                                       int lastIncludedTerm, byte[] data) {
+        if (term < currentTerm) {
+            return false;
+        }
+        boolean termChanged = term > currentTerm;
+        currentTerm = term;
+        currentLeader = leaderId;
+        state = RaftState.FOLLOWER;
+        votesReceived = 0;
+        if (termChanged) {
+            persistMetadata();
+            failPendingBarriers();
+        }
+        if (stateMachine != null && !stateMachine.isSnapshotable()) {
+            return false;
+        }
+        if (lastIncludedIndex > lastApplied) {
+            boolean matches = log.lastIndex() >= lastIncludedIndex
+                    && log.termAt(lastIncludedIndex) == lastIncludedTerm;
+            if (matches) {
+                log.compact(lastIncludedIndex, lastIncludedTerm);
+            } else {
+                log.resetTo(lastIncludedIndex, lastIncludedTerm);
+            }
+            if (stateMachine != null) {
+                stateMachine.restore(data);
+            }
+            lastApplied = lastIncludedIndex;
+            if (appliedStore != null) {
+                try {
+                    appliedStore.persist(lastApplied);
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to persist raft applied index", e);
+                }
+            }
+            if (snapshotStore != null) {
+                try {
+                    snapshotStore.save(new RaftSnapshot(lastIncludedIndex, lastIncludedTerm, data));
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to persist raft snapshot", e);
+                }
+            }
+            lastSnapshotIndex = lastIncludedIndex;
+        }
+        commitIndex = Math.max(commitIndex, lastIncludedIndex);
+        scheduleElectionTimeout();
+        return true;
     }
 
     /**

@@ -9,6 +9,8 @@ import com.minigoogle.cluster.transport.ProtocolViolationException;
 import com.minigoogle.cluster.transport.RaftTransport;
 import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 
@@ -57,6 +59,11 @@ public class HttpRaftTransport implements RaftTransport {
         return sendPost(targetNodeId, "/cluster/v1/raft/append-entries", stampMetadata(request), AppendEntriesResponse.class);
     }
 
+    @Override
+    public CompletableFuture<InstallSnapshotResponse> sendInstallSnapshot(String targetNodeId, InstallSnapshotRequest request) {
+        return sendPost(targetNodeId, "/cluster/v1/raft/install-snapshot", stampMetadata(request), InstallSnapshotResponse.class);
+    }
+
     private RequestVoteRequest stampMetadata(RequestVoteRequest request) {
         String correlationId = ClusterProtocol.newId();
         return new RequestVoteRequest(
@@ -85,6 +92,21 @@ public class HttpRaftTransport implements RaftTransport {
                 request.prevLogTerm(),
                 request.entries(),
                 request.leaderCommit()
+        );
+    }
+
+    private InstallSnapshotRequest stampMetadata(InstallSnapshotRequest request) {
+        return new InstallSnapshotRequest(
+                ClusterProtocol.PROTOCOL_VERSION,
+                ClusterProtocol.newId(),
+                ClusterProtocol.newId(),
+                localNodeId,
+                ClusterProtocol.now(),
+                request.leaderId(),
+                request.term(),
+                request.lastIncludedIndex(),
+                request.lastIncludedTerm(),
+                request.data()
         );
     }
 

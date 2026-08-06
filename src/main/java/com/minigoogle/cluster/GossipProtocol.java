@@ -121,15 +121,28 @@ public class GossipProtocol {
                         l.onNodeJoined(key);
                     }
                 }
-            } else if (remote.heartbeatCounter() > local.heartbeatCounter()) {
-                membershipTable.put(key, remote);
-                // Transition: was not ALIVE, now ALIVE => joined
-                if (local.status() != NodeStatus.ALIVE && remote.status() == NodeStatus.ALIVE) {
-                    for (MembershipListener l : listeners) {
-                        l.onNodeJoined(key);
-                    }
+        } else if (senderId.equals(key)
+                || remote.heartbeatCounter() > local.heartbeatCounter()
+                || (remote.status() == NodeStatus.ALIVE && local.status() != NodeStatus.ALIVE)) {
+            // A node that contacts us is alive right now even if it restarted
+            // its heartbeat counter at zero (rejoin), and an ALIVE claim revives
+            // a suspect/dead local entry; otherwise a rejoining node whose
+            // counter restarts below the survivors' frozen value could never
+            // re-enter the cluster. Never regress the highest-known counter or
+            // liveness freshness.
+            GossipNodeState updated = new GossipNodeState(
+                    key,
+                    Math.max(remote.heartbeatCounter(), local.heartbeatCounter()),
+                    remote.status(),
+                    Math.max(remote.lastSeen(), local.lastSeen()));
+            membershipTable.put(key, updated);
+            // Transition: was not ALIVE, now ALIVE => joined
+            if (local.status() != NodeStatus.ALIVE && remote.status() == NodeStatus.ALIVE) {
+                for (MembershipListener l : listeners) {
+                    l.onNodeJoined(key);
                 }
             }
+        }
         }
     }
 
@@ -238,10 +251,26 @@ public class GossipProtocol {
         
         if (transport != null) {
             transport.exchangeState(peer, Map.copyOf(membershipTable))
-                     .exceptionally(ex -> {
-                         // On failure, rely on normal failure detection
-                         return null;
-                     });
+                    .thenAccept(ack -> {
+                        // The peer answered, so it is alive right now: refresh
+                        // its liveness so a bootstrapping/rejoining node does
+                        // not fail-detect the very seed it is converging with.
+                        GossipNodeState current = membershipTable.get(peer);
+                        if (current != null) {
+                            boolean rejoined = current.status() != NodeStatus.ALIVE;
+                            membershipTable.put(peer, new GossipNodeState(
+                                    peer, current.heartbeatCounter(), NodeStatus.ALIVE, System.currentTimeMillis()));
+                            if (rejoined) {
+                                for (MembershipListener l : listeners) {
+                                    l.onNodeJoined(peer);
+                                }
+                            }
+                        }
+                    })
+                    .exceptionally(ex -> {
+                        // On failure, rely on normal failure detection
+                        return null;
+                    });
         }
     }
 

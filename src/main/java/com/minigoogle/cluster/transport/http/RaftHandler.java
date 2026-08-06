@@ -6,6 +6,8 @@ import com.minigoogle.cluster.transport.ClusterProtocol;
 import com.minigoogle.cluster.transport.ProtocolViolationException;
 import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotRequest;
+import com.minigoogle.cluster.transport.dto.InstallSnapshotResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
 import com.sun.net.httpserver.HttpExchange;
@@ -64,6 +66,25 @@ public class RaftHandler implements HttpHandler {
                 boolean success = raft.receiveAppendEntries(req.leaderId(), req.term(),
                         req.prevLogIndex(), req.prevLogTerm(), req.entries(), req.leaderCommit());
                 AppendEntriesResponse resp = new AppendEntriesResponse(
+                        ClusterProtocol.PROTOCOL_VERSION,
+                        req.requestId(),
+                        req.correlationId(),
+                        localNodeId,
+                        ClusterProtocol.now(),
+                        raft.getCurrentTerm(),
+                        success
+                );
+                sendResponse(exchange, resp);
+            } else if (path.endsWith("/install-snapshot")) {
+                InstallSnapshotRequest req = mapper.readValue(exchange.getRequestBody(), InstallSnapshotRequest.class);
+                ClusterProtocol.validate(req);
+                if (!AuthFilter.authenticatedSender(exchange, req.sourceNodeId())) {
+                    sendError(exchange, 403, "Forbidden: source node mismatch");
+                    return;
+                }
+                boolean success = raft.receiveInstallSnapshot(req.leaderId(), req.term(),
+                        req.lastIncludedIndex(), req.lastIncludedTerm(), req.data());
+                InstallSnapshotResponse resp = new InstallSnapshotResponse(
                         ClusterProtocol.PROTOCOL_VERSION,
                         req.requestId(),
                         req.correlationId(),

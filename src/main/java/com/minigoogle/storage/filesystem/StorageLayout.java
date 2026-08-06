@@ -60,4 +60,13 @@ public class StorageLayout {
     public Path getRaftAppliedPath() {
         return baseDirectory.resolve("raft-applied.bin");
     }
+
+    /**
+     * @return The path to the file holding this node's durable Raft
+     *         state-machine snapshot (which also carries the log base after
+     *         prefix compaction).
+     */
+    public Path getRaftSnapshotPath() {
+        return baseDirectory.resolve("raft-snapshot.bin");
+    }
 }

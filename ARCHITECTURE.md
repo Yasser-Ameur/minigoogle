@@ -8404,11 +8404,15 @@ Each node stores
     raft-log.bin
 
     raft-applied.bin
+
+    raft-snapshot.bin
 ```
 
 Every shard lives inside its own directory.
 
 Moving a shard becomes as simple as copying one folder.
+
+`raft-snapshot.bin` is the latest state-machine snapshot (storage.metadata.RaftSnapshotStore, magic "RSNP"). Every `snapshotInterval` committed entries the applied state is captured there and the `raft-log.bin` prefix is compacted, so a restarted node rebuilds the KV from snapshot + compacted tail instead of replaying history. Once the log is compacted, the snapshot carries the log base: `raft-snapshot.bin` and `raft-log.bin` must be deleted together, never one alone (a rebuilt node just rejoins from scratch).
 
 ---
 
@@ -15391,7 +15395,7 @@ A leader that loses leadership before its write commits surfaces NotLeaderExcept
 
 Not yet implemented (future work):
 
-Snapshotting/compaction of the replicated log, follower-served reads, and membership reconfiguration.
+Follower-served reads and membership reconfiguration.
 
 ---
 
@@ -15441,9 +15445,9 @@ The durable index WAL (storage.wal.WriteAheadLog) provides append + fsync + repl
 
 Raft election metadata is persisted in a separate crash-consistent file (storage.metadata.RaftMetadataStore) so a restart never re-issues a vote for a term it already voted in.
 
-The Raft log reuses the same WAL format (storage.wal.WriteAheadLog) for crash recovery of replicated entries: each entry is framed [4-byte term][payload] with a dedicated operation type, appended with fsync, and replayed into the in-memory log on startup. Conflict truncation rewrites the WAL with the retained prefix.
+The Raft log reuses the same WAL format (storage.wal.WriteAheadLog) for crash recovery of replicated entries: each entry is framed [4-byte term][payload] with a dedicated operation type, appended with fsync, and replayed into the in-memory log on startup. Conflict truncation rewrites the WAL with the retained prefix. Log compaction rewrites the WAL with the retained tail at a new base index, and an installed snapshot replaces the whole WAL.
 
-The apply watermark is persisted in a dedicated crash-consistent file (storage.metadata.RaftAppliedStore, raft-applied.bin), so a restarted node rebuilds its state machine by replaying exactly the committed prefix [1..lastApplied] instead of the whole log tail.
+The apply watermark is persisted in a dedicated crash-consistent file (storage.metadata.RaftAppliedStore, raft-applied.bin), so a restarted node rebuilds its state machine by replaying exactly the committed prefix [1..lastApplied] instead of the whole log tail. After compaction, the state machine is rebuilt from the durable snapshot (raft-snapshot.bin) plus the re-based tail.
 
 ---
 
@@ -15518,6 +15522,14 @@ replaying
 millions
 
 of entries.
+
+Implementation status:
+
+Snapshotting and log compaction are implemented (Phase 5). Every `snapshotInterval` (default 10_000) committed entries, the applied state is captured into raft-snapshot.bin (storage.metadata.RaftSnapshotStore, magic "RSNP", written atomically: temp + fsync + rename) and the log prefix is compacted (com.minigoogle.cluster.RaftLog.compact), so the leader's log stays bounded and restarts rebuild in O(state + tail). The snapshot is written before the log is compacted, so a crash at any point loses only an uncommitted tail.
+
+A follower whose next index falls below the leader's first retained index is caught up with an InstallSnapshot RPC (transport dto.InstallSnapshotRequest/Response over /cluster/v1/raft/install-snapshot): it adopts the snapshot (compacting a matching tail or replacing its log entirely), restores the state machine, and advances its applied watermark. A snapshot carrying a lower term is rejected; a higher-term snapshot steps the receiver down and persists the term. Non-snapshotable state machines are never snapped or restored.
+
+A restarted node opens its WAL at the snapshot's base (RaftLog(wal, baseIndex, baseTerm)) and rebuilds the KV from snapshot + re-based tail, so a compacted raft-log.bin is never replayed as if it started at index 1. Membership rejoin is supported: a node whose gossip entry was marked suspect/dead is revived the moment it contacts the cluster again, even though its heartbeat counter restarts below the survivors' frozen value.
 
 ---
 
