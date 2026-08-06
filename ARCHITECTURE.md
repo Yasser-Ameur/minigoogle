@@ -8402,6 +8402,8 @@ Each node stores
     raft-metadata.bin
 
     raft-log.bin
+
+    raft-applied.bin
 ```
 
 Every shard lives inside its own directory.
@@ -15381,9 +15383,15 @@ Full log replication is implemented: leaders append entries to a RaftLog (com.mi
 
 The replicated log is durable: entries are fsynced to raft-log.bin (a WriteAheadLog) before acknowledgment, and a restarted node replays its log on startup.
 
+Committed entries are applied to an in-memory replicated key-value state machine (cluster.state.ReplicatedKeyValueStore) strictly in index order, on every node, immediately after commit: the leader in advanceCommit, followers in receiveAppendEntries. The apply watermark is durably recorded in raft-applied.bin (storage.metadata.RaftAppliedStore), so a restarted node deterministically rebuilds the state machine by re-applying the committed prefix [1..lastApplied].
+
+ClusterNode exposes linearizable operations over the leader: put/delete append a framed command (cluster.state.KvCommand, op PUT/DELETE) to the Raft log and acknowledge only after a quorum commit plus the leader's own apply; get serves a leader read after a read-index barrier (prepareReadBarrier) confirms a quorum in the leader's term, so a partitioned leader cannot serve stale reads. A non-leader raises NotLeaderException naming the current leader for redirection.
+
+A leader that loses leadership before its write commits surfaces NotLeaderException to the caller rather than a false acknowledgement, preserving linearizability.
+
 Not yet implemented (future work):
 
-Applying the committed log to a state machine (nothing consumes the log yet), snapshotting/compaction, and membership reconfiguration.
+Snapshotting/compaction of the replicated log, follower-served reads, and membership reconfiguration.
 
 ---
 
@@ -15434,6 +15442,8 @@ The durable index WAL (storage.wal.WriteAheadLog) provides append + fsync + repl
 Raft election metadata is persisted in a separate crash-consistent file (storage.metadata.RaftMetadataStore) so a restart never re-issues a vote for a term it already voted in.
 
 The Raft log reuses the same WAL format (storage.wal.WriteAheadLog) for crash recovery of replicated entries: each entry is framed [4-byte term][payload] with a dedicated operation type, appended with fsync, and replayed into the in-memory log on startup. Conflict truncation rewrites the WAL with the retained prefix.
+
+The apply watermark is persisted in a dedicated crash-consistent file (storage.metadata.RaftAppliedStore, raft-applied.bin), so a restarted node rebuilds its state machine by replaying exactly the committed prefix [1..lastApplied] instead of the whole log tail.
 
 ---
 

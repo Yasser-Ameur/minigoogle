@@ -1,6 +1,8 @@
 package com.minigoogle.cluster;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.state.KvCommand;
+import com.minigoogle.cluster.state.ReplicatedKeyValueStore;
 import com.minigoogle.cluster.transport.ClusterTransport;
 import com.minigoogle.cluster.transport.NodeDirectory;
 import com.minigoogle.cluster.transport.SearchTransport;
@@ -13,12 +15,16 @@ import com.minigoogle.cluster.transport.http.RaftHandler;
 import com.minigoogle.cluster.transport.http.SearchHandler;
 import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.storage.filesystem.StorageLayout;
+import com.minigoogle.storage.metadata.RaftAppliedStore;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
 import com.minigoogle.storage.wal.WriteAheadLog;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Assemblies the Phase 1 cluster stack for a single node:
@@ -30,12 +36,15 @@ import java.util.List;
  * so coordinators can fan queries out over the transport.</p>
  */
 public class ClusterNode {
+    private static final long OPERATION_TIMEOUT_MS = 10_000;
+
     private final String nodeId;
     private final InternalClusterServer server;
     private final GossipProtocol gossip;
     private final RaftConsensus raft;
     private final ConsistentHashRing ring;
     private final List<ClusterTransport> transports;
+    private final ReplicatedKeyValueStore kv;
 
     public ClusterNode(String nodeId, int port, NodeDirectory directory) throws IOException {
         this(nodeId, port, directory, 1000, 5000, 5000, 1000, null);
@@ -183,7 +192,48 @@ public class ClusterNode {
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, raftMetadataStore, raftLog, null, null);
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with an explicit
+     * Raft metadata store, replicated log, and replicated key-value state
+     * machine.
+     *
+     * <p>Committed entries are applied to {@code stateMachine} in order, and
+     * the apply watermark is durably recorded in {@code appliedStore}, so a
+     * node restarted on the same stores rebuilds the key-value state from its
+     * log without waiting for the next commit. The public {@link #put(String, byte[])},
+     * {@link #delete(String)}, and {@link #get(String)} operations require a
+     * state machine; without one they fail with {@link IllegalStateException}.
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param raftMetadataStore    Store for {@code currentTerm} and
+     *                             {@code votedFor}, or {@code null} to keep the
+     *                             metadata in memory only.
+     * @param raftLog              The replicated log, or {@code null} for a
+     *                             memory-only log.
+     * @param stateMachine         The replicated key-value state machine, or
+     *                             {@code null} to disable the client operations.
+     * @param appliedStore         Store for the apply watermark, or {@code null}
+     *                             to keep it in memory only.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog,
+                       ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore) throws IOException {
         this.nodeId = nodeId;
+        this.kv = stateMachine;
         ObjectMapper mapper = new ObjectMapper();
         this.server = new InternalClusterServer(port, mapper);
 
@@ -203,7 +253,8 @@ public class ClusterNode {
         // campaigns against nodes that gossip currently believes are alive.
         this.raft = new RaftConsensus(nodeId, raftElectionTimeout, raftHeartbeat, 3, raftTransport, gossip::getLiveNodes,
                 raftMetadataStore == null ? RaftMetadataStore.inMemory() : raftMetadataStore,
-                raftLog == null ? RaftLog.inMemory() : raftLog);
+                raftLog == null ? RaftLog.inMemory() : raftLog,
+                stateMachine, appliedStore);
 
         server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
@@ -263,5 +314,81 @@ public class ClusterNode {
 
     public InternalClusterServer getServer() {
         return server;
+    }
+
+    /**
+     * Linearly puts a value for {@code key} into the replicated state machine.
+     * Returns only after the entry is committed by a majority and applied, so
+     * a successful return is durable.
+     *
+     * @throws NotLeaderException If this node is not the leader, or commit is
+     *                            not reached before the operation timeout.
+     */
+    public void put(String key, byte[] value) {
+        ensureStateMachine();
+        appendAndWait(KvCommand.encodePut(key, value));
+    }
+
+    /**
+     * Linearly deletes {@code key} from the replicated state machine. Returns
+     * only after the entry is committed by a majority and applied.
+     *
+     * @throws NotLeaderException If this node is not the leader, or commit is
+     *                            not reached before the operation timeout.
+     */
+    public void delete(String key) {
+        ensureStateMachine();
+        appendAndWait(KvCommand.encodeDelete(key));
+    }
+
+    /**
+     * Linearly reads the value for {@code key}. The read is served only after
+     * a read-index barrier confirms this node is still the leader for its term,
+     * so a partitioned leader cannot return stale state.
+     *
+     * @return The stored value, or {@code null} if absent.
+     * @throws NotLeaderException If this node is not the leader or cannot
+     *                            establish a read barrier.
+     */
+    public byte[] get(String key) {
+        ensureStateMachine();
+        if (raft.getState() != RaftConsensus.RaftState.LEADER) {
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Node " + nodeId + " is not the leader; leader is " + raft.getCurrentLeader());
+        }
+        if (!raft.prepareReadBarrier()) {
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Node " + nodeId + " could not establish a read barrier (no quorum)");
+        }
+        return kv.get(key);
+    }
+
+    private void ensureStateMachine() {
+        if (kv == null) {
+            throw new IllegalStateException("Node " + nodeId + " has no replicated key-value state machine");
+        }
+    }
+
+    private void appendAndWait(byte[] command) {
+        int index;
+        try {
+            index = raft.appendEntry(command);
+        } catch (IllegalStateException e) {
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Node " + nodeId + " is not the leader; leader is " + raft.getCurrentLeader());
+        }
+        try {
+            kv.awaitCommit(index).get(OPERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Write to " + nodeId + " timed out waiting for commit");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Interrupted waiting for commit on " + nodeId);
+        } catch (ExecutionException e) {
+            throw new NotLeaderException(raft.getCurrentLeader(),
+                    "Failed waiting for commit on " + nodeId, e);
+        }
     }
 }

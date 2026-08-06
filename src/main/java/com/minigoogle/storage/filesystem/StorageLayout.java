@@ -52,4 +52,12 @@ public class StorageLayout {
     public Path getRaftLogPath() {
         return baseDirectory.resolve("raft-log.bin");
     }
+
+    /**
+     * @return The path to the file holding this node's durable Raft apply
+     *         watermark (the last log index applied to the state machine).
+     */
+    public Path getRaftAppliedPath() {
+        return baseDirectory.resolve("raft-applied.bin");
+    }
 }

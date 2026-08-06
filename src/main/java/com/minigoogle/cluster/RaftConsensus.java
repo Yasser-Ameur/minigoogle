@@ -6,6 +6,7 @@ import com.minigoogle.cluster.transport.dto.AppendEntriesRequest;
 import com.minigoogle.cluster.transport.dto.AppendEntriesResponse;
 import com.minigoogle.cluster.transport.dto.RequestVoteRequest;
 import com.minigoogle.cluster.transport.dto.RequestVoteResponse;
+import com.minigoogle.storage.metadata.RaftAppliedStore;
 import com.minigoogle.storage.metadata.RaftMetadata;
 import com.minigoogle.storage.metadata.RaftMetadataStore;
 
@@ -16,9 +17,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
@@ -53,6 +58,9 @@ public class RaftConsensus {
     /** Maximum entries sent in a single AppendEntries request. */
     private static final int MAX_ENTRIES_PER_REQUEST = 64;
 
+    /** Floor for the read-barrier quorum wait, independent of heartbeat cadence. */
+    private static final long READ_BARRIER_MIN_TIMEOUT_MS = 500;
+
     private final String nodeId;
     private volatile RaftState state;
     private volatile String currentLeader;
@@ -64,16 +72,34 @@ public class RaftConsensus {
     private final Supplier<List<String>> peerSupplier;
     private final RaftMetadataStore metadataStore;
     private final RaftLog log;
+    private final StateMachine stateMachine;
+    private final RaftAppliedStore appliedStore;
 
     private volatile int commitIndex;
+    private volatile int lastApplied;
 
     private final Map<String, Integer> nextIndex = new HashMap<>();
     private final Map<String, Integer> matchIndex = new HashMap<>();
+
+    /** Guards the read-barrier rounds below. */
+    private final Object barrierLock = new Object();
+    private int barrierRound;
+    private final Map<Integer, Set<String>> barrierResponders = new HashMap<>();
+    private final Map<Integer, CompletableFuture<Boolean>> barrierFutures = new HashMap<>();
 
     private ScheduledExecutorService scheduler;
     private final long electionTimeoutMs;
     private final long heartbeatIntervalMs;
     private final int clusterSize;
+
+    /**
+     * The single pending election-timeout task. Each reschedule cancels the
+     * previous task, so a node that keeps hearing from a leader never piles up
+     * stale election tasks; without cancellation, a contested startup floods
+     * every node with tasks that fire back-to-back and ratchet the term upward
+     * without ever converging on a leader.
+     */
+    private volatile ScheduledFuture<?> electionTimeoutTask;
 
     /**
      * Creates a Raft consensus node with full configuration.
@@ -175,11 +201,46 @@ public class RaftConsensus {
     public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize,
                          RaftTransport transport, Supplier<List<String>> peerSupplier,
                          RaftMetadataStore metadataStore, RaftLog log) {
+        this(nodeId, electionTimeoutMs, heartbeatIntervalMs, clusterSize, transport, peerSupplier, metadataStore, log,
+                null, null);
+    }
+
+    /**
+     * Full configuration with transport, peer discovery, durable election
+     * metadata, a durable replicated log, and an optional state machine that
+     * consumes committed entries.
+     *
+     * <p>Every time {@code commitIndex} advances (on the leader after a quorum,
+     * on followers up to {@code leaderCommit}), the newly committed range
+     * {@code [lastApplied+1 .. commitIndex]} is applied to the state machine in
+     * index order. When an {@link RaftAppliedStore} is provided, the watermark
+     * is persisted after each applied batch and the deterministic committed
+     * prefix is re-applied on construction, so a restarted node resumes with
+     * the same state without waiting for the next commit. Either may be
+     * {@code null} to keep the pre-existing apply-free behavior.
+     *
+     * @param nodeId              The unique identifier for this node.
+     * @param electionTimeoutMs   The election timeout in milliseconds.
+     * @param heartbeatIntervalMs The heartbeat interval in milliseconds.
+     * @param clusterSize         Fallback cluster size when no peer supplier is given.
+     * @param transport           The transport for cluster RPCs, or {@code null} for in-memory operation.
+     * @param peerSupplier        Supplies the current peer IDs, or {@code null} to rely on {@code clusterSize}.
+     * @param metadataStore       The store for {@code currentTerm} and {@code votedFor}, or {@code null}
+     *                            to keep the metadata in memory only.
+     * @param log                 The replicated log, or {@code null} for a memory-only log.
+     * @param stateMachine        Consumer of committed entries, or {@code null} for none.
+     * @param appliedStore        Store for the apply watermark, or {@code null} for none.
+     */
+    public RaftConsensus(String nodeId, long electionTimeoutMs, long heartbeatIntervalMs, int clusterSize,
+                         RaftTransport transport, Supplier<List<String>> peerSupplier,
+                         RaftMetadataStore metadataStore, RaftLog log,
+                         StateMachine stateMachine, RaftAppliedStore appliedStore) {
         this.nodeId = nodeId;
         this.state = RaftState.FOLLOWER;
         this.currentLeader = null;
         this.votesReceived = 0;
         this.commitIndex = 0;
+        this.lastApplied = 0;
         this.electionTimeoutMs = electionTimeoutMs;
         this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.clusterSize = clusterSize;
@@ -187,9 +248,12 @@ public class RaftConsensus {
         this.peerSupplier = peerSupplier;
         this.metadataStore = metadataStore == null ? RaftMetadataStore.inMemory() : metadataStore;
         this.log = log == null ? RaftLog.inMemory() : log;
+        this.stateMachine = stateMachine;
+        this.appliedStore = appliedStore;
         RaftMetadata restored = restoreMetadata();
         this.currentTerm = restored.currentTerm();
         this.votedFor = restored.votedFor();
+        restoreAppliedState();
     }
 
     /**
@@ -293,6 +357,7 @@ public class RaftConsensus {
         votesReceived = 0;
         if (termChanged) {
             persistMetadata();
+            failPendingBarriers();
         }
         if (prevLogIndex > log.lastIndex() || log.termAt(prevLogIndex) != prevLogTerm) {
             scheduleElectionTimeout();
@@ -313,6 +378,7 @@ public class RaftConsensus {
         }
         if (leaderCommit > commitIndex) {
             commitIndex = Math.min(leaderCommit, log.lastIndex());
+            applyCommitted(commitIndex);
         }
         scheduleElectionTimeout();
         return true;
@@ -375,6 +441,10 @@ public class RaftConsensus {
             throw new IllegalStateException("Only the leader may append to the Raft log");
         }
         int index = log.append(currentTerm, payload);
+        if (majorityThreshold() <= 1) {
+            commitIndex = index;
+            applyCommitted(index);
+        }
         sendHeartbeats();
         return index;
     }
@@ -400,6 +470,109 @@ public class RaftConsensus {
     public int getCommitIndex() { return commitIndex; }
     public int getLastLogIndex() { return log.lastIndex(); }
     public int getLastLogTerm() { return log.lastTerm(); }
+    public int getLastApplied() { return lastApplied; }
+
+    /**
+     * Establishes a linearizable read barrier: confirms this node is still the
+     * leader for its term by requiring a fresh quorum of AppendEntries acks
+     * before returning, so a partitioned leader cannot serve stale reads.
+     *
+     * <p>A single-node cluster (no transport) trivially satisfies the barrier.
+     * A node that is not the leader, or a leader that cannot gather a quorum
+     * before the timeout, returns {@code false}.
+     *
+     * @return true when it is safe to serve a linearizable read.
+     */
+    public boolean prepareReadBarrier() {
+        List<String> targets;
+        int roundTerm;
+        int prevLogIndex;
+        int prevLogTerm;
+        int snapshotCommit;
+        synchronized (this) {
+            if (state != RaftState.LEADER) {
+                return false;
+            }
+            if (transport == null || majorityThreshold() <= 1) {
+                return true;
+            }
+            roundTerm = currentTerm;
+            prevLogIndex = log.lastIndex();
+            prevLogTerm = log.lastTerm();
+            snapshotCommit = commitIndex;
+            targets = peers();
+        }
+
+        int round;
+        CompletableFuture<Boolean> future;
+        synchronized (barrierLock) {
+            round = ++barrierRound;
+            future = new CompletableFuture<>();
+            barrierResponders.put(round, new HashSet<>());
+            barrierFutures.put(round, future);
+        }
+
+        for (String peer : targets) {
+            AppendEntriesRequest req = new AppendEntriesRequest(
+                    ClusterProtocol.PROTOCOL_VERSION,
+                    ClusterProtocol.newId(),
+                    ClusterProtocol.newId(),
+                    nodeId,
+                    ClusterProtocol.now(),
+                    nodeId,
+                    roundTerm,
+                    prevLogIndex,
+                    prevLogTerm,
+                    List.of(),
+                    snapshotCommit
+            );
+            transport.sendAppendEntries(peer, req)
+                    .whenComplete((resp, err) -> onBarrierResponse(round, peer, resp, err));
+        }
+
+        try {
+            return future.get(Math.max(READ_BARRIER_MIN_TIMEOUT_MS, heartbeatIntervalMs * 2), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException | TimeoutException e) {
+            return false;
+        } finally {
+            synchronized (barrierLock) {
+                barrierResponders.remove(round);
+                barrierFutures.remove(round);
+            }
+        }
+    }
+
+    /**
+     * Counts a barrier round's AppendEntries response. A response is credited
+     * only when it succeeds in the round's term; a higher term invalidates the
+     * round (this leader is stale). The round completes once self plus the
+     * credited peers form a strict majority.
+     */
+    private void onBarrierResponse(int round, String peer, AppendEntriesResponse resp, Throwable err) {
+        if (err != null) {
+            return;
+        }
+        synchronized (barrierLock) {
+            CompletableFuture<Boolean> future = barrierFutures.get(round);
+            Set<String> responders = barrierResponders.get(round);
+            if (future == null || responders == null || future.isDone()) {
+                return;
+            }
+            if (resp.term() > currentTerm) {
+                future.complete(false);
+                return;
+            }
+            if (resp.success()) {
+                responders.add(peer);
+            }
+            if (responders.size() + 1 >= majorityThreshold()) {
+                future.complete(true);
+            }
+        }
+    }
 
     /**
      * Sends a RequestVote RPC to every peer for the current election term,
@@ -494,7 +667,22 @@ public class RaftConsensus {
         votesReceived = 0;
         votedFor = null;
         persistMetadata();
+        failPendingBarriers();
         scheduleElectionTimeout();
+    }
+
+    /**
+     * Aborts every in-flight read barrier as failed. Invoked whenever this node
+     * loses leadership (term increase), so a stale leader never serves a read.
+     */
+    private void failPendingBarriers() {
+        synchronized (barrierLock) {
+            for (CompletableFuture<Boolean> future : barrierFutures.values()) {
+                future.complete(false);
+            }
+            barrierFutures.clear();
+            barrierResponders.clear();
+        }
     }
 
     /**
@@ -508,9 +696,59 @@ public class RaftConsensus {
         for (int n = log.lastIndex(); n > commitIndex; n--) {
             if (log.termAt(n) == currentTerm && countMatches(n) >= threshold) {
                 commitIndex = n;
+                applyCommitted(n);
                 return;
             }
         }
+    }
+
+    /**
+     * Applies the newly committed range {@code [lastApplied+1 .. newCommitIndex]}
+     * to the state machine in index order, then records the watermark. Runs
+     * under the consensus lock, so a write ack (which happens only after the
+     * leader's own apply) guarantees the effect is visible to subsequent reads.
+     */
+    private void applyCommitted(int newCommitIndex) {
+        if (stateMachine == null) {
+            return;
+        }
+        for (int i = lastApplied + 1; i <= newCommitIndex; i++) {
+            stateMachine.apply(logEntryAt(i));
+        }
+        lastApplied = newCommitIndex;
+        if (appliedStore != null) {
+            try {
+                appliedStore.persist(lastApplied);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to persist raft applied index", e);
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the state machine from the persisted committed prefix on
+     * construction. Applying {@code [1 .. lastApplied]} deterministically
+     * reproduces the pre-restart state; the log is durable and therefore at
+     * least as long as the watermark in normal operation.
+     */
+    private void restoreAppliedState() {
+        if (appliedStore == null) {
+            return;
+        }
+        try {
+            lastApplied = appliedStore.load();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to load raft applied index", e);
+        }
+        if (stateMachine != null) {
+            for (int i = 1; i <= lastApplied; i++) {
+                stateMachine.apply(logEntryAt(i));
+            }
+        }
+    }
+
+    private LogEntry logEntryAt(int index) {
+        return new LogEntry(index, log.termAt(index), log.payloadAt(index));
     }
 
     /**
@@ -632,8 +870,12 @@ public class RaftConsensus {
 
     private void scheduleElectionTimeout() {
         if (scheduler != null && !scheduler.isShutdown() && state != RaftState.LEADER) {
+            ScheduledFuture<?> pending = electionTimeoutTask;
+            if (pending != null) {
+                pending.cancel(false);
+            }
             long jitter = (long) (electionTimeoutMs * 0.5 + Math.random() * electionTimeoutMs * 0.5);
-            scheduler.schedule(this::startElection, jitter, TimeUnit.MILLISECONDS);
+            electionTimeoutTask = scheduler.schedule(this::startElection, jitter, TimeUnit.MILLISECONDS);
         }
     }
 
