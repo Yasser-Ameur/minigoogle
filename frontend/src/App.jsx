@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import SearchBox from './components/SearchBox';
-import { analytics, crawl, search, stats } from './api';
+import { analytics, click, crawl, search, stats } from './api';
 import { formatScore, highlightSnippet } from './format.jsx';
 
 function Logo({ size = 'home', onClick }) {
@@ -65,15 +65,26 @@ function IndexStats({ data }) {
   );
 }
 
-function ResultCard({ result }) {
+function ResultCard({ query, position, result }) {
   const scores = [];
   if (result.bm25Score > 0) scores.push('BM25: ' + formatScore(result.bm25Score));
   if (result.pageRankScore > 0) scores.push('PageRank: ' + formatScore(result.pageRankScore));
   scores.push('Score: ' + formatScore(result.score));
+
+  // Report the click to the backend for learning-to-rank training. Fire and
+  // forget so the click never blocks navigation, and never fail the UI.
+  const onClick = () => {
+    if (query) {
+      click(query, result.url, position).catch(() => {});
+    }
+  };
+
   return (
     <div className="result">
       <div className="url">{result.url}</div>
-      <div className="title"><a href={result.url} target="_blank" rel="noreferrer">{result.title}</a></div>
+      <div className="title">
+        <a href={result.url} target="_blank" rel="noreferrer" onClick={onClick}>{result.title}</a>
+      </div>
       <div className="snippet">{highlightSnippet(result.snippet)}</div>
       <div className="score">{scores.join(' \u00b7 ')}</div>
     </div>
@@ -145,7 +156,7 @@ function ResultsPage({ query, onLogoClick, onSearch, onData, data }) {
               Did you mean: <b>{didYouMean}</b>
             </div>
           )}
-          {results.map((r) => <ResultCard key={r.url} result={r} />)}
+          {results.map((r, i) => <ResultCard key={r.url} query={query} position={i + 1} result={r} />)}
           {analyticsData && analyticsData.totalQueries > 0 && (
             <div className="analytics-bar">
               <div>Queries: <span>{analyticsData.totalQueries}</span></div>
