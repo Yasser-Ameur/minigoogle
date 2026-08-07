@@ -9,13 +9,24 @@ import java.util.List;
  * @param totalResults    Estimated total number of matching documents.
  * @param results         The requested page of results.
  * @param didYouMean      Suggested correction when no results found (may be null).
+ * @param maxPageRank     The responding node's corpus-global maximum PageRank,
+ *                        used by the coordinator to build the global
+ *                        normalization context. 0 for standalone responses.
+ * @param maxDocLength    The responding node's corpus-global maximum document
+ *                        length. 0 for standalone responses.
  */
 public record SearchResponse(
         long executionTimeMs,
         int totalResults,
         List<SearchResult> results,
-        String didYouMean
+        String didYouMean,
+        double maxPageRank,
+        double maxDocLength
 ) {
+    public SearchResponse(long executionTimeMs, int totalResults, List<SearchResult> results, String didYouMean) {
+        this(executionTimeMs, totalResults, results, didYouMean, 0.0, 0.0);
+    }
+
     public SearchResponse(long executionTimeMs, int totalResults, List<SearchResult> results) {
         this(executionTimeMs, totalResults, results, null);
     }

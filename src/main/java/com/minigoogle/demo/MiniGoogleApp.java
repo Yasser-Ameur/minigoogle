@@ -64,6 +64,7 @@ import com.minigoogle.ml.click.ClickFeedbackTrainer;
 import com.minigoogle.ml.click.ClickTracker;
 import com.minigoogle.ml.features.FeatureExtractor;
 import com.minigoogle.ml.features.FeatureName;
+import com.minigoogle.ml.features.NormalizationContext;
 import com.minigoogle.ml.ltr.LinearRankingModel;
 import com.minigoogle.monitoring.analytics.QueryAnalytics;
 import com.minigoogle.network.dto.ClickRequest;
@@ -171,9 +172,16 @@ public class MiniGoogleApp {
                 long start = System.currentTimeMillis();
                 int topK = config.getInt("search.topK", 20);
                 int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
-                SearchResponse response = executeSearch(request.query().trim(), pageSize);
+                // A SEARCH-mode node returns its candidate set with raw
+                // features for coordinator-side global ranking; a standalone
+                // node returns fully ranked results.
+                SearchResponse response = "SEARCH".equals(nodeType)
+                        ? gatherCandidateResults(request.query().trim(), pageSize)
+                        : executeSearch(request.query().trim(), pageSize);
                 long elapsed = System.currentTimeMillis() - start;
-                return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(), response.results(), response.didYouMean()));
+                return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(),
+                        response.results(), response.didYouMean(),
+                        response.maxPageRank(), response.maxDocLength()));
             } catch (Exception e) {
                 return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
             }
@@ -664,6 +672,75 @@ public class MiniGoogleApp {
 
         long start = System.currentTimeMillis();
 
+        RetrievalResult retrieval = retrieveCandidates(query, pageSize);
+        List<RankedDocument> ranked = retrieval.ranked();
+        String didYouMean = retrieval.didYouMean();
+
+        if (ranked.isEmpty()) {
+            eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
+            return new SearchResponse(0, 0, List.of(), didYouMean);
+        }
+
+        // Learning-to-rank re-rank: score each candidate with the shared
+        // ranking pipeline using the pre-rank position as the POSITION
+        // feature, then re-sort. Standalone and distributed execution share
+        // GlobalRankingPipeline, so the served ordering is produced by the
+        // exact same code in both modes.
+        boolean ltrEnabled = config.getBoolean("ml.ltr.enabled", true)
+                && rankingModel != null && featureExtractor != null;
+        if (ltrEnabled && !ranked.isEmpty()) {
+            List<RankedCandidate> candidates = new ArrayList<>(ranked.size());
+            for (RankedDocument doc : ranked) {
+                candidates.add(new RankedCandidate(
+                        String.valueOf(doc.documentId()), doc.url(), doc.title(), doc.snippet(),
+                        doc.bm25Score(), doc.pageRankScore(),
+                        featureExtractor.extractRaw(query, doc.documentId())));
+            }
+            List<RankedResult> ltrResults = GlobalRankingPipeline.rank(
+                    query, candidates, featureExtractor.normalizationContext(), rankingModel);
+            List<RankedDocument> ltrRanked = new ArrayList<>(ltrResults.size());
+            for (RankedResult result : ltrResults) {
+                RankedCandidate candidate = result.candidate();
+                ltrRanked.add(new RankedDocument(
+                        Integer.parseInt(candidate.documentId()), candidate.url(), candidate.title(),
+                        candidate.bm25Score(), candidate.pageRankScore(),
+                        result.score(), candidate.snippet()));
+            }
+            ranked = ltrRanked;
+        }
+
+        // Record the served result order as an impression for click training.
+        if (clickTracker != null && !ranked.isEmpty()) {
+            clickTracker.recordImpression(query, ranked.stream()
+                    .map(RankedDocument::documentId)
+                    .collect(Collectors.toList()));
+        }
+
+        // Convert to DTOs
+        List<com.minigoogle.network.dto.SearchResult> dtoResults = ranked.stream()
+            .map(r -> new com.minigoogle.network.dto.SearchResult(
+                r.url(), r.title(), r.snippet(), r.finalScore(),
+                r.bm25Score(), r.pageRankScore()))
+            .collect(Collectors.toList());
+
+        long elapsed = System.currentTimeMillis() - start;
+
+        // Cache and record analytics
+        queryCache.put(query.toLowerCase().strip(), dtoResults);
+        eventBus.publish(new QueryExecutedEvent(query, dtoResults.size(), elapsed, false));
+
+        return new SearchResponse(elapsed, dtoResults.size(), dtoResults, didYouMean);
+    }
+
+    /**
+     * Retrieval stage shared by standalone and shard execution: query
+     * expansion, parsing, spell correction, lexical BM25 + PageRank ranking,
+     * hybrid semantic recall and cross-encoder re-ranking. The returned
+     * candidates carry no learning-to-rank score — that decision is made by
+     * the {@link GlobalRankingPipeline} (standalone) or by the coordinator
+     * (distributed).
+     */
+    private RetrievalResult retrieveCandidates(String query, int pageSize) {
         // Expand query with synonyms. Expansions are OR-ed with the original
         // terms so a single-word query (e.g. "text") is not turned into an
         // AND query that requires every expanded term to match.
@@ -709,8 +786,7 @@ public class MiniGoogleApp {
                 && vectorIndex != null && embeddingGenerator != null;
 
         if (results.getPostings().isEmpty() && !hybridEnabled) {
-            eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
-            return new SearchResponse(0, 0, List.of(), didYouMean);
+            return new RetrievalResult(List.of(), didYouMean);
         }
 
         // Build per-term posting lists for ranking
@@ -788,52 +864,41 @@ public class MiniGoogleApp {
         // Re-rank with cross-encoder
         ranked = reranker.rerank(query, ranked);
 
-        // Learning-to-rank re-rank: score each candidate with the ranking model
-        // using the pre-rank position as the POSITION feature, then re-sort.
-        boolean ltrEnabled = config.getBoolean("ml.ltr.enabled", true)
-                && rankingModel != null && featureExtractor != null;
-        if (ltrEnabled && !ranked.isEmpty()) {
-            List<RankedCandidate> candidates = new ArrayList<>(ranked.size());
-            for (RankedDocument doc : ranked) {
-                candidates.add(new RankedCandidate(
-                        String.valueOf(doc.documentId()), doc.url(), doc.title(), doc.snippet(),
-                        doc.bm25Score(), doc.pageRankScore(),
-                        featureExtractor.extractRaw(query, doc.documentId())));
-            }
-            List<RankedResult> ltrResults = GlobalRankingPipeline.rank(
-                    query, candidates, featureExtractor.normalizationContext(), rankingModel);
-            List<RankedDocument> ltrRanked = new ArrayList<>(ltrResults.size());
-            for (RankedResult result : ltrResults) {
-                RankedCandidate candidate = result.candidate();
-                ltrRanked.add(new RankedDocument(
-                        Integer.parseInt(candidate.documentId()), candidate.url(), candidate.title(),
-                        candidate.bm25Score(), candidate.pageRankScore(),
-                        result.score(), candidate.snippet()));
-            }
-            ranked = ltrRanked;
-        }
+        return new RetrievalResult(ranked, didYouMean);
+    }
 
-        // Record the served result order as an impression for click training.
-        if (clickTracker != null && !ranked.isEmpty()) {
-            clickTracker.recordImpression(query, ranked.stream()
-                    .map(RankedDocument::documentId)
-                    .collect(Collectors.toList()));
-        }
+    /**
+     * Shard-mode query execution: runs the shared retrieval stage and returns
+     * the candidate set with raw feature vectors and the node's corpus
+     * statistics, so the coordinator can perform global ranking.
+     */
+    private SearchResponse gatherCandidateResults(String query, int pageSize) {
+        long start = System.currentTimeMillis();
 
-        // Convert to DTOs
-        List<com.minigoogle.network.dto.SearchResult> dtoResults = ranked.stream()
-            .map(r -> new com.minigoogle.network.dto.SearchResult(
-                r.url(), r.title(), r.snippet(), r.finalScore(),
-                r.bm25Score(), r.pageRankScore()))
-            .collect(Collectors.toList());
+        RetrievalResult retrieval = retrieveCandidates(query, pageSize);
+        List<RankedDocument> ranked = retrieval.ranked();
+
+        NormalizationContext context = featureExtractor != null
+                ? featureExtractor.normalizationContext()
+                : NormalizationContext.EMPTY;
+
+        List<com.minigoogle.network.dto.SearchResult> results =
+                new ArrayList<>(ranked.size());
+        for (RankedDocument doc : ranked) {
+            double[] raw = featureExtractor != null
+                    ? featureExtractor.extractRaw(query, doc.documentId()).toArray()
+                    : null;
+            results.add(new com.minigoogle.network.dto.SearchResult(
+                    doc.url(), doc.title(), doc.snippet(), doc.finalScore(),
+                    doc.bm25Score(), doc.pageRankScore(), raw));
+        }
 
         long elapsed = System.currentTimeMillis() - start;
+        return new SearchResponse(elapsed, results.size(), results,
+                retrieval.didYouMean(), context.maxPageRank(), context.maxDocLength());
+    }
 
-        // Cache and record analytics
-        queryCache.put(query.toLowerCase().strip(), dtoResults);
-        eventBus.publish(new QueryExecutedEvent(query, dtoResults.size(), elapsed, false));
-
-        return new SearchResponse(elapsed, dtoResults.size(), dtoResults, didYouMean);
+    private record RetrievalResult(List<RankedDocument> ranked, String didYouMean) {
     }
 
     private String loadResource(String resourcePath) throws IOException {
