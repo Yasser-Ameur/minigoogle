@@ -49,6 +49,19 @@ public record BenchmarkReport(
     }
 
     /**
+     * @param p The percentile to compute, e.g. 99.9.
+     * @return The p-th percentile latency in milliseconds.
+     */
+    public double latencyPercentileMs(double p) {
+        if (latenciesNanos.isEmpty()) return 0.0;
+        List<Long> sorted = new java.util.ArrayList<>(latenciesNanos);
+        Collections.sort(sorted);
+        int idx = (int) Math.ceil(p / 100.0 * sorted.size()) - 1;
+        idx = Math.max(0, Math.min(idx, sorted.size() - 1));
+        return sorted.get(idx) / 1_000_000.0;
+    }
+
+    /**
      * @return The minimum latency in milliseconds.
      */
     public double minLatencyMs() {
