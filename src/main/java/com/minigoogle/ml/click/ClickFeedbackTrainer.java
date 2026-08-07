@@ -15,10 +15,15 @@ import java.util.List;
  * <p>Every {@link #onClick} records the click and, once {@code trainAfterClicks}
  * new clicks have accumulated, rebuilds the preference pairs from the click log
  * and refines the ranking model with a short pairwise training pass.</p>
+ *
+ * <p>Features are resolved through a {@link ClickFeatureProvider}: a standalone
+ * node re-extracts them from its corpus via {@link FeatureExtractor}; a
+ * coordinator resolves the exact served vectors from its impression log. In
+ * both cases train-time features equal serve-time features.</p>
  */
 public class ClickFeedbackTrainer {
 
-    private final FeatureExtractor featureExtractor;
+    private final ClickFeatureProvider featureProvider;
     private final LinearRankingModel model;
     private final ClickTracker tracker;
     private final int trainAfterClicks;
@@ -32,7 +37,17 @@ public class ClickFeedbackTrainer {
                                 int trainAfterClicks,
                                 int epochs,
                                 double learningRate) {
-        this.featureExtractor = featureExtractor;
+        this((ClickFeatureProvider) featureExtractor, model, tracker,
+                trainAfterClicks, epochs, learningRate);
+    }
+
+    public ClickFeedbackTrainer(ClickFeatureProvider featureProvider,
+                                LinearRankingModel model,
+                                ClickTracker tracker,
+                                int trainAfterClicks,
+                                int epochs,
+                                double learningRate) {
+        this.featureProvider = featureProvider;
         this.model = model;
         this.tracker = tracker;
         this.trainAfterClicks = trainAfterClicks;
@@ -68,10 +83,10 @@ public class ClickFeedbackTrainer {
         }
         List<TrainingPair> pairs = new ArrayList<>(preferences.size());
         for (ClickPreference preference : preferences) {
-            QueryDocumentFeatures preferred = featureExtractor.extract(
-                    preference.query(), preference.preferredDocId(), 0);
-            QueryDocumentFeatures nonPreferred = featureExtractor.extract(
-                    preference.query(), preference.nonPreferredDocId(), 0);
+            QueryDocumentFeatures preferred = featureProvider.features(
+                    preference.query(), preference.preferredDocId());
+            QueryDocumentFeatures nonPreferred = featureProvider.features(
+                    preference.query(), preference.nonPreferredDocId());
             pairs.add(new TrainingPair(preferred, nonPreferred));
         }
         return PairwiseRankerTrainer.train(model, pairs, epochs, learningRate);

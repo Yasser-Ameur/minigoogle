@@ -28,6 +28,9 @@ import com.minigoogle.ranking.model.RankedDocument;
 import com.minigoogle.ranking.pagerank.GraphBuilder;
 import com.minigoogle.ranking.pagerank.PageRankCalculator;
 import com.minigoogle.ranking.pipeline.RankingPipeline;
+import com.minigoogle.ranking.pipeline.GlobalRankingPipeline;
+import com.minigoogle.ranking.pipeline.RankedCandidate;
+import com.minigoogle.ranking.pipeline.RankedResult;
 import com.minigoogle.semantic.EmbeddingGenerator;
 import com.minigoogle.semantic.VectorIndex;
 import com.minigoogle.semantic.autocomplete.TrieAutocomplete;
@@ -790,14 +793,23 @@ public class MiniGoogleApp {
         boolean ltrEnabled = config.getBoolean("ml.ltr.enabled", true)
                 && rankingModel != null && featureExtractor != null;
         if (ltrEnabled && !ranked.isEmpty()) {
-            List<RankedDocument> ltrRanked = new ArrayList<>(ranked.size());
-            for (int i = 0; i < ranked.size(); i++) {
-                RankedDocument doc = ranked.get(i);
-                double ltrScore = rankingModel.score(featureExtractor.extract(query, doc, i));
-                ltrRanked.add(new RankedDocument(doc.documentId(), doc.url(), doc.title(),
-                        doc.bm25Score(), doc.pageRankScore(), ltrScore, doc.snippet()));
+            List<RankedCandidate> candidates = new ArrayList<>(ranked.size());
+            for (RankedDocument doc : ranked) {
+                candidates.add(new RankedCandidate(
+                        String.valueOf(doc.documentId()), doc.url(), doc.title(), doc.snippet(),
+                        doc.bm25Score(), doc.pageRankScore(),
+                        featureExtractor.extractRaw(query, doc.documentId())));
             }
-            ltrRanked.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
+            List<RankedResult> ltrResults = GlobalRankingPipeline.rank(
+                    query, candidates, featureExtractor.normalizationContext(), rankingModel);
+            List<RankedDocument> ltrRanked = new ArrayList<>(ltrResults.size());
+            for (RankedResult result : ltrResults) {
+                RankedCandidate candidate = result.candidate();
+                ltrRanked.add(new RankedDocument(
+                        Integer.parseInt(candidate.documentId()), candidate.url(), candidate.title(),
+                        candidate.bm25Score(), candidate.pageRankScore(),
+                        result.score(), candidate.snippet()));
+            }
             ranked = ltrRanked;
         }
 

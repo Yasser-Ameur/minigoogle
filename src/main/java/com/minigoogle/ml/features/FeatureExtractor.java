@@ -1,5 +1,6 @@
 package com.minigoogle.ml.features;
 
+import com.minigoogle.ml.click.ClickFeatureProvider;
 import com.minigoogle.ranking.model.RankedDocument;
 import com.minigoogle.semantic.EmbeddingGenerator;
 import com.minigoogle.semantic.VectorIndex;
@@ -10,15 +11,28 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Extracts normalized query-document features for the learning-to-rank model.
+ * Extracts query-document features for the learning-to-rank model.
  *
- * <p>Every feature is derived from corpus data held by the extractor (bodies,
- * titles, URLs, lengths, PageRank and optionally the vector index) so that
- * features computed at serve time for a ranked document are identical to the
- * features computed at training time for a click signal on the same document.
- * All features are normalized into [0, 1].</p>
+ * <p>Feature extraction is split into two stages so the same code serves
+ * standalone and distributed execution:</p>
+ *
+ * <ol>
+ *   <li>{@link #extractRaw} computes document-local raw features (a pure
+ *       function of the query and the document, independent of corpus-global
+ *       statistics). A shard can compute these for the documents it owns and
+ *       ship them to the coordinator.</li>
+ *   <li>{@link FeatureNormalizer} applies corpus-global normalization against a
+ *       {@link NormalizationContext} and assigns the rank {@code POSITION}
+ *       feature. Standalone normalizes against the full local corpus; the
+ *       coordinator normalizes against the maximum over shard statistics.</li>
+ * </ol>
+ *
+ * <p>Features computed at serve time for a ranked document are therefore
+ * identical to the features computed at training time for a click signal on
+ * the same document: both go through {@code extractRaw} + the same
+ * {@link FeatureNormalizer}.</p>
  */
-public class FeatureExtractor {
+public class FeatureExtractor implements ClickFeatureProvider {
 
     private final Map<Integer, String> docUrls;
     private final Map<Integer, String> docTitles;
@@ -58,7 +72,7 @@ public class FeatureExtractor {
      * @param query    The search query.
      * @param doc      The ranked document (only the id/url/title are used).
      * @param position The 0-based position the document was served at.
-     * @return The feature vector.
+     * @return The normalized feature vector.
      */
     public QueryDocumentFeatures extract(String query, RankedDocument doc, int position) {
         return extract(query, doc.documentId(), position);
@@ -67,29 +81,56 @@ public class FeatureExtractor {
     /**
      * Extracts features for a document id at the given result position.
      *
-     * @param query    The search query.
+     * @param query      The search query.
      * @param documentId The document ID.
-     * @param position The 0-based position the document was served at.
-     * @return The feature vector.
+     * @param position   The 0-based position the document was served at.
+     * @return The normalized feature vector, normalized against this node's
+     *         corpus ({@link #normalizationContext()}).
      */
     public QueryDocumentFeatures extract(String query, int documentId, int position) {
-        double[] values = new double[FeatureName.values().length];
+        return FeatureNormalizer.normalize(
+                extractRaw(query, documentId), normalizationContext(), position);
+    }
 
+    /**
+     * Extracts the raw (pre-normalization) features for a document id.
+     *
+     * <p>Every value is a pure function of the query and the document, with no
+     * dependence on corpus-global statistics, so this can be computed on the
+     * shard that owns the document and normalized elsewhere.</p>
+     *
+     * @param query      The search query.
+     * @param documentId The document ID.
+     * @return The raw feature vector (position is 0).
+     */
+    public RawFeatures extractRaw(String query, int documentId) {
         List<String> terms = tokenize(query);
         String body = docBodies.getOrDefault(documentId, "");
         String title = docTitles.getOrDefault(documentId, "");
         String url = docUrls.getOrDefault(documentId, "");
+        return new RawFeatures(
+                bm25(terms, body),
+                pageRankScores.getOrDefault(documentId, 0.0),
+                matchFraction(terms, title),
+                matchFraction(terms, url),
+                overlapFraction(terms, body),
+                semantic(query, documentId),
+                docLengths.getOrDefault(documentId, 1),
+                0.0);
+    }
 
-        values[FeatureName.BM25.ordinal()] = bm25(terms, body);
-        values[FeatureName.PAGE_RANK.ordinal()] = pageRank(documentId);
-        values[FeatureName.TITLE_MATCH.ordinal()] = matchFraction(terms, title);
-        values[FeatureName.URL_MATCH.ordinal()] = matchFraction(terms, url);
-        values[FeatureName.TERM_OVERLAP.ordinal()] = overlapFraction(terms, body);
-        values[FeatureName.SEMANTIC_SIMILARITY.ordinal()] = semantic(query, documentId);
-        values[FeatureName.DOC_LENGTH.ordinal()] = docLength(documentId);
-        values[FeatureName.POSITION.ordinal()] = 1.0 / (position + 1.0);
+    /**
+     * @return This node's corpus-global normalization context. Standalone mode
+     *         ranks against this context; a coordinator ranks against the
+     *         maximum over the shard contexts.
+     */
+    public NormalizationContext normalizationContext() {
+        return new NormalizationContext(maxPageRank, maxDocLength);
+    }
 
-        return new QueryDocumentFeatures(query, documentId, values);
+    @Override
+    public QueryDocumentFeatures features(String query, int documentId) {
+        return extract(query, documentId, 0);
     }
 
     /**
@@ -109,13 +150,6 @@ public class FeatureExtractor {
             }
         }
         return 1.0 - Math.exp(-lexical);
-    }
-
-    private double pageRank(int documentId) {
-        if (maxPageRank <= 0.0) {
-            return 0.0;
-        }
-        return pageRankScores.getOrDefault(documentId, 0.0) / maxPageRank;
     }
 
     private double matchFraction(List<String> terms, String text) {
@@ -155,14 +189,6 @@ public class FeatureExtractor {
             return 0.0;
         }
         return Math.max(0.0, Math.min(1.0, sim));
-    }
-
-    private double docLength(int documentId) {
-        int length = docLengths.getOrDefault(documentId, 1);
-        if (maxDocLength <= 1) {
-            return 0.0;
-        }
-        return Math.log1p(length) / Math.log1p(maxDocLength);
     }
 
     private static List<String> tokenize(String text) {

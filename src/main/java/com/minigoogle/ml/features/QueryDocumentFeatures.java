@@ -17,6 +17,14 @@ public record QueryDocumentFeatures(
     }
 
     /**
+     * @param values Feature values aligned with {@link FeatureName} order.
+     * @return A feature vector for the given values.
+     */
+    public static QueryDocumentFeatures of(double[] values) {
+        return new QueryDocumentFeatures("", -1, values);
+    }
+
+    /**
      * Returns the value of a specific feature.
      */
     public double get(FeatureName name) {
