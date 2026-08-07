@@ -69,6 +69,11 @@ public final class ConfigurationLoader {
         defaults.put("search.timeoutMs", "5000");
         defaults.put("indexing.segmentSize", "10000");
         defaults.put("indexing.compactionThreshold", "5");
+        defaults.put("ml.ltr.enabled", "true");
+        defaults.put("ml.ltr.epochs", "3");
+        defaults.put("ml.ltr.learningRate", "0.05");
+        defaults.put("ml.click.enabled", "true");
+        defaults.put("ml.click.trainAfterClicks", "25");
         defaults.put("logging.level", "INFO");
         defaults.put("logging.format", "json");
         return new Configuration(defaults);

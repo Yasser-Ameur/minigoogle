@@ -56,7 +56,14 @@ import com.minigoogle.distributed.heartbeat.HeartbeatManager;
 import com.minigoogle.distributed.model.NodeInfo;
 import com.minigoogle.distributed.model.NodeRole;
 import com.minigoogle.distributed.model.NodeStatus;
+import com.minigoogle.ml.click.ClickEvent;
+import com.minigoogle.ml.click.ClickFeedbackTrainer;
+import com.minigoogle.ml.click.ClickTracker;
+import com.minigoogle.ml.features.FeatureExtractor;
+import com.minigoogle.ml.features.FeatureName;
+import com.minigoogle.ml.ltr.LinearRankingModel;
 import com.minigoogle.monitoring.analytics.QueryAnalytics;
+import com.minigoogle.network.dto.ClickRequest;
 import com.minigoogle.network.http.RestClient;
 
 import java.io.IOException;
@@ -106,6 +113,11 @@ public class MiniGoogleApp {
     private Map<Integer, Integer> docLengths = new HashMap<>();
     private Map<Integer, Double> pageRankScores = new HashMap<>();
     private KnowledgeGraph knowledgeGraph;
+
+    private FeatureExtractor featureExtractor;
+    private LinearRankingModel rankingModel;
+    private ClickTracker clickTracker;
+    private ClickFeedbackTrainer clickFeedbackTrainer;
 
     private final UnicodeNormalizer normalizer = new UnicodeNormalizer();
     private final CaseFolder caseFolder = new CaseFolder();
@@ -221,6 +233,61 @@ public class MiniGoogleApp {
                     "\"zeroResultRate\":" + analytics.getZeroResultRate() + "," +
                     "\"uniqueQueryCount\":" + analytics.uniqueQueryCount() + "," +
                     "\"topQueries\":" + topJson +
+                    "}";
+            } catch (Exception e) {
+                return "{\"error\":\"" + e.getMessage() + "\"}";
+            }
+        });
+
+        // Click feedback: record a user click for learning-to-rank training
+        server.post("/api/v1/click", body -> {
+            try {
+                ClickRequest request = JsonSerializer.fromJson(body, ClickRequest.class);
+                if (request == null || request.query() == null || request.query().trim().isEmpty()
+                        || request.documentId() <= 0) {
+                    return "{\"success\":false,\"error\":\"Missing query or documentId\"}";
+                }
+                int position = request.position() > 0 ? request.position() : 1;
+                String url = request.url() != null && !request.url().isEmpty()
+                        ? request.url() : docUrls.getOrDefault(request.documentId(), "");
+                ClickEvent event = new ClickEvent(request.query().trim(), request.documentId(),
+                        url, position, null, request.sessionId());
+                int trainedPairs = 0;
+                if (clickFeedbackTrainer != null) {
+                    trainedPairs = clickFeedbackTrainer.onClick(event);
+                } else if (clickTracker != null) {
+                    clickTracker.recordClick(event);
+                }
+                return "{\"success\":true,\"documentId\":" + request.documentId()
+                        + ",\"position\":" + position + ",\"trainedPairs\":" + trainedPairs + "}";
+            } catch (Exception e) {
+                return "{\"success\":false,\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+            }
+        });
+
+        // Learning-to-rank model and click statistics
+        server.getWithContentType("/api/v1/ml/stats", "application/json", req -> {
+            try {
+                FeatureName[] names = FeatureName.values();
+                StringBuilder featuresJson = new StringBuilder("[");
+                for (int i = 0; i < names.length; i++) {
+                    if (i > 0) featuresJson.append(",");
+                    featuresJson.append("\"").append(names[i].name()).append("\"");
+                }
+                featuresJson.append("]");
+                double[] weights = rankingModel != null ? rankingModel.weights() : new double[0];
+                StringBuilder weightsJson = new StringBuilder("[");
+                for (int i = 0; i < weights.length; i++) {
+                    if (i > 0) weightsJson.append(",");
+                    weightsJson.append(weights[i]);
+                }
+                weightsJson.append("]");
+                return "{" +
+                    "\"ltrEnabled\":" + (rankingModel != null) + "," +
+                    "\"features\":" + featuresJson + "," +
+                    "\"weights\":" + weightsJson + "," +
+                    "\"clicks\":" + (clickTracker != null ? clickTracker.clickCount() : 0) + "," +
+                    "\"impressions\":" + (clickTracker != null ? clickTracker.impressionCount() : 0) +
                     "}";
             } catch (Exception e) {
                 return "{\"error\":\"" + e.getMessage() + "\"}";
@@ -539,6 +606,19 @@ public class MiniGoogleApp {
         pageRankScores = pageRank;
         ranking = new RankingPipeline(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths);
 
+        // Learning-to-rank + click feedback: feature extractor shares the same
+        // corpus data as the ranking pipeline so serve-time and train-time
+        // feature vectors are identical.
+        int ltrEpochs = config.getInt("ml.ltr.epochs", 3);
+        double ltrLearningRate = config.getDouble("ml.ltr.learningRate", 0.05);
+        int trainAfterClicks = config.getInt("ml.click.trainAfterClicks", 25);
+        featureExtractor = new FeatureExtractor(docUrls, docTitles, docBodies, docLengths,
+                pageRankScores, vectorIndex, embeddingGenerator);
+        rankingModel = new LinearRankingModel();
+        clickTracker = new ClickTracker();
+        clickFeedbackTrainer = new ClickFeedbackTrainer(featureExtractor, rankingModel,
+                clickTracker, trainAfterClicks, ltrEpochs, ltrLearningRate);
+
         boolean knowledgeEnabled = config.getBoolean("semantic.knowledge.enabled", true);
         if (knowledgeEnabled) {
             int maxEntitiesPerDoc = config.getInt("semantic.knowledge.maxEntitiesPerDoc", 10);
@@ -704,6 +784,29 @@ public class MiniGoogleApp {
 
         // Re-rank with cross-encoder
         ranked = reranker.rerank(query, ranked);
+
+        // Learning-to-rank re-rank: score each candidate with the ranking model
+        // using the pre-rank position as the POSITION feature, then re-sort.
+        boolean ltrEnabled = config.getBoolean("ml.ltr.enabled", true)
+                && rankingModel != null && featureExtractor != null;
+        if (ltrEnabled && !ranked.isEmpty()) {
+            List<RankedDocument> ltrRanked = new ArrayList<>(ranked.size());
+            for (int i = 0; i < ranked.size(); i++) {
+                RankedDocument doc = ranked.get(i);
+                double ltrScore = rankingModel.score(featureExtractor.extract(query, doc, i));
+                ltrRanked.add(new RankedDocument(doc.documentId(), doc.url(), doc.title(),
+                        doc.bm25Score(), doc.pageRankScore(), ltrScore, doc.snippet()));
+            }
+            ltrRanked.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
+            ranked = ltrRanked;
+        }
+
+        // Record the served result order as an impression for click training.
+        if (clickTracker != null && !ranked.isEmpty()) {
+            clickTracker.recordImpression(query, ranked.stream()
+                    .map(RankedDocument::documentId)
+                    .collect(Collectors.toList()));
+        }
 
         // Convert to DTOs
         List<com.minigoogle.network.dto.SearchResult> dtoResults = ranked.stream()

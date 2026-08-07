@@ -106,6 +106,7 @@ public class HNSWSearcher {
             if (ep == null) continue;
             double sim = EmbeddingGenerator.cosineSimilarity(query, ep.getVector());
             candidates.offer(epId, sim);
+            visited.offer(epId, sim);
             visitedIds.add(epId);
         }
 

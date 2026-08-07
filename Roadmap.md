@@ -14,30 +14,21 @@
 - [x] REST API
 - [x] Unit and integration tests
 - [x] Benchmark suite
+- [x] Real Web Crawling (robots.txt, politeness delays, incremental recrawling, persistent crawl frontier)
+- [x] ML-Based Ranking (learning-to-rank, click-through signals, query-document feature extraction, semantic embedding search via HNSW)
+- [x] Frontend (React) - prebuilt demo bundle served from `demo/index.html`
 
 ## In Progress
 
-- [ ] Frontend (React)
+(none)
 
 ## Planned
-
-### Real Web Crawling
-- robots.txt compliance
-- Politeness delays
-- Incremental recrawling
-- Persistent crawl frontier
 
 ### Multi-Node Distributed Mode
 - Gossip protocol for cluster membership
 - Consistent hashing for shard placement
 - Automatic rebalancing on node join/leave
 - Cross-node query fan-out and result merging
-
-### ML-Based Ranking
-- Learning-to-rank models
-- Click-through signal integration
-- Query-document feature extraction
-- Semantic embedding search (HNSW)
 
 ### Production Hardening
 - Authentication and rate limiting

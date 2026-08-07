@@ -50,6 +50,15 @@ indexing:
   segmentSize: 10000
   compactionThreshold: 5
 
+ml:
+  ltr:
+    enabled: true           # re-rank search results with the learned model
+    epochs: 3               # pairwise training epochs per feedback round
+    learningRate: 0.05      # gradient descent step for pairwise training
+  click:
+    enabled: true           # record clicks and feed them back into the model
+    trainAfterClicks: 25    # retrain after this many new clicks
+
 logging:
   level: INFO
   format: json
