@@ -1,0 +1,264 @@
+package com.minigoogle.search;
+
+import com.minigoogle.indexer.inverted.PostingList;
+import com.minigoogle.indexer.normalization.CaseFolder;
+import com.minigoogle.indexer.normalization.UnicodeNormalizer;
+import com.minigoogle.indexer.stemming.PorterStemmer;
+import com.minigoogle.ml.features.FeatureExtractor;
+import com.minigoogle.ml.features.NormalizationContext;
+import com.minigoogle.ml.features.RawFeatures;
+import com.minigoogle.query.ast.QueryNode;
+import com.minigoogle.query.ast.WordNode;
+import com.minigoogle.query.lexer.Lexer;
+import com.minigoogle.query.lexer.Token;
+import com.minigoogle.query.parser.Parser;
+import com.minigoogle.query.planner.QueryPlanner;
+import com.minigoogle.ranking.model.RankedDocument;
+import com.minigoogle.ranking.pipeline.RankingPipeline;
+import com.minigoogle.semantic.EmbeddingGenerator;
+import com.minigoogle.semantic.VectorIndex;
+import com.minigoogle.semantic.expansion.QueryExpander;
+import com.minigoogle.semantic.rag.RetrievalPipeline;
+import com.minigoogle.semantic.reranking.CrossEncoderRanker;
+import com.minigoogle.semantic.spell.SpellCorrector;
+import com.minigoogle.storage.dictionary.DictionaryEntry;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * The single production retrieval engine shared by every node type and by the
+ * evaluation harness.
+ *
+ * <p>It owns the full retrieval stage — query expansion, parsing, spell
+ * correction, BM25 + PageRank ranking, hybrid semantic recall and cross-encoder
+ * re-ranking — so standalone search, shard candidate gathering and the offline
+ * quality harness all drive one code path. Final learning-to-rank scoring is
+ * intentionally delegated to the shared
+ * {@link com.minigoogle.ranking.pipeline.GlobalRankingPipeline}.
+ */
+public class SearchEngine {
+
+    private final QueryPlanner planner;
+    private final RankingPipeline ranking;
+    private final Lexer lexer;
+    private final SpellCorrector spellCorrector;
+    private final QueryExpander queryExpander;
+    private final CrossEncoderRanker reranker;
+    private final VectorIndex vectorIndex;
+    private final EmbeddingGenerator embeddingGenerator;
+    private final FeatureExtractor featureExtractor;
+    private final Map<String, DictionaryEntry> dictionary;
+    private final Map<Integer, String> docUrls;
+    private final Map<Integer, String> docTitles;
+    private final Map<Integer, String> docBodies;
+    private final UnicodeNormalizer normalizer;
+    private final CaseFolder caseFolder;
+    private final PorterStemmer stemmer;
+    private final SearchEngineConfig config;
+
+    public SearchEngine(QueryPlanner planner,
+                        RankingPipeline ranking,
+                        Lexer lexer,
+                        SpellCorrector spellCorrector,
+                        QueryExpander queryExpander,
+                        CrossEncoderRanker reranker,
+                        VectorIndex vectorIndex,
+                        EmbeddingGenerator embeddingGenerator,
+                        FeatureExtractor featureExtractor,
+                        Map<String, DictionaryEntry> dictionary,
+                        Map<Integer, String> docUrls,
+                        Map<Integer, String> docTitles,
+                        Map<Integer, String> docBodies,
+                        UnicodeNormalizer normalizer,
+                        CaseFolder caseFolder,
+                        PorterStemmer stemmer,
+                        SearchEngineConfig config) {
+        this.planner = planner;
+        this.ranking = ranking;
+        this.lexer = lexer;
+        this.spellCorrector = spellCorrector;
+        this.queryExpander = queryExpander;
+        this.reranker = reranker;
+        this.vectorIndex = vectorIndex;
+        this.embeddingGenerator = embeddingGenerator;
+        this.featureExtractor = featureExtractor;
+        this.dictionary = dictionary;
+        this.docUrls = docUrls;
+        this.docTitles = docTitles;
+        this.docBodies = docBodies;
+        this.normalizer = normalizer;
+        this.caseFolder = caseFolder;
+        this.stemmer = stemmer;
+        this.config = config;
+    }
+
+    /**
+     * Retrieval stage shared by standalone and shard execution: query
+     * expansion, parsing, spell correction, lexical BM25 + PageRank ranking,
+     * hybrid semantic recall and cross-encoder re-ranking. The returned
+     * candidates carry no learning-to-rank score — that decision is made by
+     * {@link com.minigoogle.ranking.pipeline.GlobalRankingPipeline}
+     * (standalone) or by the coordinator (distributed).
+     */
+    public RetrievalResult retrieveCandidates(String query, int pageSize) {
+        // Expand query with synonyms. Expansions are OR-ed with the original
+        // terms so a single-word query (e.g. "text") is not turned into an
+        // AND query that requires every expanded term to match.
+        List<String> expandedTerms = queryExpander.expand(query, config.maxExpansions());
+        String expandedQuery = String.join(" OR ", expandedTerms);
+
+        // Parse and execute query
+        List<Token> tokens = lexer.tokenize(expandedQuery);
+        Parser parser = new Parser(tokens);
+        QueryNode ast = parser.parse();
+        PostingList results = planner.execute(ast);
+
+        // Spell correction fallback
+        String didYouMean = null;
+        if (results.getPostings().isEmpty()) {
+            List<String> corrected = new ArrayList<>();
+            List<Token> origTokens = lexer.tokenize(query);
+            for (Token t : origTokens) {
+                String stemmed = stemmer.stem(caseFolder.fold(normalizer.normalize(t.value())));
+                if (stemmed.isEmpty()) continue;
+                if (dictionary.containsKey(stemmed)) {
+                    corrected.add(t.value());
+                } else {
+                    String fix = spellCorrector.correct(stemmed);
+                    if (!fix.equals(stemmed)) {
+                        corrected.add(fix);
+                    } else {
+                        corrected.add(t.value());
+                    }
+                }
+            }
+            if (!corrected.equals(origTokens.stream().map(Token::value).collect(Collectors.toList()))) {
+                didYouMean = String.join(" ", corrected);
+                String correctedQuery = String.join(" ", corrected);
+                List<String> correctedExpanded = queryExpander.expand(correctedQuery, config.maxExpansions());
+                tokens = lexer.tokenize(String.join(" ", correctedExpanded));
+                ast = new Parser(tokens).parse();
+                results = planner.execute(ast);
+            }
+        }
+
+        boolean hybridEnabled = config.hybridEnabled()
+                && vectorIndex != null && embeddingGenerator != null;
+
+        if (results.getPostings().isEmpty() && !hybridEnabled) {
+            return new RetrievalResult(List.of(), didYouMean);
+        }
+
+        // Build per-term posting lists for ranking
+        Map<String, PostingList> candidatePostings = new HashMap<>();
+        Map<String, Integer> documentFrequencies = new HashMap<>();
+
+        for (Token token : tokens) {
+            String processed = stemmer.stem(caseFolder.fold(normalizer.normalize(token.value())));
+            if (!processed.isEmpty()) {
+                QueryNode termNode = new WordNode(processed);
+                PostingList termResults = planner.execute(termNode);
+                if (!termResults.getPostings().isEmpty()) {
+                    candidatePostings.put(processed, termResults);
+                    documentFrequencies.put(processed, termResults.getPostings().size());
+                }
+            }
+        }
+
+        if (candidatePostings.isEmpty()) {
+            candidatePostings.put(query, results);
+            documentFrequencies.put(query, results.getPostings().size());
+        }
+
+        // Rank with BM25 + PageRank
+        List<String> queryTerms = tokens.stream()
+            .map(t -> t.value())
+            .map(v -> stemmer.stem(caseFolder.fold(normalizer.normalize(v))))
+            .filter(t -> !t.isEmpty())
+            .collect(Collectors.toList());
+
+        List<RankedDocument> ranked;
+        if (results.getPostings().isEmpty()) {
+            // No lexical matches; rely on semantic recall below.
+            ranked = new ArrayList<>();
+        } else {
+            ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
+        }
+
+        // Hybrid recall: merge lexical candidates with semantically-similar
+        // documents (which may share no lexical terms with the query) using the
+        // normalized score blend from the retrieval pipeline.
+        if (hybridEnabled) {
+            List<VectorIndex.VectorResult> lexical = ranked.stream()
+                    .map(r -> new VectorIndex.VectorResult(r.documentId(), r.finalScore(), r.title()))
+                    .collect(Collectors.toList());
+
+            double[] queryVector = embeddingGenerator.embed(query);
+            List<VectorIndex.VectorResult> semantic = vectorIndex.search(queryVector, config.fetchK());
+
+            int topK = Math.max(pageSize, ranked.size());
+            List<VectorIndex.VectorResult> merged = RetrievalPipeline.mergeResults(
+                    lexical, semantic, topK, config.lexicalWeight());
+
+            Map<Integer, RankedDocument> byId = ranked.stream()
+                    .collect(Collectors.toMap(RankedDocument::documentId, r -> r));
+            ranked = new ArrayList<>();
+            for (VectorIndex.VectorResult r : merged) {
+                RankedDocument existing = byId.get(r.id());
+                if (existing != null) {
+                    ranked.add(new RankedDocument(
+                            existing.documentId(), existing.url(), existing.title(),
+                            existing.bm25Score(), existing.pageRankScore(), r.score(), existing.snippet()));
+                } else {
+                    String url = docUrls.getOrDefault(r.id(), "");
+                    String title = docTitles.getOrDefault(r.id(), r.metadata());
+                    ranked.add(new RankedDocument(
+                            r.id(), url, title, 0.0, 0.0, r.score(), snippetFor(r.id())));
+                }
+            }
+        }
+
+        // Re-rank with cross-encoder
+        ranked = reranker.rerank(query, ranked);
+
+        return new RetrievalResult(ranked, didYouMean);
+    }
+
+    /**
+     * Corpus-wide normalization context (max over documents) so learning-to-rank
+     * features are normalized identically at serve time and train time.
+     */
+    public NormalizationContext normalizationContext() {
+        return featureExtractor != null
+                ? featureExtractor.normalizationContext()
+                : NormalizationContext.EMPTY;
+    }
+
+    /**
+     * Raw feature vector for one (query, document) pair, used by the final
+     * ranking pipeline. Returns {@code null} when the node has no feature
+     * extractor (feature-less shards).
+     */
+    public RawFeatures rawFeatures(String query, int documentId) {
+        return featureExtractor != null
+                ? featureExtractor.extractRaw(query, documentId)
+                : null;
+    }
+
+    public FeatureExtractor featureExtractor() {
+        return featureExtractor;
+    }
+
+    private String snippetFor(int docId) {
+        String body = docBodies.getOrDefault(docId, "");
+        if (body == null || body.isEmpty()) {
+            return docTitles.getOrDefault(docId, "");
+        }
+        String cleaned = body.replaceAll("\\s+", " ").trim();
+        return cleaned.length() > 160 ? cleaned.substring(0, 160) : cleaned;
+    }
+}

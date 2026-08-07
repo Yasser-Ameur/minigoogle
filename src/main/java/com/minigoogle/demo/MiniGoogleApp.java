@@ -6,48 +6,23 @@ import com.minigoogle.crawler.model.ParsedDocument;
 import com.minigoogle.crawler.model.UrlTask;
 import com.minigoogle.crawler.parser.JSoupHtmlParser;
 import com.minigoogle.network.http.RestServer;
-import com.minigoogle.indexer.IndexBuilder;
-import com.minigoogle.indexer.inverted.Posting;
-import com.minigoogle.indexer.inverted.PostingList;
 import com.minigoogle.indexer.model.IndexedDocument;
-import com.minigoogle.indexer.normalization.CaseFolder;
-import com.minigoogle.indexer.stemming.PorterStemmer;
-import com.minigoogle.indexer.normalization.UnicodeNormalizer;
-import com.minigoogle.indexer.stopwords.StopWordFilter;
-import com.minigoogle.indexer.tokenizer.Tokenizer;
 import com.minigoogle.network.dto.SearchRequest;
 import com.minigoogle.network.dto.SearchResponse;
 import com.minigoogle.network.serialization.JsonSerializer;
-import com.minigoogle.query.ast.QueryNode;
-import com.minigoogle.query.lexer.Lexer;
-import com.minigoogle.query.lexer.Token;
-import com.minigoogle.query.parser.Parser;
-import com.minigoogle.query.planner.QueryPlanner;
-import com.minigoogle.ranking.bm25.BM25Parameters;
 import com.minigoogle.ranking.model.RankedDocument;
-import com.minigoogle.ranking.pagerank.GraphBuilder;
-import com.minigoogle.ranking.pagerank.PageRankCalculator;
-import com.minigoogle.ranking.pipeline.RankingPipeline;
 import com.minigoogle.ranking.pipeline.GlobalRankingPipeline;
 import com.minigoogle.ranking.pipeline.RankedCandidate;
 import com.minigoogle.ranking.pipeline.RankedResult;
-import com.minigoogle.semantic.EmbeddingGenerator;
-import com.minigoogle.semantic.VectorIndex;
 import com.minigoogle.semantic.autocomplete.TrieAutocomplete;
-import com.minigoogle.semantic.expansion.PmiThesaurusBuilder;
-import com.minigoogle.semantic.expansion.QueryExpander;
 import com.minigoogle.semantic.knowledge.EntityExtractor;
 import com.minigoogle.semantic.knowledge.KnowledgeGraph;
-import com.minigoogle.semantic.rag.RetrievalPipeline;
-import com.minigoogle.semantic.reranking.CrossEncoderRanker;
 import com.minigoogle.semantic.spell.SpellCorrector;
-import com.minigoogle.semantic.synonym.SynonymGraph;
-import com.minigoogle.storage.dictionary.DictionaryEntry;
-import com.minigoogle.storage.dictionary.DictionaryReader;
-import com.minigoogle.storage.documents.DocumentReader;
 import com.minigoogle.storage.metadata.Metadata;
-import com.minigoogle.storage.metadata.MetadataReader;
-import com.minigoogle.storage.mmap.MemoryMappedIndex;
+import com.minigoogle.search.SearchEngine;
+import com.minigoogle.search.SearchEngineBuild;
+import com.minigoogle.search.SearchEngineBuilder;
+import com.minigoogle.search.RetrievalResult;
 import com.minigoogle.core.cache.LRUCache;
 import com.minigoogle.core.config.Configuration;
 import com.minigoogle.core.config.ConfigurationLoader;
@@ -90,44 +65,26 @@ public class MiniGoogleApp {
     private static final String DEFAULT_INDEX_DIR = "demo-index";
 
     private final List<ParsedDocument> allDocs = new ArrayList<>();
-    private IndexBuilder builder;
     private Configuration config;
 
-    private QueryPlanner planner;
-    private RankingPipeline ranking;
-    private Lexer lexer;
-    private MemoryMappedIndex mmapIndex;
+    private SearchEngine searchEngine;
+    private SearchEngineBuild indexBuild;
     private TrieAutocomplete autocomplete;
     private SpellCorrector spellCorrector;
-    private QueryExpander queryExpander;
-    private CrossEncoderRanker reranker;
-    private VectorIndex vectorIndex;
-    private EmbeddingGenerator embeddingGenerator;
     private Metadata metadata;
     private final QueryAnalytics analytics = new QueryAnalytics();
 
-    private Map<String, DictionaryEntry> dictionary;
     private Path indexPath;
     private final LRUCache<String, List<com.minigoogle.network.dto.SearchResult>> queryCache = new LRUCache<>(200);
     private final EventBus eventBus = new EventBus();
 
     private Map<Integer, String> docUrls = new HashMap<>();
-    private Map<Integer, String> docTitles = new HashMap<>();
-    private Map<Integer, String> docBodies = new HashMap<>();
-    private Map<Integer, Integer> docLengths = new HashMap<>();
-    private Map<Integer, Double> pageRankScores = new HashMap<>();
     private KnowledgeGraph knowledgeGraph;
 
     private FeatureExtractor featureExtractor;
     private LinearRankingModel rankingModel;
     private ClickTracker clickTracker;
     private ClickFeedbackTrainer clickFeedbackTrainer;
-
-    private final UnicodeNormalizer normalizer = new UnicodeNormalizer();
-    private final CaseFolder caseFolder = new CaseFolder();
-    private final PorterStemmer stemmer = new PorterStemmer();
-    private final StopWordFilter stopWordFilter = new StopWordFilter();
-    private final Tokenizer rawTokenizer = new Tokenizer();
 
     public void start() throws Exception {
         printBanner();
@@ -487,135 +444,31 @@ public class MiniGoogleApp {
 
     /**
      * Rebuilds the full index, autocomplete, ranking pipeline, and all
-     * supporting structures from the current allDocs list.
+     * supporting structures from the current allDocs list via the shared
+     * {@link SearchEngineBuilder}. The composition root only keeps what the
+     * REST endpoints need; retrieval itself lives in {@link SearchEngine}.
      */
     private void reindex() throws IOException {
         // Release the previous memory-mapped postings file BEFORE rewriting it,
         // otherwise Windows refuses to truncate a file with a mapped section open.
-        if (mmapIndex != null) {
-            mmapIndex.close();
-            mmapIndex = null;
+        if (indexBuild != null && indexBuild.mmapIndex() != null) {
+            indexBuild.mmapIndex().close();
             System.gc();
             System.runFinalization();
         }
 
-        builder = new IndexBuilder();
-        for (ParsedDocument doc : allDocs) {
-            builder.processDocument(doc);
-        }
-        builder.flush(
-            indexPath.resolve("dictionary.bin").toString(),
-            indexPath.resolve("postings.bin").toString(),
-            indexPath.resolve("documents.bin").toString()
-        );
-
-        DictionaryReader dictReader = new DictionaryReader();
-        dictionary = dictReader.read(indexPath.resolve("dictionary.bin"));
-
-        mmapIndex = new MemoryMappedIndex(indexPath.resolve("postings.bin"));
-        planner = new QueryPlanner(mmapIndex, dictionary);
-        lexer = new Lexer();
-
-        // Build surface-form vocabulary from raw document text
-        Map<String, Integer> surfaceFreqs = new HashMap<>();
-        for (ParsedDocument doc : allDocs) {
-            List<String> tokens = rawTokenizer.tokenize(normalizer.normalize(doc.text()));
-            String prevWord = null;
-            for (String token : tokens) {
-                String cleaned = caseFolder.fold(token);
-                if (!cleaned.isEmpty() && !stopWordFilter.isStopWord(cleaned)) {
-                    surfaceFreqs.merge(cleaned, 1, Integer::sum);
-                    if (prevWord != null) {
-                        surfaceFreqs.merge(prevWord + " " + cleaned, 1, Integer::sum);
-                    }
-                    prevWord = cleaned;
-                } else {
-                    prevWord = null;
-                }
-            }
-        }
-
-        autocomplete = new TrieAutocomplete(surfaceFreqs);
-        spellCorrector = new SpellCorrector(new HashSet<>(surfaceFreqs.keySet()));
-        for (String word : surfaceFreqs.keySet()) {
-            autocomplete.addWord(word);
-        }
-
-        queryExpander = buildQueryExpander();
-
-        // Build the semantic vector index from real document content. Documents
-        // that share vocabulary map to nearby vectors via feature hashing.
-        boolean semanticEnabled = config.getBoolean("semantic.enabled", true);
-        if (semanticEnabled) {
-            int embeddingDim = config.getInt("semantic.dimension", 128);
-            double semanticWeight = config.getDouble("semantic.weight", 0.3);
-            embeddingGenerator = new EmbeddingGenerator(embeddingDim);
-            vectorIndex = new VectorIndex(embeddingDim);
-            for (int i = 0; i < allDocs.size(); i++) {
-                ParsedDocument doc = allDocs.get(i);
-                String content = doc.title() + " " + doc.text();
-                vectorIndex.add(i + 1, embeddingGenerator.embed(content), doc.title());
-            }
-            reranker = new CrossEncoderRanker(vectorIndex, embeddingGenerator, semanticWeight);
-        } else {
-            vectorIndex = null;
-            embeddingGenerator = null;
-            reranker = new CrossEncoderRanker();
-        }
+        indexBuild = SearchEngineBuilder.build(allDocs, config, indexPath);
+        searchEngine = indexBuild.engine();
+        autocomplete = indexBuild.autocomplete();
+        spellCorrector = indexBuild.spellCorrector();
+        metadata = indexBuild.metadata();
+        docUrls = indexBuild.docUrls();
         queryCache.clear();
-
-        List<IndexedDocument> indexedDocs = new DocumentReader().read(indexPath.resolve("documents.bin"));
-        metadata = new MetadataReader().read(indexPath.resolve("metadata.bin"));
-
-        Map<Integer, IndexedDocument> docIdToIndexed = new HashMap<>();
-        for (int i = 0; i < indexedDocs.size(); i++) {
-            docIdToIndexed.put(i + 1, indexedDocs.get(i));
-        }
 
         Map<Integer, ParsedDocument> docIdToParsed = new HashMap<>();
         for (int i = 0; i < allDocs.size(); i++) {
             docIdToParsed.put(i + 1, allDocs.get(i));
         }
-
-        Map<String, Integer> urlToDocId = new HashMap<>();
-        for (Map.Entry<Integer, IndexedDocument> e : docIdToIndexed.entrySet()) {
-            urlToDocId.put(e.getValue().url().toString(), e.getKey());
-        }
-
-        GraphBuilder graph = new GraphBuilder();
-        for (Map.Entry<Integer, ParsedDocument> e : docIdToParsed.entrySet()) {
-            int docId = e.getKey();
-            ParsedDocument parsed = e.getValue();
-            graph.addNode(docId);
-            for (URI link : parsed.outgoingLinks()) {
-                Integer targetId = urlToDocId.get(link.toString());
-                if (targetId != null && targetId != docId) {
-                    graph.addEdge(docId, targetId);
-                }
-            }
-        }
-        Map<Integer, Double> pageRank = new PageRankCalculator().compute(graph);
-
-        docUrls = new HashMap<>();
-        docTitles = new HashMap<>();
-        docBodies = new HashMap<>();
-        docLengths = new HashMap<>();
-
-        for (Map.Entry<Integer, IndexedDocument> e : docIdToIndexed.entrySet()) {
-            int id = e.getKey();
-            IndexedDocument idx = e.getValue();
-            ParsedDocument parsed = docIdToParsed.get(id);
-            docUrls.put(id, idx.url().toString());
-            docTitles.put(id, idx.title());
-            docBodies.put(id, parsed != null ? parsed.text() : "");
-            docLengths.put(id, idx.length());
-        }
-
-        BM25Parameters bm25Params = BM25Parameters.withDefaults(
-            metadata.documentCount(), metadata.averageDocumentLength()
-        );
-        pageRankScores = pageRank;
-        ranking = new RankingPipeline(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths);
 
         // Learning-to-rank + click feedback: feature extractor shares the same
         // corpus data as the ranking pipeline so serve-time and train-time
@@ -623,8 +476,7 @@ public class MiniGoogleApp {
         int ltrEpochs = config.getInt("ml.ltr.epochs", 3);
         double ltrLearningRate = config.getDouble("ml.ltr.learningRate", 0.05);
         int trainAfterClicks = config.getInt("ml.click.trainAfterClicks", 25);
-        featureExtractor = new FeatureExtractor(docUrls, docTitles, docBodies, docLengths,
-                pageRankScores, vectorIndex, embeddingGenerator);
+        featureExtractor = indexBuild.featureExtractor();
         rankingModel = new LinearRankingModel();
         clickTracker = new ClickTracker();
         clickFeedbackTrainer = new ClickFeedbackTrainer(featureExtractor, rankingModel,
@@ -646,22 +498,6 @@ public class MiniGoogleApp {
         }
     }
 
-    /**
-     * Builds the query expander, preferring a corpus-derived PMI thesaurus when
-     * corpus-based expansion is enabled.
-     */
-    private QueryExpander buildQueryExpander() {
-        boolean expansionEnabled = config.getBoolean("semantic.expansion.enabled", true);
-        if (!expansionEnabled) {
-            return new QueryExpander();
-        }
-        int windowSize = config.getInt("semantic.expansion.windowSize", 10);
-        double pmiThreshold = config.getDouble("semantic.expansion.pmiThreshold", 1.0);
-        int maxNeighbors = config.getInt("semantic.expansion.maxNeighbors", 5);
-        SynonymGraph thesaurus = new PmiThesaurusBuilder(windowSize, pmiThreshold, maxNeighbors).build(allDocs);
-        return new QueryExpander(thesaurus);
-    }
-
     private SearchResponse executeSearch(String query, int pageSize) {
         // Check cache
         List<com.minigoogle.network.dto.SearchResult> cachedResults = queryCache.get(query.toLowerCase().strip());
@@ -672,7 +508,7 @@ public class MiniGoogleApp {
 
         long start = System.currentTimeMillis();
 
-        RetrievalResult retrieval = retrieveCandidates(query, pageSize);
+        RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
         List<RankedDocument> ranked = retrieval.ranked();
         String didYouMean = retrieval.didYouMean();
 
@@ -694,10 +530,10 @@ public class MiniGoogleApp {
                 candidates.add(new RankedCandidate(
                         String.valueOf(doc.documentId()), doc.url(), doc.title(), doc.snippet(),
                         doc.bm25Score(), doc.pageRankScore(),
-                        featureExtractor.extractRaw(query, doc.documentId())));
+                        searchEngine.rawFeatures(query, doc.documentId())));
             }
             List<RankedResult> ltrResults = GlobalRankingPipeline.rank(
-                    query, candidates, featureExtractor.normalizationContext(), rankingModel);
+                    query, candidates, searchEngine.normalizationContext(), rankingModel);
             List<RankedDocument> ltrRanked = new ArrayList<>(ltrResults.size());
             for (RankedResult result : ltrResults) {
                 RankedCandidate candidate = result.candidate();
@@ -733,141 +569,6 @@ public class MiniGoogleApp {
     }
 
     /**
-     * Retrieval stage shared by standalone and shard execution: query
-     * expansion, parsing, spell correction, lexical BM25 + PageRank ranking,
-     * hybrid semantic recall and cross-encoder re-ranking. The returned
-     * candidates carry no learning-to-rank score — that decision is made by
-     * the {@link GlobalRankingPipeline} (standalone) or by the coordinator
-     * (distributed).
-     */
-    private RetrievalResult retrieveCandidates(String query, int pageSize) {
-        // Expand query with synonyms. Expansions are OR-ed with the original
-        // terms so a single-word query (e.g. "text") is not turned into an
-        // AND query that requires every expanded term to match.
-        List<String> expandedTerms = queryExpander.expand(query, 4);
-        String expandedQuery = String.join(" OR ", expandedTerms);
-
-        // Parse and execute query
-        List<Token> tokens = lexer.tokenize(expandedQuery);
-        Parser parser = new Parser(tokens);
-        QueryNode ast = parser.parse();
-        PostingList results = planner.execute(ast);
-
-        // Spell correction fallback
-        String didYouMean = null;
-        if (results.getPostings().isEmpty()) {
-            List<String> corrected = new ArrayList<>();
-            List<Token> origTokens = lexer.tokenize(query);
-            for (Token t : origTokens) {
-                String stemmed = stemmer.stem(caseFolder.fold(normalizer.normalize(t.value())));
-                if (stemmed.isEmpty()) continue;
-                if (dictionary.containsKey(stemmed)) {
-                    corrected.add(t.value());
-                } else {
-                    String fix = spellCorrector.correct(stemmed);
-                    if (!fix.equals(stemmed)) {
-                        corrected.add(fix);
-                    } else {
-                        corrected.add(t.value());
-                    }
-                }
-            }
-            if (!corrected.equals(origTokens.stream().map(Token::value).collect(Collectors.toList()))) {
-                didYouMean = String.join(" ", corrected);
-                String correctedQuery = String.join(" ", corrected);
-                List<String> correctedExpanded = queryExpander.expand(correctedQuery, 4);
-                tokens = lexer.tokenize(String.join(" ", correctedExpanded));
-                ast = new Parser(tokens).parse();
-                results = planner.execute(ast);
-            }
-        }
-
-        boolean hybridEnabled = config.getBoolean("semantic.hybrid.enabled", true)
-                && vectorIndex != null && embeddingGenerator != null;
-
-        if (results.getPostings().isEmpty() && !hybridEnabled) {
-            return new RetrievalResult(List.of(), didYouMean);
-        }
-
-        // Build per-term posting lists for ranking
-        Map<String, PostingList> candidatePostings = new HashMap<>();
-        Map<String, Integer> documentFrequencies = new HashMap<>();
-
-        for (Token token : tokens) {
-            String processed = stemmer.stem(caseFolder.fold(normalizer.normalize(token.value())));
-            if (!processed.isEmpty()) {
-                QueryNode termNode = new com.minigoogle.query.ast.WordNode(processed);
-                PostingList termResults = planner.execute(termNode);
-                if (!termResults.getPostings().isEmpty()) {
-                    candidatePostings.put(processed, termResults);
-                    documentFrequencies.put(processed, termResults.getPostings().size());
-                }
-            }
-        }
-
-        if (candidatePostings.isEmpty()) {
-            candidatePostings.put(query, results);
-            documentFrequencies.put(query, results.getPostings().size());
-        }
-
-        // Rank with BM25 + PageRank
-        List<String> queryTerms = tokens.stream()
-            .map(t -> t.value())
-            .map(v -> stemmer.stem(caseFolder.fold(normalizer.normalize(v))))
-            .filter(t -> !t.isEmpty())
-            .collect(Collectors.toList());
-
-        List<RankedDocument> ranked;
-        if (results.getPostings().isEmpty()) {
-            // No lexical matches; rely on semantic recall below.
-            ranked = new ArrayList<>();
-        } else {
-            ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
-        }
-
-        // Hybrid recall: merge lexical candidates with semantically-similar
-        // documents (which may share no lexical terms with the query) using the
-        // normalized score blend from the retrieval pipeline.
-        if (hybridEnabled) {
-            int fetchK = config.getInt("semantic.hybrid.fetchK", 60);
-            double lexicalWeight = config.getDouble("semantic.hybrid.lexicalWeight", 0.5);
-
-            List<VectorIndex.VectorResult> lexical = ranked.stream()
-                    .map(r -> new VectorIndex.VectorResult(r.documentId(), r.finalScore(), r.title()))
-                    .collect(Collectors.toList());
-
-            double[] queryVector = embeddingGenerator.embed(query);
-            List<VectorIndex.VectorResult> semantic = vectorIndex.search(queryVector, fetchK);
-
-            int topK = Math.max(pageSize, ranked.size());
-            List<VectorIndex.VectorResult> merged = RetrievalPipeline.mergeResults(
-                    lexical, semantic, topK, lexicalWeight);
-
-            Map<Integer, RankedDocument> byId = ranked.stream()
-                    .collect(Collectors.toMap(RankedDocument::documentId, r -> r));
-            ranked = new ArrayList<>();
-            for (VectorIndex.VectorResult r : merged) {
-                RankedDocument existing = byId.get(r.id());
-                if (existing != null) {
-                    ranked.add(new RankedDocument(
-                            existing.documentId(), existing.url(), existing.title(),
-                            existing.bm25Score(), existing.pageRankScore(), r.score(), existing.snippet()));
-                } else {
-                    String url = docUrls.getOrDefault(r.id(), "");
-                    String title = docTitles.getOrDefault(r.id(), r.metadata());
-                    ranked.add(new RankedDocument(
-                            r.id(), url, title, 0.0, 0.0, r.score(), snippetFor(r.id())));
-                }
-            }
-        }
-
-        // Re-rank with cross-encoder
-        ranked = reranker.rerank(query, ranked);
-
-        return new RetrievalResult(ranked, didYouMean);
-    }
-
-    /**
      * Shard-mode query execution: runs the shared retrieval stage and returns
      * the candidate set with raw feature vectors and the node's corpus
      * statistics, so the coordinator can perform global ranking.
@@ -875,18 +576,16 @@ public class MiniGoogleApp {
     private SearchResponse gatherCandidateResults(String query, int pageSize) {
         long start = System.currentTimeMillis();
 
-        RetrievalResult retrieval = retrieveCandidates(query, pageSize);
+        RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
         List<RankedDocument> ranked = retrieval.ranked();
 
-        NormalizationContext context = featureExtractor != null
-                ? featureExtractor.normalizationContext()
-                : NormalizationContext.EMPTY;
+        NormalizationContext context = searchEngine.normalizationContext();
 
         List<com.minigoogle.network.dto.SearchResult> results =
                 new ArrayList<>(ranked.size());
         for (RankedDocument doc : ranked) {
-            double[] raw = featureExtractor != null
-                    ? featureExtractor.extractRaw(query, doc.documentId()).toArray()
+            double[] raw = searchEngine.rawFeatures(query, doc.documentId()) != null
+                    ? searchEngine.rawFeatures(query, doc.documentId()).toArray()
                     : null;
             results.add(new com.minigoogle.network.dto.SearchResult(
                     doc.url(), doc.title(), doc.snippet(), doc.finalScore(),
@@ -898,23 +597,11 @@ public class MiniGoogleApp {
                 retrieval.didYouMean(), context.maxPageRank(), context.maxDocLength());
     }
 
-    private record RetrievalResult(List<RankedDocument> ranked, String didYouMean) {
-    }
-
     private String loadResource(String resourcePath) throws IOException {
         try (InputStream is = getClass().getResourceAsStream(resourcePath)) {
             if (is == null) throw new IOException("Resource not found: " + resourcePath);
             return new String(is.readAllBytes(), StandardCharsets.UTF_8);
         }
-    }
-
-    private String snippetFor(int docId) {
-        String body = docBodies.getOrDefault(docId, "");
-        if (body == null || body.isEmpty()) {
-            return docTitles.getOrDefault(docId, "");
-        }
-        String cleaned = body.replaceAll("\\s+", " ").trim();
-        return cleaned.length() > 160 ? cleaned.substring(0, 160) : cleaned;
     }
 
     private void printBanner() {
