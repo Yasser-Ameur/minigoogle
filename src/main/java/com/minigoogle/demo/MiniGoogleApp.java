@@ -376,7 +376,15 @@ public class MiniGoogleApp {
 
         ClusterCoordinator clusterCoordinator = new ClusterCoordinator(clusterPort);
         clusterCoordinator.start();
-        SearchCoordinator searchCoordinator = new SearchCoordinator(coordinatorUrl);
+        // Coordinator trains the shared ranking model on click feedback, using
+        // the served-impression log as its feature source (RFC 0001 §6.4).
+        boolean clickEnabled = config.getBoolean("ml.click.enabled", true);
+        SearchCoordinator searchCoordinator = clickEnabled
+                ? new SearchCoordinator(coordinatorUrl, 3,
+                        config.getInt("ml.click.trainAfterClicks", 25),
+                        config.getInt("ml.ltr.epochs", 3),
+                        config.getDouble("ml.ltr.learningRate", 0.05))
+                : new SearchCoordinator(coordinatorUrl);
 
         RestServer server = new RestServer(port);
         String html = loadResource("/demo/index.html");
@@ -405,6 +413,57 @@ public class MiniGoogleApp {
         server.getWithContentType("/api/v1/cluster/state", "application/json", req -> {
             try {
                 return JsonSerializer.toJson(clusterCoordinator.getState());
+            } catch (Exception e) {
+                return "{\"error\":\"" + e.getMessage() + "\"}";
+            }
+        });
+
+        // Click feedback: the coordinator attributes the click to its served
+        // impression and retrains the shared ranking model when enough new
+        // clicks have accumulated.
+        server.post("/api/v1/click", body -> {
+            try {
+                ClickRequest request = JsonSerializer.fromJson(body, ClickRequest.class);
+                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                    return "{\"success\":false,\"error\":\"Missing query\"}";
+                }
+                String url = request.url() != null && !request.url().isEmpty()
+                        ? request.url() : null;
+                int position = request.position() > 0 ? request.position() : 1;
+                int trainedPairs = searchCoordinator.recordClick(
+                        request.query().trim(), url, position, request.sessionId());
+                int docId = searchCoordinator.resolveDocId(url);
+                return "{\"success\":true,\"documentId\":" + docId
+                        + ",\"position\":" + position + ",\"trainedPairs\":" + trainedPairs + "}";
+            } catch (Exception e) {
+                return "{\"success\":false,\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+            }
+        });
+
+        // Learning-to-rank model and click statistics for the coordinator.
+        server.getWithContentType("/api/v1/ml/stats", "application/json", req -> {
+            try {
+                FeatureName[] names = FeatureName.values();
+                StringBuilder featuresJson = new StringBuilder("[");
+                for (int i = 0; i < names.length; i++) {
+                    if (i > 0) featuresJson.append(",");
+                    featuresJson.append("\"").append(names[i].name()).append("\"");
+                }
+                featuresJson.append("]");
+                double[] weights = searchCoordinator.modelWeights();
+                StringBuilder weightsJson = new StringBuilder("[");
+                for (int i = 0; i < weights.length; i++) {
+                    if (i > 0) weightsJson.append(",");
+                    weightsJson.append(weights[i]);
+                }
+                weightsJson.append("]");
+                return "{" +
+                    "\"ltrEnabled\":" + clickEnabled + "," +
+                    "\"features\":" + featuresJson + "," +
+                    "\"weights\":" + weightsJson + "," +
+                    "\"clicks\":" + searchCoordinator.clickCount() + "," +
+                    "\"impressions\":" + searchCoordinator.impressionCount() +
+                    "}";
             } catch (Exception e) {
                 return "{\"error\":\"" + e.getMessage() + "\"}";
             }

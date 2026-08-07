@@ -5,9 +5,16 @@ import com.minigoogle.distributed.model.NodeRole;
 import com.minigoogle.distributed.model.NodeStatus;
 import com.minigoogle.distributed.model.ShardInfo;
 import com.minigoogle.distributed.registry.ClusterState;
+import com.minigoogle.ml.click.ClickEvent;
+import com.minigoogle.ml.click.ClickFeedbackTrainer;
+import com.minigoogle.ml.click.ClickTracker;
 import com.minigoogle.ml.features.NormalizationContext;
+import com.minigoogle.ml.impression.DocIdRegistry;
+import com.minigoogle.ml.impression.ImpressionLog;
+import com.minigoogle.ml.impression.ServedImpression;
+import com.minigoogle.ml.impression.ServedImpressionFeatureProvider;
+import com.minigoogle.ml.impression.ServedResult;
 import com.minigoogle.ml.ltr.LinearRankingModel;
-import com.minigoogle.ml.ltr.RankingModel;
 import com.minigoogle.network.dto.SearchRequest;
 import com.minigoogle.network.dto.SearchResponse;
 import com.minigoogle.network.dto.SearchResult;
@@ -17,6 +24,7 @@ import com.minigoogle.ranking.pipeline.GlobalRankingPipeline;
 import com.minigoogle.ranking.pipeline.RankedCandidate;
 import com.minigoogle.ranking.pipeline.RankedResult;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -50,8 +58,13 @@ public class SearchCoordinator {
 
     private final RestClient client;
     private final String clusterCoordinatorUrl;
-    private final RankingModel rankingModel;
+    private final LinearRankingModel rankingModel;
     private final int shardOversample;
+    private final DocIdRegistry docIdRegistry;
+    private final ImpressionLog impressionLog;
+    private final ServedImpressionFeatureProvider impressionFeatureProvider;
+    private ClickTracker clickTracker;
+    private ClickFeedbackTrainer trainer;
 
     /**
      * @param clusterCoordinatorUrl The URL of the cluster coordinator's state
@@ -73,6 +86,29 @@ public class SearchCoordinator {
         this.clusterCoordinatorUrl = clusterCoordinatorUrl;
         this.rankingModel = new LinearRankingModel();
         this.shardOversample = Math.max(1, shardOversample);
+        this.docIdRegistry = new DocIdRegistry();
+        this.impressionLog = new ImpressionLog();
+        this.impressionFeatureProvider = new ServedImpressionFeatureProvider(impressionLog);
+        this.clickTracker = null;
+        this.trainer = null;
+    }
+
+    /**
+     * @param clusterCoordinatorUrl The URL of the cluster coordinator's state
+     *                              registry.
+     * @param shardOversample       How many candidates to request per shard for
+     *                              every final result slot.
+     * @param trainAfterClicks      How many new clicks accumulate before the
+     *                              ranking model is retrained.
+     * @param ltrEpochs             Pairwise training epochs per retrain.
+     * @param ltrLearningRate       Pairwise training learning rate.
+     */
+    public SearchCoordinator(String clusterCoordinatorUrl, int shardOversample,
+                             int trainAfterClicks, int ltrEpochs, double ltrLearningRate) {
+        this(clusterCoordinatorUrl, shardOversample);
+        this.clickTracker = new ClickTracker();
+        this.trainer = new ClickFeedbackTrainer(impressionFeatureProvider, rankingModel,
+                clickTracker, trainAfterClicks, ltrEpochs, ltrLearningRate);
     }
 
     /**
@@ -162,6 +198,8 @@ public class SearchCoordinator {
             }
         }
         List<SearchResult> candidates = new ArrayList<>(deduplicated.values());
+        NormalizationContext globalContext =
+                new NormalizationContext(globalMaxPageRank, globalMaxDocLength);
 
         if (allFeatureful && !candidates.isEmpty()) {
             List<RankedCandidate> rankedCandidates = new ArrayList<>(candidates.size());
@@ -171,30 +209,54 @@ public class SearchCoordinator {
                         candidate.bm25Score(), candidate.pageRankScore(), candidate.rawFeatures()));
             }
             List<RankedResult> ranked = GlobalRankingPipeline.rank(
-                    query, rankedCandidates,
-                    new NormalizationContext(globalMaxPageRank, globalMaxDocLength),
-                    rankingModel);
+                    query, rankedCandidates, globalContext, rankingModel);
 
             List<SearchResult> finalResults = new ArrayList<>(Math.min(topK, ranked.size()));
-            for (RankedResult result : ranked) {
+            List<ServedResult> servedResults = new ArrayList<>(Math.min(topK, ranked.size()));
+            List<Integer> servedIds = new ArrayList<>(Math.min(topK, ranked.size()));
+            for (int i = 0; i < ranked.size() && i < topK; i++) {
+                RankedResult result = ranked.get(i);
                 RankedCandidate candidate = result.candidate();
+                String url = candidate.url();
+                int docId = docIdRegistry.resolve(url);
+                servedResults.add(new ServedResult(docId, url, candidate.title(),
+                        candidate.snippet(), result.score(), candidate.bm25Score(),
+                        candidate.pageRankScore(), candidate.rawFeatures().toArray()));
+                servedIds.add(docId);
                 finalResults.add(new SearchResult(
-                        candidate.url(), candidate.title(), candidate.snippet(),
+                        url, candidate.title(), candidate.snippet(),
                         result.score(), candidate.bm25Score(), candidate.pageRankScore()));
             }
-            return finalResults.size() > topK
-                    ? finalResults.subList(0, topK)
-                    : finalResults;
+            recordImpression(query, globalContext, servedResults, servedIds);
+            return finalResults;
         }
 
-        return mergeByScore(candidates, topK);
+        return mergeByScore(candidates, topK, query, globalContext);
+    }
+
+    /**
+     * Records the served result ordering and feature vectors so a later click
+     * can be attributed to exactly what was served (train-time features equal
+     * serve-time features).
+     */
+    private void recordImpression(String query, NormalizationContext context,
+                                  List<ServedResult> servedResults, List<Integer> servedIds) {
+        if (servedResults.isEmpty()) {
+            return;
+        }
+        impressionLog.recordImpression(new ServedImpression(query, context, servedResults));
+        if (clickTracker != null) {
+            clickTracker.recordImpression(query, servedIds);
+        }
     }
 
     /**
      * Falls back to a score-based global top-K merge (min-heap) for shards
-     * that reply without raw features.
+     * that reply without raw features. Impressions are still recorded, but
+     * without feature vectors, so click-training skips them.
      */
-    private List<SearchResult> mergeByScore(List<SearchResult> candidates, int topK) {
+    private List<SearchResult> mergeByScore(List<SearchResult> candidates, int topK,
+                                            String query, NormalizationContext context) {
         PriorityQueue<SearchResult> heap = new PriorityQueue<>(
                 Comparator.comparingDouble(SearchResult::score));
         for (SearchResult result : candidates) {
@@ -208,7 +270,58 @@ public class SearchCoordinator {
             finalResults.add(heap.poll());
         }
         Collections.reverse(finalResults);
+
+        List<ServedResult> servedResults = new ArrayList<>(finalResults.size());
+        List<Integer> servedIds = new ArrayList<>(finalResults.size());
+        for (SearchResult result : finalResults) {
+            int docId = docIdRegistry.resolve(result.url());
+            servedResults.add(new ServedResult(docId, result.url(), result.title(),
+                    result.snippet(), result.score(), result.bm25Score(),
+                    result.pageRankScore(), null));
+            servedIds.add(docId);
+        }
+        recordImpression(query, context, servedResults, servedIds);
         return finalResults;
+    }
+
+    /**
+     * Records a user click on a served result and returns the number of
+     * preference pairs trained, if any.
+     *
+     * @param query     The query that was served.
+     * @param url       The clicked result URL.
+     * @param position  The 1-based served position of the clicked result.
+     * @param sessionId Optional client session id.
+     */
+    public int recordClick(String query, String url, int position, String sessionId) {
+        int docId = url != null ? docIdRegistry.resolve(url) : -1;
+        ClickEvent event = new ClickEvent(query, docId, url, position, Instant.now(), sessionId);
+        if (trainer != null) {
+            return trainer.onClick(event);
+        }
+        if (clickTracker != null) {
+            clickTracker.recordClick(event);
+        }
+        return 0;
+    }
+
+    /**
+     * Resolves the coordinator-global id for a result URL.
+     */
+    public int resolveDocId(String url) {
+        return url != null ? docIdRegistry.resolve(url) : -1;
+    }
+
+    public long clickCount() {
+        return clickTracker != null ? clickTracker.clickCount() : 0L;
+    }
+
+    public long impressionCount() {
+        return clickTracker != null ? clickTracker.impressionCount() : 0L;
+    }
+
+    public double[] modelWeights() {
+        return rankingModel.weights();
     }
 
     private ClusterState getClusterState() {

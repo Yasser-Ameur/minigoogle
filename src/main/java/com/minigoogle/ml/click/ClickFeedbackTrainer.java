@@ -87,6 +87,12 @@ public class ClickFeedbackTrainer {
                     preference.query(), preference.preferredDocId());
             QueryDocumentFeatures nonPreferred = featureProvider.features(
                     preference.query(), preference.nonPreferredDocId());
+            // A provider may not be able to resolve features (e.g. a
+            // coordinator whose impression for the query carried no raw
+            // features); such preferences cannot be trained on.
+            if (preferred == null || nonPreferred == null) {
+                continue;
+            }
             pairs.add(new TrainingPair(preferred, nonPreferred));
         }
         return PairwiseRankerTrainer.train(model, pairs, epochs, learningRate);

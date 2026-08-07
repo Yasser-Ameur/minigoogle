@@ -178,4 +178,40 @@ class ClusterIntegrationTest {
         assertEquals(2, results.stream().map(SearchResult::url).distinct().count());
         assertTrue(results.stream().anyMatch(r -> r.url().equals("http://b.example.com/unique")));
     }
+
+    @Test
+    void testCoordinatorTrainsRankingModelOnClicksFromServedImpressions() {
+        // Shard A serves a strong lexical result; shard B serves a strong
+        // authority result. With a fresh model the lexical doc wins (BM25 is
+        // weighted higher in the default model).
+        RawFeatures lexical = new RawFeatures(0.9, 0.1, 0.5, 0.0, 0.9, 0.0, 100, 0.0);
+        RawFeatures authority = new RawFeatures(0.2, 0.9, 0.1, 0.0, 0.2, 0.0, 100, 0.0);
+
+        featureNodeA = mockFeatureSearchNode(
+                List.of(featureResult("http://a.example.com/lexical", 0.8, lexical)), 1.0, 200);
+        featureNodeB = mockFeatureSearchNode(
+                List.of(featureResult("http://b.example.com/authority", 0.9, authority)), 1.0, 200);
+        registerNode("index-a", featureNodeA);
+        registerNode("index-b", featureNodeB);
+
+        // trainAfterClicks = 1 so the first click triggers a training pass.
+        SearchCoordinator coordinator = new SearchCoordinator(
+                "http://localhost:" + clusterCoordinator.getPort(), 3, 1, 3, 0.05);
+
+        List<SearchResult> served = coordinator.search("test", 10);
+        assertEquals(2, served.size());
+        assertEquals("http://a.example.com/lexical", served.get(0).url());
+        assertEquals(2, coordinator.impressionCount(), "Every served result counts as an impression");
+
+        double[] before = coordinator.modelWeights().clone();
+        // The user clicks the second-ranked authority document: it should be
+        // preferred over the lexical doc above it.
+        int trainedPairs = coordinator.recordClick(
+                "test", "http://b.example.com/authority", 2, "session-1");
+
+        assertEquals(1, coordinator.clickCount());
+        assertTrue(trainedPairs > 0, "A click below position 1 must produce a preference pair");
+        assertFalse(java.util.Arrays.equals(before, coordinator.modelWeights()),
+                "Click training must update the coordinator's shared ranking model");
+    }
 }
