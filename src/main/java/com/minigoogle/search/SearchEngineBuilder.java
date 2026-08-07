@@ -119,8 +119,12 @@ public final class SearchEngineBuilder {
         if (semanticEnabled) {
             int embeddingDim = config.getInt("semantic.dimension", 128);
             double semanticWeight = config.getDouble("semantic.weight", 0.3);
+            VectorIndex.VectorMode indexMode = "flat".equalsIgnoreCase(
+                    config.get("semantic.index.mode", "hnsw"))
+                    ? VectorIndex.VectorMode.EXACT
+                    : VectorIndex.VectorMode.HNSW;
             embeddingGenerator = new EmbeddingGenerator(embeddingDim);
-            vectorIndex = new VectorIndex(embeddingDim);
+            vectorIndex = new VectorIndex(embeddingDim, indexMode);
             for (int i = 0; i < docs.size(); i++) {
                 ParsedDocument doc = docs.get(i);
                 String content = doc.title() + " " + doc.text();
@@ -151,19 +155,28 @@ public final class SearchEngineBuilder {
             urlToDocId.put(e.getValue().url().toString(), e.getKey());
         }
 
-        GraphBuilder graph = new GraphBuilder();
-        for (Map.Entry<Integer, ParsedDocument> e : docIdToParsed.entrySet()) {
-            int docId = e.getKey();
-            ParsedDocument parsed = e.getValue();
-            graph.addNode(docId);
-            for (URI link : parsed.outgoingLinks()) {
-                Integer targetId = urlToDocId.get(link.toString());
-                if (targetId != null && targetId != docId) {
-                    graph.addEdge(docId, targetId);
+        boolean pagerankEnabled = config.getBoolean("ranking.pagerank.enabled", true);
+        boolean diversifyEnabled = config.getBoolean("ranking.diversify.enabled", true);
+        int rankingTopK = config.getInt("ranking.topK", 20);
+
+        Map<Integer, Double> pageRank;
+        if (pagerankEnabled) {
+            GraphBuilder graph = new GraphBuilder();
+            for (Map.Entry<Integer, ParsedDocument> e : docIdToParsed.entrySet()) {
+                int docId = e.getKey();
+                ParsedDocument parsed = e.getValue();
+                graph.addNode(docId);
+                for (URI link : parsed.outgoingLinks()) {
+                    Integer targetId = urlToDocId.get(link.toString());
+                    if (targetId != null && targetId != docId) {
+                        graph.addEdge(docId, targetId);
+                    }
                 }
             }
+            pageRank = new PageRankCalculator().compute(graph);
+        } else {
+            pageRank = Map.of();
         }
-        Map<Integer, Double> pageRank = new PageRankCalculator().compute(graph);
 
         Map<Integer, String> docUrls = new HashMap<>();
         Map<Integer, String> docTitles = new HashMap<>();
@@ -185,7 +198,8 @@ public final class SearchEngineBuilder {
         );
         Map<Integer, Double> pageRankScores = pageRank;
         RankingPipeline ranking = new RankingPipeline(
-                bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths);
+                bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths,
+                rankingTopK, diversifyEnabled);
 
         FeatureExtractor featureExtractor = new FeatureExtractor(docUrls, docTitles, docBodies,
                 docLengths, pageRankScores, vectorIndex, embeddingGenerator);

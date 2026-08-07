@@ -4,8 +4,10 @@ import com.minigoogle.semantic.hnsw.HNSWGraph;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -28,22 +30,50 @@ public class VectorIndex {
     /** Layers in the HNSW graph. A fixed ceiling keeps search O(log n). */
     private static final int DEFAULT_MAX_LAYERS = 6;
 
+    /**
+     * Search implementation for the index.
+     *
+     * <p>{@link #EXACT} performs a linear scan over every stored vector. It is
+     * deterministic and returns the true nearest neighbors, which is what an
+     * evaluation harness needs; construction is O(n) so multi-hundred-thousand
+     * document corpora build in seconds.</p>
+     *
+     * <p>{@link #HNSW} builds the approximate navigable-small-world graph for
+     * logarithmic candidate retrieval on very large corpora. It is the default
+     * for production search nodes.</p>
+     */
+    public enum VectorMode { EXACT, HNSW }
+
     private final int dimension;
     private final int maxConnections;  // M parameter: max connections per node
     private final int efConstruction;  // efConstruction: search width during insertion
+    private final VectorMode mode;
     private final List<VectorEntry> entries;
+    private final Map<Integer, Integer> idToIndex;
     private final HNSWGraph graph;
 
     public VectorIndex(int dimension, int maxConnections, int efConstruction) {
-        this.dimension = dimension;
-        this.maxConnections = maxConnections;
-        this.efConstruction = efConstruction;
-        this.entries = new ArrayList<>();
-        this.graph = new HNSWGraph(dimension, maxConnections, DEFAULT_MAX_LAYERS);
+        this(dimension, VectorMode.HNSW, maxConnections, efConstruction);
+    }
+
+    public VectorIndex(int dimension, VectorMode mode) {
+        this(dimension, mode, 16, 200);
     }
 
     public VectorIndex(int dimension) {
-        this(dimension, 16, 200);
+        this(dimension, VectorMode.HNSW, 16, 200);
+    }
+
+    private VectorIndex(int dimension, VectorMode mode, int maxConnections, int efConstruction) {
+        this.dimension = dimension;
+        this.maxConnections = maxConnections;
+        this.efConstruction = efConstruction;
+        this.mode = mode;
+        this.entries = new ArrayList<>();
+        this.idToIndex = new HashMap<>();
+        this.graph = mode == VectorMode.HNSW
+                ? new HNSWGraph(dimension, maxConnections, DEFAULT_MAX_LAYERS)
+                : null;
     }
 
     /**
@@ -57,15 +87,19 @@ public class VectorIndex {
         if (vector.length != dimension) {
             throw new IllegalArgumentException("Vector dimension mismatch");
         }
-        for (int i = 0; i < entries.size(); i++) {
-            if (entries.get(i).id() == id) {
-                entries.set(i, new VectorEntry(id, vector.clone(), metadata));
+        Integer existing = idToIndex.get(id);
+        if (existing != null) {
+            entries.set(existing, new VectorEntry(id, vector.clone(), metadata));
+            if (graph != null) {
                 graph.insert(id, vector);
-                return;
             }
+            return;
         }
+        idToIndex.put(id, entries.size());
         entries.add(new VectorEntry(id, vector.clone(), metadata));
-        graph.insert(id, vector);
+        if (graph != null) {
+            graph.insert(id, vector);
+        }
     }
 
     /**
@@ -98,6 +132,10 @@ public class VectorIndex {
         }
 
         int fetch = Math.min(k, entries.size());
+        if (mode == VectorMode.EXACT) {
+            return exactSearch(query, fetch);
+        }
+
         List<VectorResult> candidates = graph.search(query, fetch, efConstruction);
 
         List<VectorResult> results = new ArrayList<>(fetch);
@@ -136,6 +174,22 @@ public class VectorIndex {
     }
 
     /**
+     * Deterministic exact nearest-neighbor scan over every stored vector.
+     */
+    private List<VectorResult> exactSearch(double[] query, int fetch) {
+        List<VectorResult> results = new ArrayList<>(fetch);
+        for (VectorEntry entry : entries) {
+            results.add(new VectorResult(
+                    entry.id(),
+                    EmbeddingGenerator.cosineSimilarity(query, entry.vector()),
+                    entry.metadata()));
+        }
+        results.sort(Comparator.comparingDouble(VectorResult::score).reversed()
+                .thenComparingInt(VectorResult::id));
+        return results.size() > fetch ? results.subList(0, fetch) : results;
+    }
+
+    /**
      * Returns the cosine similarity between a query vector and the stored
      * vector for the given id, or {@code null} if the id is not indexed.
      *
@@ -147,12 +201,11 @@ public class VectorIndex {
         if (queryVector.length != dimension) {
             throw new IllegalArgumentException("Query vector dimension mismatch");
         }
-        for (VectorEntry entry : entries) {
-            if (entry.id() == id) {
-                return EmbeddingGenerator.cosineSimilarity(queryVector, entry.vector());
-            }
+        VectorEntry entry = findEntry(id);
+        if (entry == null) {
+            return null;
         }
-        return null;
+        return EmbeddingGenerator.cosineSimilarity(queryVector, entry.vector());
     }
 
     /**
@@ -174,16 +227,15 @@ public class VectorIndex {
      */
     public void clear() {
         entries.clear();
-        graph.clear();
+        idToIndex.clear();
+        if (graph != null) {
+            graph.clear();
+        }
     }
 
     private VectorEntry findEntry(int id) {
-        for (VectorEntry entry : entries) {
-            if (entry.id() == id) {
-                return entry;
-            }
-        }
-        return null;
+        Integer index = idToIndex.get(id);
+        return index == null ? null : entries.get(index);
     }
 
     private record VectorEntry(int id, double[] vector, String metadata) {

@@ -100,6 +100,58 @@ public final class RankingMetrics {
         return (double) hits / relevant;
     }
 
+    /**
+     * Recall at cutoff K over the served ranking (BEIR Recall@100 uses the full
+     * candidate list).
+     */
+    public static double recallAtK(List<Integer> ranked, Map<Integer, Integer> relevance, int k) {
+        long relevant = relevance.values().stream().filter(v -> v > 0).count();
+        if (relevant == 0) {
+            return 0.0;
+        }
+        List<Integer> topK = ranked.size() > k ? ranked.subList(0, k) : ranked;
+        long hits = topK.stream().filter(id -> relevance.getOrDefault(id, 0) > 0).count();
+        return (double) hits / relevant;
+    }
+
+    /**
+     * MRR at cutoff K: reciprocal rank of the first relevant hit, capped at K
+     * (0 if the first relevant hit is beyond K or absent).
+     */
+    public static double mrrAtK(List<Integer> ranked, Map<Integer, Integer> relevance, int k) {
+        int limit = Math.min(k, ranked.size());
+        for (int i = 0; i < limit; i++) {
+            if (relevance.getOrDefault(ranked.get(i), 0) > 0) {
+                return 1.0 / (i + 1);
+            }
+        }
+        return 0.0;
+    }
+
+    /**
+     * MAP over the top-K served ranking, divided by the total number of judged
+     * relevant documents.
+     */
+    public static double mapAtK(List<Integer> ranked, Map<Integer, Integer> relevance, int k) {
+        List<Integer> relevant = relevance.entrySet().stream()
+                .filter(e -> e.getValue() > 0)
+                .map(Map.Entry::getKey)
+                .toList();
+        if (relevant.isEmpty()) {
+            return 0.0;
+        }
+        double sum = 0.0;
+        int hits = 0;
+        int limit = Math.min(k, ranked.size());
+        for (int i = 0; i < limit; i++) {
+            if (relevance.getOrDefault(ranked.get(i), 0) > 0) {
+                hits++;
+                sum += (double) hits / (i + 1);
+            }
+        }
+        return sum / relevant.size();
+    }
+
     public static double precisionAt(List<Integer> ranked, Map<Integer, Integer> relevance) {
         if (ranked.isEmpty()) {
             return 0.0;

@@ -26,6 +26,7 @@ demo-index/
 demo-index-a/
 demo-index-b/
 snapshots/
+data/
 
 # Gradle wrapper (keep JAR)
 !gradle/wrapper/gradle-wrapper.jar

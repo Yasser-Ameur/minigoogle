@@ -71,7 +71,7 @@ public class SearchCoordinator {
      *                              registry (e.g. {@code http://localhost:8081}).
      */
     public SearchCoordinator(String clusterCoordinatorUrl) {
-        this(clusterCoordinatorUrl, 3);
+        this(clusterCoordinatorUrl, 3, new LinearRankingModel());
     }
 
     /**
@@ -82,9 +82,24 @@ public class SearchCoordinator {
      *                              ranks from a superset (RFC 0001 §6).
      */
     public SearchCoordinator(String clusterCoordinatorUrl, int shardOversample) {
+        this(clusterCoordinatorUrl, shardOversample, new LinearRankingModel());
+    }
+
+    /**
+     * @param clusterCoordinatorUrl The URL of the cluster coordinator's state
+     *                              registry.
+     * @param shardOversample       How many candidates to request per shard for
+     *                              every final result slot.
+     * @param rankingModel          The shared ranking model to score candidates
+     *                              with (typically a trained LTR model). Enables
+     *                              testing the distributed path with the exact
+     *                              model the standalone engine was evaluated with.
+     */
+    public SearchCoordinator(String clusterCoordinatorUrl, int shardOversample,
+                             LinearRankingModel rankingModel) {
         this.client = new RestClient();
         this.clusterCoordinatorUrl = clusterCoordinatorUrl;
-        this.rankingModel = new LinearRankingModel();
+        this.rankingModel = rankingModel != null ? rankingModel : new LinearRankingModel();
         this.shardOversample = Math.max(1, shardOversample);
         this.docIdRegistry = new DocIdRegistry();
         this.impressionLog = new ImpressionLog();

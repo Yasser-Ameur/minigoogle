@@ -29,6 +29,7 @@ public class RankingPipeline {
     private final SnippetGenerator snippetGenerator;
     private final Map<Integer, Double> pageRankScores;
     private final int topK;
+    private final boolean diversifyEnabled;
 
     // Document metadata needed for scoring
     private final Map<Integer, String> docUrls;
@@ -42,7 +43,18 @@ public class RankingPipeline {
                            Map<Integer, String> docTitles,
                            Map<Integer, String> docBodies,
                            Map<Integer, Integer> docLengths) {
-        this(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths, DEFAULT_TOP_K);
+        this(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths, DEFAULT_TOP_K, true);
+    }
+
+    public RankingPipeline(BM25Parameters bm25Params,
+                           Map<Integer, Double> pageRankScores,
+                           Map<Integer, String> docUrls,
+                           Map<Integer, String> docTitles,
+                           Map<Integer, String> docBodies,
+                           Map<Integer, Integer> docLengths,
+                           boolean diversifyEnabled) {
+        this(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths,
+                DEFAULT_TOP_K, diversifyEnabled);
     }
 
     public RankingPipeline(BM25Parameters bm25Params,
@@ -52,6 +64,17 @@ public class RankingPipeline {
                            Map<Integer, String> docBodies,
                            Map<Integer, Integer> docLengths,
                            int topK) {
+        this(bm25Params, pageRankScores, docUrls, docTitles, docBodies, docLengths, topK, true);
+    }
+
+    public RankingPipeline(BM25Parameters bm25Params,
+                           Map<Integer, Double> pageRankScores,
+                           Map<Integer, String> docUrls,
+                           Map<Integer, String> docTitles,
+                           Map<Integer, String> docBodies,
+                           Map<Integer, Integer> docLengths,
+                           int topK,
+                           boolean diversifyEnabled) {
         this.bm25Calculator = new BM25Calculator(bm25Params);
         this.normalizer = new ScoreNormalizer();
         this.fusion = new ScoreFusion();
@@ -63,6 +86,7 @@ public class RankingPipeline {
         this.docBodies = docBodies;
         this.docLengths = docLengths;
         this.topK = topK;
+        this.diversifyEnabled = diversifyEnabled;
     }
 
     /**
@@ -77,42 +101,39 @@ public class RankingPipeline {
                                      Map<String, PostingList> candidatePostings,
                                      Map<String, Integer> documentFrequencies) {
 
-        // 1. Collect all unique candidate document IDs
-        Set<Integer> candidateDocIds = new HashSet<>();
-        for (PostingList pl : candidatePostings.values()) {
+        // 1. Accumulate per-document term frequencies in a single pass over the
+        //    (docId-sorted) posting lists. Posting lists are sorted by document
+        //    id, so each posting contributes exactly once: O(total postings)
+        //    instead of O(candidateDocs x total postings).
+        Map<Integer, Map<String, Integer>> tfByDoc = new HashMap<>();
+        for (String term : queryTerms) {
+            PostingList pl = candidatePostings.get(term);
+            if (pl == null) {
+                continue;
+            }
             for (Posting p : pl.getPostings()) {
-                candidateDocIds.add(p.getDocumentId());
+                tfByDoc.computeIfAbsent(p.getDocumentId(), id -> new HashMap<>())
+                        .put(term, p.getFrequency());
             }
         }
 
-        if (candidateDocIds.isEmpty()) {
+        if (tfByDoc.isEmpty()) {
             return List.of();
         }
 
         // 2. Compute BM25 score for each candidate
-        Map<Integer, Double> rawBm25Scores = new HashMap<>();
-        for (int docId : candidateDocIds) {
-            Map<String, Integer> tfMap = new HashMap<>();
-            for (String term : queryTerms) {
-                PostingList pl = candidatePostings.get(term);
-                if (pl != null) {
-                    for (Posting p : pl.getPostings()) {
-                        if (p.getDocumentId() == docId) {
-                            tfMap.put(term, p.getFrequency());
-                            break;
-                        }
-                    }
-                }
-            }
-
+        Map<Integer, Double> rawBm25Scores = new HashMap<>(tfByDoc.size());
+        for (Map.Entry<Integer, Map<String, Integer>> e : tfByDoc.entrySet()) {
+            int docId = e.getKey();
             int docLength = docLengths.getOrDefault(docId, 1);
-            double score = bm25Calculator.scoreDocument(queryTerms, tfMap, docLength, documentFrequencies);
+            double score = bm25Calculator.scoreDocument(
+                    queryTerms, e.getValue(), docLength, documentFrequencies);
             rawBm25Scores.put(docId, score);
         }
 
         // 3. Collect PageRank scores for candidates
-        Map<Integer, Double> rawPageRankScores = new HashMap<>();
-        for (int docId : candidateDocIds) {
+        Map<Integer, Double> rawPageRankScores = new HashMap<>(tfByDoc.size());
+        for (int docId : tfByDoc.keySet()) {
             rawPageRankScores.put(docId, pageRankScores.getOrDefault(docId, 0.0));
         }
 
@@ -127,7 +148,7 @@ public class RankingPipeline {
         PriorityQueue<RankedDocument> heap = new PriorityQueue<>(
                 Comparator.comparingDouble(RankedDocument::finalScore));
 
-        for (int docId : candidateDocIds) {
+        for (int docId : tfByDoc.keySet()) {
             String url = docUrls.getOrDefault(docId, "");
             String title = docTitles.getOrDefault(docId, "");
             String body = docBodies.getOrDefault(docId, "");
@@ -151,7 +172,12 @@ public class RankingPipeline {
         List<RankedDocument> topResults = new ArrayList<>(heap);
         topResults.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
 
-        // 8. Apply domain diversification
-        return diversityFilter.diversify(topResults);
+        // 8. Apply domain diversification (skippable: reorders by domain, which
+        //    perturbs ranking metrics and is meaningless when every document
+        //    shares one synthetic domain).
+        if (diversifyEnabled) {
+            return diversityFilter.diversify(topResults);
+        }
+        return topResults;
     }
 }

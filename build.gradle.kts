@@ -111,3 +111,87 @@ fun executableExists(name: String): Boolean {
 tasks.processResources {
     dependsOn(frontendBuild)
 }
+
+/**
+ * Builds a verified SearchEngine index from a BEIR dataset. Reads corpus,
+ * queries and qrels, persists the deterministic id mapping + manifest, and
+ * prints the exact numbers that may go into the docs and resume.
+ *
+ * Usage:
+ *   gradlew corpusIndex -Pbeir.dataset=trec-covid -Pbeir.dir=data/beir/trec-covid
+ *                        [-Pbeir.out=build/beir-index] [-Pbeir.maxDocs=100000]
+ *                        [-Pbeir.config=ranking.topK=100]
+ */
+val corpusIndex by tasks.registering(JavaExec::class) {
+    group = "evaluation"
+    description = "Loads a BEIR dataset and builds a verified search index"
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.minigoogle.corpus.BeirIndexMain")
+    jvmArgs = listOf("-Xmx12g", "-XX:MaxMetaspaceSize=512m")
+    doFirst {
+        providers.gradleProperty("beir.heap").orNull?.let {
+            jvmArgs = listOf("-Xmx$it", "-XX:MaxMetaspaceSize=512m")
+        }
+        val dataset = providers.gradleProperty("beir.dataset").getOrElse("trec-covid")
+        args = buildList {
+            add("--dataset"); add(dataset)
+            add("--dir"); add(providers.gradleProperty("beir.dir")
+                .getOrElse("data/beir/$dataset"))
+            add("--out"); add(providers.gradleProperty("beir.out")
+                .getOrElse("build/beir-index/$dataset"))
+            providers.gradleProperty("beir.maxDocs").orNull?.let {
+                add("--maxDocs"); add(it)
+            }
+            providers.gradleProperty("beir.config").orNull?.let {
+                add("--config"); add(it)
+            }
+        }
+    }
+}
+
+/**
+ * Runs BEIR retrieval evaluation over a built index and prints NDCG@10,
+ * Recall@100, MRR@10 and MAP@100 per variant.
+ *
+ * Usage:
+ *   gradlew corpusEval -Pbeir.dataset=trec-covid -Pbeir.dir=data/beir/trec-covid
+ *                      [-Pbeir.out=build/beir-index] [-Pbeir.maxDocs=25000]
+ *                      [-Pbeir.split=test] [-Pbeir.topK=100]
+ *                      [-Pbeir.variants=hybrid,bm25]
+ *                      [-Pbeir.config=semantic.hybrid.enabled=false]
+ */
+val corpusEval by tasks.registering(JavaExec::class) {
+    group = "evaluation"
+    description = "Runs BEIR retrieval evaluation (NDCG@10, Recall@100, MRR@10, MAP@100)"
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.minigoogle.corpus.BeirEvaluationMain")
+    jvmArgs = listOf("-Xmx12g", "-XX:MaxMetaspaceSize=512m")
+    doFirst {
+        providers.gradleProperty("beir.heap").orNull?.let {
+            jvmArgs = listOf("-Xmx$it", "-XX:MaxMetaspaceSize=512m")
+        }
+        val dataset = providers.gradleProperty("beir.dataset").getOrElse("trec-covid")
+        args = buildList {
+            add("--dataset"); add(dataset)
+            add("--dir"); add(providers.gradleProperty("beir.dir")
+                .getOrElse("data/beir/$dataset"))
+            add("--out"); add(providers.gradleProperty("beir.out")
+                .getOrElse("build/beir-index/$dataset"))
+            providers.gradleProperty("beir.maxDocs").orNull?.let {
+                add("--maxDocs"); add(it)
+            }
+            providers.gradleProperty("beir.split").orNull?.let {
+                add("--split"); add(it)
+            }
+            providers.gradleProperty("beir.topK").orNull?.let {
+                add("--topK"); add(it)
+            }
+            providers.gradleProperty("beir.variants").orNull?.let {
+                add("--variants"); add(it)
+            }
+            providers.gradleProperty("beir.config").orNull?.let {
+                add("--config"); add(it)
+            }
+        }
+    }
+}
