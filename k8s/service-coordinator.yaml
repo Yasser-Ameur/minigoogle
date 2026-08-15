@@ -11,8 +11,8 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    app: minigoogle
-    component: coordinator
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: coordinator
   ports:
     - port: 8080
       targetPort: 8080

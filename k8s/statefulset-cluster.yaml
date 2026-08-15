@@ -1,0 +1,157 @@
+# A real three-node MiniGoogle Raft cluster.
+#
+# A StatefulSet, not a Deployment: Raft needs stable node identity and durable
+# per-node storage. The headless Service below gives every pod a predictable DNS
+# name (minigoogle-cluster-0.minigoogle-cluster.minigoogle.svc.cluster.local),
+# which is what CLUSTER_PEERS refers to. Deployment pods get random names and
+# shared-nothing identity, so a Raft member could never be addressed or recover
+# its own persisted state after a reschedule.
+#
+#   kubectl apply -f k8s/namespace.yaml -f k8s/configmap.yaml \
+#                 -f k8s/statefulset-cluster.yaml
+#   kubectl -n minigoogle get endpoints minigoogle-cluster     # must be non-empty
+#   kubectl -n minigoogle exec minigoogle-cluster-0 -- \
+#       curl -s localhost:8080/api/v1/cluster/status
+---
+# Headless Service: assigns per-pod DNS records for the internal RPC port.
+# clusterIP: None is what makes the stable per-pod names resolve.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minigoogle-cluster
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: cluster
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true   # peers must resolve before they pass readiness
+  selector:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: cluster
+  ports:
+    - name: rpc
+      port: 9080
+      targetPort: 9080
+      protocol: TCP
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# Client-facing Service for the public REST API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minigoogle-cluster-api
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: cluster
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: cluster
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minigoogle-cluster
+  namespace: minigoogle
+  labels:
+    app.kubernetes.io/name: minigoogle
+    app.kubernetes.io/component: cluster
+    app.kubernetes.io/part-of: minigoogle
+spec:
+  serviceName: minigoogle-cluster
+  replicas: 3
+  podManagementPolicy: Parallel   # peers must come up together to form a quorum
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minigoogle
+      app.kubernetes.io/component: cluster
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minigoogle
+        app.kubernetes.io/component: cluster
+        app.kubernetes.io/part-of: minigoogle
+    spec:
+      containers:
+        - name: minigoogle
+          image: ghcr.io/Yasser-Ameur-Dev/distributed-search-engine:latest
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: rpc
+              containerPort: 9080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: minigoogle-config
+          env:
+            - name: NODE_TYPE
+              value: CLUSTER
+            - name: NODE_PORT
+              value: "8080"
+            - name: CLUSTER_PORT
+              value: "9080"
+            # The pod's own name is its stable Raft node id.
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ADVERTISED_HOST
+              value: "$(NODE_ID).minigoogle-cluster"
+            - name: CLUSTER_PEERS
+              value: >-
+                minigoogle-cluster-0=http://minigoogle-cluster-0.minigoogle-cluster:9080,
+                minigoogle-cluster-1=http://minigoogle-cluster-1.minigoogle-cluster:9080,
+                minigoogle-cluster-2=http://minigoogle-cluster-2.minigoogle-cluster:9080
+            - name: INDEX_DIR
+              value: /data/index
+            - name: MINIGOGLE_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: minigoogle-cluster-secret
+                  key: secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: 1000m
+            limits:
+              memory: 1Gi
+              cpu: 1000m
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  # Per-pod persistent Raft state: term, votedFor, log, snapshot and the
+  # committed configuration. Losing this on reschedule would violate the
+  # durability Raft's safety argument assumes.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

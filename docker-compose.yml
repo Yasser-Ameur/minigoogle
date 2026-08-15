@@ -1,83 +1,95 @@
+# A real three-node MiniGoogle cluster.
+#
+# Each container runs NODE_TYPE=CLUSTER, which starts the full consensus stack
+# (gossip membership, Raft, the consistent-hash ring and the internal RPC
+# server) alongside that node's local index and REST API.
+#
+#   8080/8081/8082  public REST API of each node
+#   9080/9081/9082  internal cluster RPC (gossip + Raft), published so the
+#                   topology is inspectable from the host
+#
+# The peer list uses the compose service names, which resolve on the shared
+# network. Every node must share MINIGOGLE_CLUSTER_SECRET or peers reject one
+# another's RPCs.
+#
+#   docker compose up --build
+#   curl localhost:8080/api/v1/cluster/status
+#   curl -X POST localhost:8080/api/v1/cluster/kv -d '{"key":"k","value":"v"}'
+#   curl 'localhost:8081/api/v1/cluster/kv?key=k'     # served from a peer
+#
+# Killing the leader (docker compose stop minigoogle-1) and re-querying
+# /api/v1/cluster/status on a survivor shows a new leader elected.
+
+x-cluster-common: &cluster-common
+  build: .
+  networks:
+    - minigoogle-net
+  restart: unless-stopped
+  environment: &cluster-env
+    NODE_TYPE: CLUSTER
+    NODE_PORT: 8080
+    CLUSTER_PORT: 9080
+    # nodeId=host:port for every member, including self.
+    CLUSTER_PEERS: "minigoogle-1=http://minigoogle-1:9080,minigoogle-2=http://minigoogle-2:9080,minigoogle-3=http://minigoogle-3:9080"
+    MINIGOGLE_CLUSTER_SECRET: "change-me-in-production"
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+    interval: 10s
+    timeout: 5s
+    start_period: 20s
+    retries: 5
+
 services:
-  coordinator:
-    build: .
-    container_name: minigoogle-coordinator
+  minigoogle-1:
+    <<: *cluster-common
+    container_name: minigoogle-1
     ports:
       - "8080:8080"
+      - "9080:9080"
     environment:
-      - NODE_TYPE=coordinator
-      - NODE_PORT=8080
-      - CLUSTER_PEERS=search-node-1:8080,search-node-2:8080
-    networks:
-      - minigoogle-net
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      start_period: 15s
-      retries: 3
+      <<: *cluster-env
+      NODE_ID: minigoogle-1
+      ADVERTISED_HOST: minigoogle-1
+      INDEX_DIR: /data/index
+    volumes:
+      - minigoogle-1-data:/data
 
-  search-node-1:
-    build: .
-    container_name: minigoogle-search-node-1
+  minigoogle-2:
+    <<: *cluster-common
+    container_name: minigoogle-2
     ports:
       - "8081:8080"
+      - "9081:9080"
     environment:
-      - NODE_TYPE=search-node
-      - NODE_PORT=8080
-      - CLUSTER_PEERS=coordinator:8080,search-node-2:8080
-    networks:
-      - minigoogle-net
-    restart: unless-stopped
-    depends_on:
-      coordinator:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      start_period: 15s
-      retries: 3
+      <<: *cluster-env
+      NODE_ID: minigoogle-2
+      ADVERTISED_HOST: minigoogle-2
+      INDEX_DIR: /data/index
+    volumes:
+      - minigoogle-2-data:/data
 
-  search-node-2:
-    build: .
-    container_name: minigoogle-search-node-2
+  minigoogle-3:
+    <<: *cluster-common
+    container_name: minigoogle-3
     ports:
       - "8082:8080"
+      - "9082:9080"
     environment:
-      - NODE_TYPE=search-node
-      - NODE_PORT=8080
-      - CLUSTER_PEERS=coordinator:8080,search-node-1:8080
-    networks:
-      - minigoogle-net
-    restart: unless-stopped
-    depends_on:
-      coordinator:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      start_period: 15s
-      retries: 3
-
-  monitoring:
-    build: .
-    container_name: minigoogle-monitoring
-    ports:
-      - "9090:8080"
-    environment:
-      - NODE_TYPE=monitoring
-      - NODE_PORT=8080
-      - CLUSTER_PEERS=coordinator:8080,search-node-1:8080,search-node-2:8080
-    networks:
-      - minigoogle-net
-    restart: unless-stopped
-    depends_on:
-      coordinator:
-        condition: service_healthy
+      <<: *cluster-env
+      NODE_ID: minigoogle-3
+      ADVERTISED_HOST: minigoogle-3
+      INDEX_DIR: /data/index
+    volumes:
+      - minigoogle-3-data:/data
 
 networks:
   minigoogle-net:
     driver: bridge
+
+# Raft state lives under $INDEX_DIR/raft. Without a volume a container restart
+# would lose its persisted term, log and configuration, which is exactly the
+# state Raft relies on to recover safely.
+volumes:
+  minigoogle-1-data:
+  minigoogle-2-data:
+  minigoogle-3-data:
