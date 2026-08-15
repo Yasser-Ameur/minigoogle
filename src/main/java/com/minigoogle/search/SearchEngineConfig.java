@@ -26,7 +26,9 @@ public record SearchEngineConfig(
         boolean rerankEnabled) {
 
     public static SearchEngineConfig from(Configuration config) {
-        boolean semantic = config.getBoolean("semantic.enabled", true);
+        // See SearchEngineBuilder: the embedding is feature hashing, not a
+        // trained model, and hybrid fusion measurably degrades both BEIR datasets.
+        boolean semantic = config.getBoolean("semantic.enabled", false);
         boolean hybrid = semantic && config.getBoolean("semantic.hybrid.enabled", true);
         int fetchK = config.getInt("semantic.hybrid.fetchK", 60);
         double lexicalWeight = config.getDouble("semantic.hybrid.lexicalWeight", 0.5);

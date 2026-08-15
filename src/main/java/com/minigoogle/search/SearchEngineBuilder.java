@@ -117,7 +117,16 @@ public final class SearchEngineBuilder {
         VectorIndex vectorIndex;
         EmbeddingGenerator embeddingGenerator;
         CrossEncoderRanker reranker;
-        boolean semanticEnabled = config.getBoolean("semantic.enabled", true);
+        // Defaults to OFF. EmbeddingGenerator is feature hashing over raw tokens
+        // (bucket = hash(token) % dim, +/-1, L2-normalized), not a trained model:
+        // it carries no semantic knowledge, so it cannot relate terms that do not
+        // share a token. Measured on BEIR with everything else held identical, it
+        // is strictly worse than the lexical path and hybrid fusion damages both
+        // datasets - scifact NDCG@10 0.6015 -> 0.3611, trec-covid 0.3890 -> 0.2660 -
+        // while recovering only 2.3% of the relevant documents lexical retrieval
+        // misses on trec-covid. Enable explicitly, or replace the representation
+        // with a trained retrieval model, before relying on it.
+        boolean semanticEnabled = config.getBoolean("semantic.enabled", false);
         if (semanticEnabled) {
             int embeddingDim = config.getInt("semantic.dimension", 128);
             double semanticWeight = config.getDouble("semantic.weight", 0.3);
