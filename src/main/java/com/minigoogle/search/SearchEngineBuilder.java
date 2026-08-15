@@ -221,7 +221,13 @@ public final class SearchEngineBuilder {
      * corpus-based expansion is enabled.
      */
     private static QueryExpander buildQueryExpander(List<ParsedDocument> docs, Configuration config) {
-        boolean expansionEnabled = config.getBoolean("semantic.expansion.enabled", true);
+        // Defaults to OFF. Measured on BEIR scifact with everything else held
+        // identical, PMI expansion degraded every quality metric - NDCG@10
+        // 0.6015 -> 0.4469, MRR@10 0.5641 -> 0.3990, Recall@10 0.7360 -> 0.6126 -
+        // while Recall@1000 was flat (0.9343 -> 0.9333). It adds candidates
+        // without recovering relevant documents, and costs ~8x the wall time.
+        // Enable it explicitly if a corpus is shown to benefit.
+        boolean expansionEnabled = config.getBoolean("semantic.expansion.enabled", false);
         if (!expansionEnabled) {
             return new QueryExpander();
         }
