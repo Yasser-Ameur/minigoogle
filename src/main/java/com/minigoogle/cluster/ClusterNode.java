@@ -156,9 +156,16 @@ public class ClusterNode {
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, Path storageDirectory) throws IOException {
+        // A node configured with durable storage gets a complete durable stack:
+        // metadata, log, snapshot and configuration stores AND a replicated
+        // state machine with its applied-index store. Previously this
+        // constructor passed null for the state machine, so the most
+        // production-shaped way to build a node produced one that threw on
+        // every put/get - durable consensus with nothing to apply it to.
         this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
                 security, createRaftMetadataStore(storageDirectory), createRaftLog(storageDirectory),
-                null, null, createRaftSnapshotStore(storageDirectory), SNAPSHOT_INTERVAL,
+                new ReplicatedKeyValueStore(), createRaftAppliedStore(storageDirectory),
+                createRaftSnapshotStore(storageDirectory), SNAPSHOT_INTERVAL,
                 createRaftConfigurationStore(storageDirectory));
     }
 
@@ -408,6 +415,13 @@ public class ClusterNode {
         } catch (IOException e) {
             throw new java.io.UncheckedIOException("Failed to load raft log; refusing to start", e);
         }
+    }
+
+    private static RaftAppliedStore createRaftAppliedStore(Path storageDirectory) {
+        if (storageDirectory == null) {
+            return RaftAppliedStore.inMemory();
+        }
+        return new RaftAppliedStore(new StorageLayout(storageDirectory).getRaftAppliedPath());
     }
 
     private static RaftSnapshotStore createRaftSnapshotStore(Path storageDirectory) {

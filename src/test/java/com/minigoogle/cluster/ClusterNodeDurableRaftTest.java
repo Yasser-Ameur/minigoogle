@@ -89,7 +89,11 @@ class ClusterNodeDurableRaftTest {
             node.getRaft().startElection();
             assertTrue(node.getRaft().receiveVote(), "A single-node cluster must win its own election");
             node.getRaft().becomeLeader();
-            int index = node.getRaft().appendEntry("durable".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            // A node built from a storage directory now carries a replicated
+            // key-value state machine, so the committed entry must be a real
+            // command rather than arbitrary bytes.
+            int index = node.getRaft().appendEntry(com.minigoogle.cluster.state.KvCommand.encodePut(
+                    "durable-key", "durable".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
             assertEquals(1, index);
             assertEquals(1, node.getRaft().getLastLogIndex());
             assertEquals(1, node.getRaft().getLastLogTerm());

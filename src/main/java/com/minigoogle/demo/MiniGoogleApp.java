@@ -30,8 +30,15 @@ import com.minigoogle.core.config.Configuration;
 import com.minigoogle.core.config.ConfigurationLoader;
 import com.minigoogle.core.event.EventBus;
 import com.minigoogle.core.event.QueryExecutedEvent;
+import com.minigoogle.cluster.ClusterNode;
+import com.minigoogle.cluster.ClusterSecurity;
+import com.minigoogle.cluster.NotLeaderException;
+import com.minigoogle.cluster.RaftConsensus;
+import com.minigoogle.cluster.transport.StaticNodeDirectory;
 import com.minigoogle.distributed.coordinator.ClusterCoordinator;
 import com.minigoogle.distributed.coordinator.SearchCoordinator;
+import com.minigoogle.distributed.query.execution.LocalSearchExecutor;
+import com.minigoogle.distributed.query.execution.SearchExecutor;
 import com.minigoogle.distributed.heartbeat.HeartbeatManager;
 import com.minigoogle.distributed.model.NodeInfo;
 import com.minigoogle.distributed.model.NodeRole;
@@ -88,6 +95,13 @@ public class MiniGoogleApp {
 
     /** Monotonically increasing build counter used to name versioned build directories. */
     private final java.util.concurrent.atomic.AtomicLong buildSeq = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * The consensus runtime, non-null only when {@code node.type=CLUSTER}. It
+     * owns gossip, Raft, the hash ring and the internal RPC server.
+     */
+    private ClusterNode clusterNode;
+    private String clusterNodeId;
 
     public void start() throws Exception {
         printBanner();
@@ -392,7 +406,176 @@ public class MiniGoogleApp {
             registerWithCluster(port);
         }
 
+        if ("CLUSTER".equals(nodeType)) {
+            startClusterRuntime(server);
+        }
+
         Thread.currentThread().join();
+    }
+
+    /**
+     * Brings up the real consensus stack alongside this node's local index and
+     * REST API: gossip membership, Raft, the consistent-hash ring and the
+     * internal RPC server, all durable under {@code indexing.indexDir/raft}.
+     *
+     * <p>A CLUSTER node is a full search node that additionally participates in
+     * the cluster, rather than a separate mode. Its public REST API keeps
+     * serving search from the local index while {@code /api/v1/cluster/*}
+     * exposes the replicated state machine and membership.</p>
+     *
+     * <p>Peers are addressed through {@link StaticNodeDirectory} from
+     * {@code cluster.peers}. The bootstrap configuration is established once,
+     * from this node plus its configured peers, and is persisted by Raft; on
+     * restart the committed configuration wins and this call is a no-op.</p>
+     */
+    private void startClusterRuntime(RestServer server) throws Exception {
+        String nodeId = config.get("cluster.nodeId", "").trim();
+        if (nodeId.isEmpty()) {
+            nodeId = java.net.InetAddress.getLocalHost().getHostName();
+        }
+        int clusterPort = config.getInt("cluster.port", 8081);
+        String advertisedHost = config.get("cluster.advertisedHost", "localhost").trim();
+
+        java.net.URI selfUri = java.net.URI.create("http://" + advertisedHost + ":" + clusterPort);
+        StaticNodeDirectory directory = StaticNodeDirectory
+                .parse(config.get("cluster.peers", ""))
+                .withSelf(nodeId, selfUri);
+
+        // The cluster secret authenticates every internal RPC. Nodes must share
+        // it; a random per-node secret would make peers reject each other.
+        String secret = config.get("cluster.secret", "").trim();
+        if (secret.isEmpty()) {
+            System.out.println("WARN: cluster.secret is not set; using a fixed development secret. "
+                    + "Set MINIGOGLE_CLUSTER_SECRET before running outside a trusted network.");
+            secret = "minigoogle-development-cluster-secret";
+        }
+        ClusterSecurity security = new ClusterSecurity(secret);
+
+        // A shard executor backed by this node's live index, so a peer's
+        // /cluster/v1/search/dispatch runs a real query against real postings.
+        this.clusterNodeId = nodeId;
+        final String executorNodeId = nodeId;
+        SearchExecutor localSearch = new LocalSearchExecutor(
+                Math.abs(nodeId.hashCode() % 1024),
+                (query, topK) -> gatherCandidateResults(query, topK).results());
+
+        Path raftDir = indexPath.resolve("raft");
+        Files.createDirectories(raftDir);
+
+        clusterNode = new ClusterNode(
+                nodeId,
+                clusterPort,
+                directory,
+                config.getLong("cluster.gossipInterval", 1000),
+                config.getLong("cluster.nodeTimeout", 30000),
+                config.getLong("cluster.raft.electionTimeoutMs", 1500),
+                config.getLong("cluster.raft.heartbeatMs", 300),
+                localSearch,
+                security,
+                raftDir);
+        clusterNode.start();
+
+        // Seed gossip with the configured peers so membership converges without
+        // an external registry; Raft then campaigns only against live members.
+        for (String peerId : directory.nodeIds()) {
+            if (!peerId.equals(executorNodeId)) {
+                clusterNode.getGossip().seedPeer(peerId);
+            }
+        }
+
+        try {
+            clusterNode.initializeConfig(List.copyOf(directory.nodeIds()));
+            System.out.println("Bootstrapped Raft configuration with " + directory.nodeIds());
+        } catch (IllegalStateException alreadyConfigured) {
+            System.out.println("Raft configuration already established; keeping committed membership");
+        }
+
+        registerClusterEndpoints(server);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                clusterNode.stop();
+            } catch (RuntimeException e) {
+                System.err.println("Cluster node shutdown failed: " + e.getMessage());
+            }
+        }, "cluster-shutdown"));
+
+        System.out.println("Cluster node " + nodeId + " participating on port " + clusterPort
+                + " with peers " + directory.nodeIds());
+    }
+
+    /**
+     * Exposes the replicated state machine and cluster membership over the
+     * public REST API, so the consensus layer is reachable by a user request
+     * rather than only by internal RPC.
+     */
+    private void registerClusterEndpoints(RestServer server) {
+        server.getWithContentType("/api/v1/cluster/status", "application/json", req -> {
+            RaftConsensus raft = clusterNode.getRaft();
+            return "{\"nodeId\":\"" + clusterNodeId
+                    + "\",\"state\":\"" + raft.getState()
+                    + "\",\"term\":" + raft.getCurrentTerm()
+                    + ",\"leader\":\"" + String.valueOf(raft.getCurrentLeader())
+                    + "\",\"commitIndex\":" + raft.getCommitIndex()
+                    + ",\"members\":" + toJsonArray(clusterNode.getCommittedConfig().members())
+                    + ",\"liveNodes\":" + toJsonArray(clusterNode.getGossip().getLiveNodes())
+                    + "}";
+        });
+
+        // Linearizable write through Raft: returns only once a majority has
+        // committed and applied the entry.
+        server.post("/api/v1/cluster/kv", body -> {
+            try {
+                KvRequest request = JsonSerializer.fromJson(body, KvRequest.class);
+                if (request == null || request.key() == null || request.key().isBlank()) {
+                    return "{\"success\":false,\"error\":\"key is required\"}";
+                }
+                clusterNode.put(request.key(),
+                        String.valueOf(request.value()).getBytes(StandardCharsets.UTF_8));
+                return "{\"success\":true,\"key\":\"" + request.key().replace("\"", "'") + "\"}";
+            } catch (NotLeaderException e) {
+                return "{\"success\":false,\"error\":\"not leader\",\"leader\":\""
+                        + String.valueOf(e.getLeaderId()) + "\"}";
+            } catch (Exception e) {
+                return "{\"success\":false,\"error\":\"" + sanitize(e.getMessage()) + "\"}";
+            }
+        });
+
+        server.getWithContentType("/api/v1/cluster/kv", "application/json", req -> {
+            try {
+                String key = java.net.URLDecoder.decode(
+                        req.replaceAll("^.*[?&]key=", "").replaceAll("&.*$", ""),
+                        StandardCharsets.UTF_8).trim();
+                if (key.isEmpty()) {
+                    return "{\"found\":false,\"error\":\"key is required\"}";
+                }
+                byte[] value = clusterNode.get(key);
+                if (value == null) {
+                    return "{\"found\":false,\"key\":\"" + key.replace("\"", "'") + "\"}";
+                }
+                return "{\"found\":true,\"key\":\"" + key.replace("\"", "'")
+                        + "\",\"value\":\"" + new String(value, StandardCharsets.UTF_8).replace("\"", "'") + "\"}";
+            } catch (NotLeaderException e) {
+                return "{\"found\":false,\"error\":\"no leader\",\"leader\":\""
+                        + String.valueOf(e.getLeaderId()) + "\"}";
+            } catch (Exception e) {
+                return "{\"found\":false,\"error\":\"" + sanitize(e.getMessage()) + "\"}";
+            }
+        });
+    }
+
+    private static String toJsonArray(java.util.Collection<String> values) {
+        return values.stream()
+                .map(v -> "\"" + v.replace("\"", "'") + "\"")
+                .collect(java.util.stream.Collectors.joining(",", "[", "]"));
+    }
+
+    private static String sanitize(String message) {
+        return message == null ? "unknown" : message.replace("\"", "'");
+    }
+
+    /** Request body for the replicated key-value endpoint. */
+    public record KvRequest(String key, String value) {
     }
 
     /**

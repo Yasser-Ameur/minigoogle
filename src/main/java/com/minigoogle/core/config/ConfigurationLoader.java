@@ -46,8 +46,20 @@ public final class ConfigurationLoader {
         putIfEnv(props, "MINIGOGLE_CLUSTER_COORDINATOR_URL", "cluster.coordinatorUrl");
         putIfEnv(props, "MINIGOGLE_REPLICATION_FACTOR", "cluster.replicationFactor");
         putIfEnv(props, "MINIGOGLE_LOG_LEVEL", "logging.level");
+        putIfEnv(props, "MINIGOGLE_CLUSTER_SECRET", "cluster.secret");
+        putIfEnv(props, "MINIGOGLE_ADVERTISED_HOST", "cluster.advertisedHost");
+        // Unprefixed aliases. Container orchestrators set plain names, and
+        // docker-compose already did so for CLUSTER_PEERS while only the
+        // MINIGOGLE_-prefixed key was read - so the peer list was silently
+        // ignored and every container started as an isolated single node.
         putIfEnv(props, "NODE_TYPE", "node.type");
         putIfEnv(props, "NODE_PORT", "server.port");
+        putIfEnv(props, "NODE_ID", "cluster.nodeId");
+        putIfEnv(props, "CLUSTER_PEERS", "cluster.peers");
+        putIfEnv(props, "CLUSTER_PORT", "cluster.port");
+        putIfEnv(props, "CLUSTER_SECRET", "cluster.secret");
+        putIfEnv(props, "ADVERTISED_HOST", "cluster.advertisedHost");
+        putIfEnv(props, "INDEX_DIR", "indexing.indexDir");
         return new Configuration(props);
     }
 
