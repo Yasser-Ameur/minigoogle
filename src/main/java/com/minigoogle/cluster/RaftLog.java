@@ -35,6 +35,21 @@ public class RaftLog {
     /** WAL operation type for a replicated Raft entry. */
     public static final byte RAFT_ENTRY_OP = 0x01;
 
+    /**
+     * WAL operation type for the base marker: {@code [baseIndex:4][baseTerm:4]}.
+     *
+     * <p>WAL records carry a term and a payload but not their absolute index, so
+     * replay infers each index from the record's position. That inference is only
+     * valid if the reader knows which absolute index the first record represents.
+     * Compaction writes this marker as the first record of the same atomic
+     * replacement that drops the prefix, so the base and the entries can never
+     * disagree — including after a crash, where the file is entirely the old
+     * version or entirely the new one.</p>
+     *
+     * <p>Its absence means a log that was never compacted, which starts at 1.</p>
+     */
+    public static final byte RAFT_BASE_OP = 0x02;
+
     private final WriteAheadLog wal;
     private final List<LogEntry> entries = new ArrayList<>();
     private int baseIndex;
@@ -74,17 +89,41 @@ public class RaftLog {
      */
     public RaftLog(WriteAheadLog wal, int baseIndex, int baseTerm) throws IOException {
         this.wal = wal;
-        this.baseIndex = baseIndex;
-        this.baseTerm = baseTerm;
-        this.entries.add(new LogEntry(baseIndex, baseTerm, new byte[0]));
-        if (wal != null) {
-            for (WriteAheadLog.WalEntry walEntry : wal.readAll()) {
-                if (walEntry.operationType() == RAFT_ENTRY_OP) {
-                    byte[] frame = walEntry.payload();
-                    entries.add(new LogEntry(entries.size() + baseIndex, termFromFrame(frame), payloadFromFrame(frame)));
-                }
+        List<WriteAheadLog.WalEntry> persisted =
+                wal == null ? List.of() : wal.readAll();
+
+        // A persisted base marker is authoritative: it was written atomically
+        // with the entries beneath it, so it always describes this exact file.
+        // The caller-supplied base applies only when the log carries no marker
+        // (never compacted, or written before markers existed).
+        int effectiveBase = baseIndex;
+        int effectiveBaseTerm = baseTerm;
+        for (WriteAheadLog.WalEntry walEntry : persisted) {
+            if (walEntry.operationType() == RAFT_BASE_OP) {
+                ByteBuffer marker = ByteBuffer.wrap(walEntry.payload());
+                effectiveBase = marker.getInt();
+                effectiveBaseTerm = marker.getInt();
             }
         }
+
+        this.baseIndex = effectiveBase;
+        this.baseTerm = effectiveBaseTerm;
+        this.entries.add(new LogEntry(effectiveBase, effectiveBaseTerm, new byte[0]));
+        for (WriteAheadLog.WalEntry walEntry : persisted) {
+            if (walEntry.operationType() == RAFT_ENTRY_OP) {
+                byte[] frame = walEntry.payload();
+                entries.add(new LogEntry(entries.size() + effectiveBase,
+                        termFromFrame(frame), payloadFromFrame(frame)));
+            }
+        }
+    }
+
+    /** Encodes the base marker record placed at the head of a replaced log. */
+    private static WriteAheadLog.WalEntry baseMarker(int index, int term) {
+        ByteBuffer buffer = ByteBuffer.allocate(8);
+        buffer.putInt(index);
+        buffer.putInt(term);
+        return new WriteAheadLog.WalEntry(RAFT_BASE_OP, buffer.array());
     }
 
     /**
@@ -185,12 +224,20 @@ public class RaftLog {
             return;
         }
         if (wal != null) {
+            // The retained prefix [firstIndex(), index-1] contains committed
+            // entries. Rewriting it as clear-then-append would leave a window in
+            // which the log is deleted and the survivors are not yet written, so
+            // a crash there destroyed committed state. replaceAll swaps the file
+            // atomically: a crash leaves either the old log or the new one.
+            List<WriteAheadLog.WalEntry> retained = new ArrayList<>();
+            retained.add(baseMarker(baseIndex, baseTerm));
+            for (int i = firstIndex(); i < index; i++) {
+                LogEntry entry = entries.get(i - baseIndex);
+                retained.add(new WriteAheadLog.WalEntry(
+                        RAFT_ENTRY_OP, toFrame(entry.term(), entry.payload())));
+            }
             try {
-                wal.clear();
-                for (int i = firstIndex(); i < index; i++) {
-                    LogEntry entry = entries.get(i - baseIndex);
-                    wal.append(RAFT_ENTRY_OP, toFrame(entry.term(), entry.payload()));
-                }
+                wal.replaceAll(retained);
             } catch (IOException e) {
                 throw new UncheckedIOException("Failed to persist raft log truncation", e);
             }
@@ -204,12 +251,16 @@ public class RaftLog {
      * Drops the prefix {@code [firstIndex() .. snapshotIndex]}, re-basing the
      * log at {@code snapshotIndex}/{@code snapshotTerm} and retaining the
      * absolute tail {@code [snapshotIndex+1 .. lastIndex()]}. The WAL is
-     * rewritten with the retained tail. A no-op when {@code snapshotIndex} is
-     * at or below the current base.
+     * replaced atomically with the retained tail. A no-op when
+     * {@code snapshotIndex} is at or below the current base.
      *
-     * <p>A crash mid-rewrite loses at most the uncommitted tail: everything at
-     * or below the snapshot is already covered by the durable snapshot, and
-     * the applied watermark, so no committed entry is ever lost.</p>
+     * <p>Crash safety comes from the atomic replacement, not from the tail being
+     * uncommitted: a crash leaves either the complete pre-compaction log or the
+     * complete post-compaction log. Entries at or below the snapshot are covered
+     * by the durable snapshot, and the retained tail survives intact either way.
+     * (The previous clear-then-rewrite made the weaker claim that only the
+     * uncommitted tail was at risk; that reasoning did not hold for
+     * {@link #truncateFrom(int)}, whose retained prefix is committed.)</p>
      *
      * @param snapshotIndex The absolute index the snapshot covers.
      * @param snapshotTerm  The term at {@code snapshotIndex}.
@@ -223,11 +274,16 @@ public class RaftLog {
             tail.add(entries.get(i - baseIndex));
         }
         if (wal != null) {
+            // Atomic swap for the same reason as truncateFrom: the retained tail
+            // must never be observable as "deleted but not yet rewritten".
+            List<WriteAheadLog.WalEntry> retained = new ArrayList<>();
+            retained.add(baseMarker(snapshotIndex, snapshotTerm));
+            for (LogEntry entry : tail) {
+                retained.add(new WriteAheadLog.WalEntry(
+                        RAFT_ENTRY_OP, toFrame(entry.term(), entry.payload())));
+            }
             try {
-                wal.clear();
-                for (LogEntry entry : tail) {
-                    wal.append(RAFT_ENTRY_OP, toFrame(entry.term(), entry.payload()));
-                }
+                wal.replaceAll(retained);
             } catch (IOException e) {
                 throw new UncheckedIOException("Failed to persist raft log compaction", e);
             }
@@ -255,8 +311,12 @@ public class RaftLog {
             return;
         }
         if (wal != null) {
+            // An empty log still has to record where it starts: after an
+            // installed snapshot the next entry is snapshotIndex + 1, and a
+            // deleted file would recover as a log starting at 1. Written through
+            // replaceAll so the re-base is atomic like every other rewrite.
             try {
-                wal.clear();
+                wal.replaceAll(List.of(baseMarker(snapshotIndex, snapshotTerm)));
             } catch (IOException e) {
                 throw new UncheckedIOException("Failed to persist raft log reset", e);
             }
