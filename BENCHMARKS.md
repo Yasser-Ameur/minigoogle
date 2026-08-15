@@ -542,3 +542,88 @@ primarily candidate recall (0.7508), not ranking.
 defect was a stage downstream of BM25 that discarded its output entirely. Tuning
 k1/b first would have fitted parameters to compensate for a bug, and any gain
 would have been an artifact of that bug.
+
+---
+
+## QUALITY — title indexing (2026-08-15)
+
+**Benchmark:** `RetrievalOracleDiagnostic` (candidate recall + quality) and
+`TrecCovidRecallDiagnostic` (missed-document classification, rank histogram).
+
+**Datasets:** BEIR trec-covid (171,332 docs / 50 judged queries) and scifact
+(5,183 docs / 300 judged queries), `test` split.
+
+**Environment:** Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, 8 GB heap,
+sequential Gradle invocations only.
+
+**Configuration — identical before and after; ranking untouched:**
+`semantic.enabled=false`, `semantic.hybrid.enabled=false`,
+`semantic.expansion.enabled=false`, `ranking.diversify.enabled=false`,
+`ranking.rerank.enabled=false`, `deepK=100`. BM25 k1/b, PageRank weighting, topK
+and deepK were **not** modified. The only changed variable is whether the
+document title is indexed.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.TrecCovidRecallDiagnostic" \
+  -Dbeir.dir=data/beir/trec-covid -Dbeir.dataset=trec-covid
+```
+
+### Candidate generation
+
+| | before | after |
+|---|---|---|
+| missed relevant judgments (trec-covid) | 6,074 | **4,113** |
+| of which TYPE_A (term present, doc absent) | 1,972 | **11** |
+| never retrieved | 24.6% | **16.7%** |
+
+### Quality
+
+| dataset | metric | before | after | delta |
+|---|---|---|---|---|
+| trec-covid | candidate recall | 0.7508 | **0.8357** | +0.0849 |
+| trec-covid | Recall@100 | 0.0732 | **0.0822** | +12.3% |
+| trec-covid | Recall@10 | 0.0108 | **0.0120** | +11.1% |
+| trec-covid | NDCG@10 | 0.3660 | **0.3890** | +6.3% |
+| trec-covid | MRR@10 | 0.6017 | **0.6093** | +1.3% |
+| scifact | candidate recall | 0.9643 | 0.9643 | 0.0000 |
+| scifact | Recall@100 | 0.8276 | **0.8409** | +1.6% |
+| scifact | Recall@10 | 0.7303 | **0.7360** | +0.8% |
+| scifact | NDCG@10 | 0.5938 | **0.6015** | +1.3% |
+| scifact | MRR@10 | 0.5560 | **0.5641** | +1.5% |
+
+Improvement on both datasets with no regression on either metric — the first
+change in this project's quality work that is unambiguously positive across
+datasets.
+
+### Where relevant documents land (trec-covid, 24,673 judgments)
+
+| rank bucket | before | after |
+|---|---|---|
+| 1–10 | 0.9% | 0.9% |
+| 11–50 | 2.7% | 3.0% |
+| 51–100 | 2.8% | 3.0% |
+| 101–200 | 4.3% | 4.8% |
+| 201–500 | 8.1% | 9.3% |
+| 501–1000 | 8.0% | 9.0% |
+| >1000 | 48.6% | 53.3% |
+| never retrieved | 24.6% | **16.7%** |
+
+The recovered documents move out of "never retrieved" and into the ranked-but-deep
+buckets. That is the honest reading: the fix restores them to the candidate set,
+and ranking then fails to surface most of them.
+
+### Latency
+
+Not measured for this change. Indexing titles enlarges posting lists (mean
+candidate union 51,574 → 55,727 documents on trec-covid, +8%), so a small latency
+increase is expected; no latency claim is made in either direction.
+
+### Interpretation
+
+Only 6.4% of relevant documents reach the top 100 while 53.3% are scored and
+ranked below 1000. Candidate recall is now 0.8357 and ranking is unambiguously
+the dominant remaining loss on trec-covid. scifact NDCG@10 of 0.6015 is close to
+the published BEIR BM25 reference of ~0.665; trec-covid at 0.3890 against ~0.656
+is not.

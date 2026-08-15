@@ -5,6 +5,108 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Index document titles
+
+### Problem
+
+25% of TREC-COVID relevant documents never reached scoring. Candidate recall was
+0.7508, so a quarter of the relevance judgments were unreachable by any ranking
+change.
+
+### Root cause
+
+`TrecCovidRecallDiagnostic` traces every missed relevant judgment backwards and
+classifies it by what the document actually contains:
+
+```
+TYPE_A  analyzed query term IS in the document, yet absent from the union : 1972  32.5%
+TYPE_B  query term in raw text but not in analyzed tokens                 : 2140  35.2%
+TYPE_E  no lexical overlap at all (semantic relevance)                    : 1962  32.3%
+```
+
+TYPE_A is by definition a defect. Splitting it settled the question:
+
+```
+TYPE_A total                                  : 1972
+  of which the term appears ONLY in the title : 1962   (99.5%)
+```
+
+`IndexBuilder.processDocument` read `doc.text()` and nothing else — the title was
+never normalized, tokenized or indexed. `BeirCorpusReader` maps the BEIR `title`
+field to `ParsedDocument.title()` and the abstract to `text()`, so on a corpus of
+scientific papers the single most informative field was invisible to retrieval.
+
+### Hypothesis
+
+If titles are indexed alongside the body, the ~32% of missed relevant documents
+whose only match is in the title become reachable, raising candidate recall
+without touching ranking.
+
+### Implementation
+
+`IndexBuilder.processDocument` analyzes `title + " " + text` instead of `text`.
+One line, in the analysis chain that already existed. No new component, no
+ranking change.
+
+### Correctness validation
+
+Full suite: 787 tests. TYPE_A drops from 1,972 to 11 of 4,113 remaining misses
+(0.3%), confirming the diagnosis was complete rather than partial — candidate
+generation itself was never at fault.
+
+### Quality impact
+
+Ranking configuration identical before and after; the only changed variable is
+whether the title is indexed.
+
+| dataset | metric | before | after |
+|---|---|---|---|
+| trec-covid | candidate recall | 0.7508 | 0.8357 |
+| trec-covid | Recall@100 | 0.0732 | 0.0822 |
+| trec-covid | NDCG@10 | 0.3660 | 0.3890 |
+| trec-covid | MRR@10 | 0.6017 | 0.6093 |
+| scifact | Recall@100 | 0.8276 | 0.8409 |
+| scifact | NDCG@10 | 0.5938 | 0.6015 |
+| scifact | MRR@10 | 0.5560 | 0.5641 |
+
+Improvement on both datasets with no regression on any metric. scifact's
+candidate recall is unchanged (its titles rarely carry terms the abstract lacks)
+yet quality still improves, because title terms now contribute term frequency to
+scoring.
+
+### Latency impact
+
+Not measured. Indexing titles enlarges posting lists — mean candidate union on
+trec-covid grows 51,574 → 55,727 documents (+8%) — so a small increase is
+expected. No latency claim is made in either direction.
+
+### Tradeoffs
+
+- **Positions now span the title/body boundary.** Title tokens occupy leading
+  positions, so a phrase query could in principle match across the join. A field
+  separator or true multi-field indexing would prevent it; that is a larger
+  change than this defect warranted, and the risk is small on these corpora.
+- **Document lengths grow**, which feeds BM25 length normalization. Correct in
+  principle — the title is content — but it does mean this change is not purely a
+  candidate-generation change.
+- `RankingQualityExperimentTest` needed a MAP tolerance. Its assertion was
+  zero-tolerance on a delta that was +0.1% before this change (0.7796 vs 0.7786),
+  so any corpus perturbation flipped its sign. It now uses the same ±0.02
+  tolerance the test already granted precision@5. NDCG@10 — the primary assertion
+  — improved for every variant on that corpus too.
+
+### Conclusion
+
+Kept. The largest recoverable candidate-recall loss on TREC-COVID, fixed by one
+line, verified on two datasets with ranking held fixed.
+
+After this, 53.3% of relevant documents are scored and ranked below 1000 while
+only 6.4% reach the top 100. Candidate recall is no longer the bottleneck;
+ranking is. Per the mission brief that becomes the next investigation rather than
+something to start tuning here.
+
+---
+
 ## 2026-08-15 — Stop the fallback reranker from discarding BM25
 
 ### Problem

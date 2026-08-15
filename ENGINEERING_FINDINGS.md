@@ -1154,3 +1154,121 @@ These are the next two experiments, in that order. BM25 parameters were **not**
 tuned: the evidence says the dominant defect was a stage downstream of BM25, and
 tuning k1/b before removing it would have been fitting parameters to compensate
 for a bug.
+
+---
+
+# P2 Track A2 — TREC-COVID candidate-recall diagnosis (2026-08-15)
+
+## Finding 20 — Document titles were never indexed *(FIXED)*
+
+**Observation:** 25% of TREC-COVID relevant documents never reached scoring.
+`TrecCovidRecallDiagnostic` traces every missed relevant judgment backwards and
+asks what the document actually contains, which classifies the loss:
+
+| class | meaning | count | share |
+|---|---|---|---|
+| TYPE_A | an analyzed query term **is** in the document, yet it is absent from the candidate union | 1,972 | 32.5% |
+| TYPE_B | a query term appears in the raw text but not in the analyzed tokens | 2,140 | 35.2% |
+| TYPE_E | no lexical overlap at all — semantic relevance | 1,962 | 32.3% |
+
+TYPE_A is by definition a defect: the term is present and indexed analysis should
+have produced it. Splitting it further was decisive:
+
+```
+TYPE_A total                                 : 1972
+  of which the term appears ONLY in the title: 1962   (99.5%)
+```
+
+**Root cause:** `IndexBuilder.processDocument` read `doc.text()` and nothing else.
+The title was never normalized, tokenized or indexed. `BeirCorpusReader` maps the
+BEIR `title` field to `ParsedDocument.title()` and the abstract to `text()`, so on
+a corpus of scientific papers the single most informative field was invisible to
+retrieval.
+
+**Fix:** index `title + " " + text`. One line, in the analysis chain that already
+existed.
+
+**Result — candidate generation:**
+
+| | before | after |
+|---|---|---|
+| missed relevant judgments | 6,074 | **4,113** |
+| TYPE_A (defect) | 1,972 | **11** |
+| never retrieved | 24.6% | **16.7%** |
+| mean candidate recall (trec-covid) | 0.7508 | **0.8357** |
+
+TYPE_A is effectively eliminated; the 11 remaining are edge cases, not a pattern.
+
+**Result — quality, ranking configuration untouched:**
+
+| dataset | metric | before | after |
+|---|---|---|---|
+| trec-covid | candidate recall | 0.7508 | **0.8357** |
+| trec-covid | Recall@100 | 0.0732 | **0.0822** |
+| trec-covid | Recall@10 | 0.0108 | **0.0120** |
+| trec-covid | NDCG@10 | 0.3660 | **0.3890** |
+| trec-covid | MRR@10 | 0.6017 | **0.6093** |
+| scifact | candidate recall | 0.9643 | 0.9643 |
+| scifact | Recall@100 | 0.8276 | **0.8409** |
+| scifact | NDCG@10 | 0.5938 | **0.6015** |
+| scifact | MRR@10 | 0.5560 | **0.5641** |
+
+Improvement on **both** datasets with no regression anywhere — unlike the rerank
+change, which was a genuine trade. scifact's candidate recall is unchanged (its
+titles rarely carry terms the abstract lacks) yet its quality still improves,
+because title terms now contribute term frequency to scoring.
+
+**Status: CONFIRMED, FIXED**
+
+## Finding 21 — Ranking, not recall, is now the dominant TREC-COVID loss
+
+Rank histogram over all 24,673 relevant judgments (before the fix):
+
+| rank bucket | share |
+|---|---|
+| 1–10 | 0.9% |
+| 11–50 | 2.7% |
+| 51–100 | 2.8% |
+| 101–200 | 4.3% |
+| 201–500 | 8.1% |
+| 501–1000 | 8.0% |
+| **>1000** | **48.6%** |
+| never retrieved | 24.6% |
+
+Only 6.4% of relevant documents reach the top 100, while **48.6% are scored and
+then ranked below 1000**. After the title fix, never-retrieved drops to 16.7% and
+that mass moves into the ranked-but-deep buckets (>1000 rises to 53.3%).
+
+Per the brief's §14: candidate recall improved materially, and ranking is now
+unambiguously the dominant remaining loss on TREC-COVID. That is the next
+mission, and this one stops here rather than tuning ranking under the guise of a
+recall investigation.
+
+## Rejected and unresolved hypotheses
+
+- **Boolean/planner defect — REJECTED.** After the title fix TYPE_A is 11 of
+  4,113 (0.3%). Production OR candidate generation is not losing documents.
+- **Query expansion — NOT A FACTOR in these measurements.** Expansion was
+  disabled throughout (`semantic.expansion.enabled=false`) so it could not
+  contribute to the numbers above. Its effect is therefore still unmeasured, and
+  the §5 expansion A/B remains open work rather than something this mission
+  answered.
+- **TYPE_B (35.2% before, 52.0% of the smaller remainder after) is not trustworthy
+  as measured.** It is detected with `rawText.contains(stemmedTerm)`, a substring
+  test: the stem `origin` matches `original`, `originally`, `originating`. That
+  over-counts TYPE_B and makes it an upper bound on normalization mismatch, not a
+  measurement. Quantifying it properly needs token-level comparison against the
+  indexed vocabulary, and no normalization change should be made on this evidence.
+- **TYPE_E (32.3% before) is not a retrieval-engineering problem.** Those
+  documents share no lexical overlap with the query. Boolean set algebra cannot
+  reach them; that is what the semantic/hybrid path exists for.
+
+## Pre-existing failure, attributed
+
+`RaftConsensusConfigChangeTest.testRemoveNodeAndRemovedNodeStopsCountingTowardQuorum`
+fails when the class is run in isolation and intermittently in the full suite
+(`expected [a, b] but was [c, b, a]` — a removed member still in the committed
+configuration). It is **not** caused by this mission or by the P1 Raft work:
+verified failing 3/3 at commit `eb70915`, before the leadership no-op existed, and
+4/4 at `eab8dd4` without the title change. Recorded here rather than fixed, since
+it is unrelated to candidate recall.
