@@ -5,6 +5,113 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Make retrieval return results at all (P2 baseline)
+
+### Problem
+
+On the mandated BEIR TREC-COVID baseline the engine returned **zero results for
+all 50 queries**, at a p50 latency of 10.4 s. Not poor ranking — no ranking.
+NDCG@10, Recall@100, MRR@10 and MAP@100 were all exactly 0.0000.
+
+Two independent defects, both invisible to the project's own synthetic harness:
+
+1. **Index/query analysis asymmetry.** `IndexBuilder.java:59` drops stop words, so
+   `the`, `of`, `is` are never in the dictionary. Nothing dropped them on the
+   query path, and `Parser` joined adjacent terms with implicit AND — so
+   `"what is the origin of COVID-19"` required a document containing `the`, which
+   the index cannot represent. One stop word anywhere guaranteed ∅.
+2. **Implicit AND is the wrong retrieval model.** Fixing (1) alone still left
+   299/300 scifact queries empty: the stop list has 33 entries and no question
+   words, and requiring all of `"0-dimensional biomaterials lack inductive
+   properties"` in one document is unsatisfiable regardless.
+
+### Hypothesis
+
+If query analysis mirrors index analysis and adjacent terms are combined
+disjunctively with BM25 deciding the order — the standard bag-of-words model —
+retrieval returns ranked results without changing explicit boolean semantics.
+
+### Implementation
+
+- `QueryStopWordFilter` — removes stop words from the token stream using the same
+  normalize → fold pipeline the indexer uses. Applied only when the query carries
+  no explicit `AND`/`OR`/`NOT`/parentheses, since removing an operand from an
+  explicit expression would leave a dangling operator and silently rewrite what
+  the user wrote. Phrase tokens are never modified.
+- `Parser.ImplicitOperator`, defaulting to `OR`. Explicit operators are
+  unaffected; `ImplicitOperator.AND` remains available for boolean filtering.
+
+### Correctness validation
+
+- `QueryStopWordFilterTest` — 9 tests: stop words dropped, case folding matches
+  the indexer, explicit boolean queries and parenthesised queries left byte-identical,
+  all-stop-word queries left unchanged, phrases untouched.
+- `ParserTest` / `ASTBuilderTest` — the implicit default is OR, explicit `AND`
+  still builds an `AndNode`, and `ImplicitOperator.AND` still works.
+- `SearchEnginePhraseTest` — a document matching both terms must outrank one
+  matching a single term, and `java AND compiler` still excludes single-term
+  documents.
+- Full suite: **784 tests, 0 failures**.
+
+Four existing tests failed and were updated. Each pinned the old implicit-AND
+default; none pinned behaviour that is still correct. They were rewritten to
+assert the new contract *and* to keep AND coverage, not deleted.
+
+### Performance validation
+
+TREC-COVID (171,332 docs, 50 judged queries, topK=100, lexical only):
+
+| metric | before | after |
+|---|---|---|
+| queries returning zero | 50 / 50 | 0 / 50 |
+| latency p50 | 10,383 ms | 350 ms |
+| latency p99 | 37,338 ms | 781 ms |
+
+The latency change is a **consequence of the fix, not an optimization**: every
+query previously returned ∅ and so entered the spell-correction fallback, which
+runs `SpellCorrector.correct` per token over the whole vocabulary and re-executes
+the query. No retrieval algorithm was optimized here.
+
+### Quality validation
+
+| dataset | metric | before | after |
+|---|---|---|---|
+| trec-covid | NDCG@10 | 0.0000 | 0.4027 |
+| trec-covid | Recall@100 | 0.0000 | 0.0732 |
+| scifact | NDCG@10 | 0.0033 | 0.2647 |
+| scifact | Recall@100 | 0.0033 | 0.8276 |
+
+Published BEIR BM25 baselines are ~0.656 (trec-covid) and ~0.665 (scifact).
+MiniGoogle is now functional and in a defensible range, **not at parity**.
+TREC-COVID Recall@100 is structurally capped near 0.1–0.2 by ~1,300 judgments per
+query, so NDCG@10 is the meaningful signal there.
+
+### Tradeoffs
+
+- **A documented default changed.** Adjacent terms now OR rather than AND. Users
+  relying on implicit conjunction must write explicit `AND`. This is the correct
+  default for ranked retrieval and the wrong one for boolean filtering; both
+  remain reachable.
+- **Stop-word filtering is skipped for explicit boolean queries**, so
+  `covid AND the` still returns nothing. Fixing it needs operator repair in the
+  token stream; the conservative behaviour was preferred over silently rewriting
+  a user's expression.
+- **Phrases containing stop words still cannot match**, because the index stores
+  empty placeholders where stop words were. Stripping words from a phrase would
+  change adjacency and is not a fix.
+
+### Conclusion
+
+Kept. This was the precondition for the rest of the mission: every latency,
+memory and throughput measurement the brief asks for would otherwise have been
+measuring the cost of returning the empty set.
+
+H1 (WAND), H2 (skip structures) and H3 (postings representation) were
+deliberately **not** attempted — they are optimizations of a path that did not
+work. They are now measurable for the first time.
+
+---
+
 ## 2026-08-15 — Make Raft persistence crash-safe (P1)
 
 ### Problem

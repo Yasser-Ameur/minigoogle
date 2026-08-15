@@ -380,3 +380,90 @@ mid-append.
 The durability guarantee is affordable in the only sense that matters: nothing
 on the hot path got slower, and the operations that were previously unsafe also
 got substantially faster. There was no correctness/performance trade to make.
+
+---
+
+## BEIR retrieval baseline (2026-08-15) — QUALITY + END_TO_END
+
+**Benchmark:** `BeirRetrievalDiagnostic` — drives the production
+`SearchEngine.retrieveCandidates` per query and reports result counts, latency
+and quality. It exists because the `corpusEval` harness reports aggregates only,
+which cannot distinguish "ranked the wrong documents" from "returned nothing".
+
+**Datasets:** BEIR, present in `data/beir/`.
+
+| dataset | docs | judged queries | judgments |
+|---|---|---|---|
+| trec-covid | 171,332 | 50 | 66,337 |
+| scifact | 5,183 | 300 | 339 (test) |
+
+**Environment:** Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, 8 GB heap.
+
+**Configuration:** lexical only (`semantic.enabled=false`,
+`semantic.hybrid.enabled=false`, `semantic.expansion.enabled=false`),
+`ranking.diversify.enabled=false`, topK=100. Semantic and diversification are
+disabled so the measurement isolates the lexical retrieval path under test.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.BeirRetrievalDiagnostic" \
+  -Dbeir.dir=data/beir/trec-covid -Dbeir.dataset=trec-covid
+```
+
+`bench` now forwards `-Dbeir.*` and runs with an 8 GB heap; the benchmark
+disables itself when `-Dbeir.dir` is absent, so a plain `gradlew bench` is
+unaffected.
+
+**Methodology note:** index build is measured and reported separately
+(116–133 s for TREC-COVID) and excluded from query latency. Query latency is
+measured per query around `retrieveCandidates` only. There is no warmup phase —
+these are 50 and 300 query runs on a cold engine, so the figures include JIT
+warmup and should be read as end-to-end serving latency for a freshly started
+node, not steady-state.
+
+### Baseline → after
+
+**TREC-COVID** (171,332 docs, 50 judged queries, topK=100):
+
+| metric | baseline (implicit AND) | after (implicit OR) |
+|---|---|---|
+| queries returning zero results | 50 / 50 | 0 / 50 |
+| results returned (median) | 0 | 100 |
+| NDCG@10 | 0.0000 | **0.4027** |
+| Recall@100 | 0.0000 | **0.0732** |
+| latency p50 | 10,383 ms | **350 ms** |
+| latency p95 | 27,334 ms | **665 ms** |
+| latency p99 | 37,338 ms | **781 ms** |
+
+**scifact** (5,183 docs, 300 judged queries, topK=100):
+
+| metric | baseline | after |
+|---|---|---|
+| queries returning zero results | 299 / 300 | 0 / 300 |
+| NDCG@10 | 0.0033 | **0.2647** |
+| Recall@100 | 0.0033 | **0.8276** |
+| latency p50 | 937 ms | **183 ms** |
+
+**Index size (TREC-COVID):** postings 233.7 MB, documents 31.9 MB, dictionary
+3.9 MB — 270 MB total for a 212 MB corpus, i.e. **127% of corpus** against the
+`Benchmark.md` target of < 40%. Unchanged by this work and recorded as an open
+gap.
+
+### Interpretation
+
+The latency improvement is **a consequence of the correctness fix, not an
+optimization**. Every query previously returned the empty set and therefore
+entered the spell-correction fallback, which runs `SpellCorrector.correct` per
+token against the full vocabulary and re-executes the query. Removing the cause
+of the empty result removed that path. No retrieval algorithm was optimized in
+producing these numbers.
+
+The honest framing of the quality figures: published BEIR BM25 baselines are
+~0.656 NDCG@10 on TREC-COVID and ~0.665 on scifact. MiniGoogle now reaches 0.403
+and 0.265. Retrieval works and is in a defensible range; it is not at parity with
+a tuned BM25 implementation.
+
+Recall@100 on TREC-COVID is structurally capped: with ~1,300 judgments per query,
+a top-100 run cannot exceed roughly 0.1–0.2. NDCG@10 is the meaningful signal on
+that dataset; Recall@100 is meaningful on scifact, where it reaches 0.83.

@@ -836,3 +836,197 @@ they now assert that a crash was actually injected before drawing a conclusion.
 4. **`maybeSnapshot` is still two operations**, not one atomic unit. The base
    marker makes the interrupted state *recoverable and consistent*, not
    *impossible*.
+
+---
+
+# P2 Baseline — retrieval on TREC-COVID (2026-08-15)
+
+## Finding 14 — The engine returns zero results for every realistic query
+
+**Observation:** on the mandated BEIR TREC-COVID baseline, retrieval returns
+nothing at all — not poor ranking, no ranking.
+
+**Evidence** (`BeirRetrievalDiagnostic`, 171,332 docs, 50 judged queries,
+topK=100, semantic disabled to isolate the lexical path):
+
+```
+queries returning ZERO results : 50 / 50
+results returned  min=0 median=0 max=0
+latency ms        p50=10383 p95=27334 p99=37338
+NDCG@10  = 0.0000
+Recall@100 = 0.0000
+```
+
+The `corpusEval` harness reports the same all-zero metrics. It aggregates only,
+so it could not distinguish "ranked the wrong documents" from "returned nothing";
+the per-query diagnostic separates the two.
+
+**Root cause — an asymmetry between indexing and querying:**
+
+1. `IndexBuilder.java:59` drops stopwords at index time, so `what`, `is`, `the`,
+   `of` are **never in the dictionary**.
+2. There is no stopword filtering anywhere on the query path (`query/**`,
+   `SearchEngine`). The `StopWordFilter` in `SearchEngineBuilder:85` builds the
+   autocomplete vocabulary, not the query.
+3. `Parser.java:52-54` joins adjacent words with **implicit AND**.
+
+So `"what is the origin of COVID-19"` becomes
+`what AND is AND the AND origin AND of AND covid AND 19`. Each stopword resolves
+through `QueryPlanner.visit(WordNode)` to a dictionary miss → empty `PostingList`
+→ intersection with empty → **∅**. One stopword anywhere in a query is
+sufficient. Every TREC-COVID query is a natural-language question, so all 50 fail.
+
+**Why this was invisible until now:** the project's synthetic harness
+(`SyntheticCorpus`) generates keyword-style queries with no stopwords, and scored
+NDCG@10 = 0.7477. The corpus could not exercise the defect it was being used to
+validate. This is the clearest possible argument for evaluating on a real corpus:
+a 0.75 NDCG on synthetic data coexisted with total retrieval failure on real data.
+
+**Status: CONFIRMED**
+
+## Finding 15 — Ranking runs before candidate pruning, and truncates first
+
+**Observation:** `SearchEngine.retrieveCandidates` scores the OR-union of all
+query terms, takes the union's top-K, and only then filters to the documents
+that satisfy the boolean query.
+
+**Evidence** (`SearchEngine.java:212-222`):
+
+```java
+ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
+Set<Integer> matchedDocIds = results.getPostings().stream()
+        .map(Posting::getDocumentId).collect(Collectors.toSet());
+ranked = ranked.stream()
+        .filter(r -> matchedDocIds.contains(r.documentId()))
+        .collect(Collectors.toList());
+```
+
+`RankingPipeline.rank` returns at most `topK`. Filtering *after* that truncation
+means a document satisfying the query is discarded unless it also ranks in the
+union's top-K. Result count is therefore capped below `topK` and can reach zero
+even when the matched set is large — a hard ceiling on Recall@K independent of
+ranking quality.
+
+The performance consequence is the same defect seen from the other side: work is
+proportional to the union, while only the matched set can ever be returned.
+
+**Status: CONFIRMED** (masked by Finding 14 — cannot be measured until retrieval
+returns anything)
+
+## Finding 16 — Latency is dominated by the empty-result fallback
+
+**Observation:** p50 of 10.4 s per query on a corpus this size is not explained
+by scoring alone.
+
+**Evidence:** when the boolean result is empty, `SearchEngine` runs the spell
+correction fallback, which calls `SpellCorrector.correct` per token against the
+full 171k-document vocabulary, then re-parses and re-executes the whole query.
+Every query takes this path because every query returns ∅ (Finding 14).
+
+**Status: CONFIRMED as the likely dominant cost; the attribution is reasoned from
+the code path, not yet profiled.** Re-measure after Finding 14 is fixed, since
+most queries will then never enter this path.
+
+## Consequence for this mission
+
+The brief asks for lower latency, better memory and higher throughput on the real
+search path. None of those numbers mean anything while the path returns ∅ for
+every realistic query: a benchmark of a function that returns the empty set is
+measuring the cost of failing.
+
+Retrieval correctness is therefore the precondition, not a detour. Order of work:
+fix the index/query stopword asymmetry (Finding 14), re-baseline, then address
+Finding 15, then optimize what profiling shows to be dominant.
+
+## Finding 17 — Implicit AND is the wrong retrieval model for these queries *(FIXED)*
+
+**Observation:** fixing the stop-word asymmetry (Finding 14) did **not** fix
+retrieval. Measured on BEIR scifact after that fix alone:
+
+```
+queries returning ZERO results : 299 / 300
+NDCG@10 = 0.0033   Recall@100 = 0.0033
+```
+
+**Evidence:** the stop list has 33 entries and covers function words
+(`is`, `the`, `of`) but not question words (`what`, `how`, `does`). More
+fundamentally, `Parser` joined adjacent terms with **AND**, so a scifact query
+like `"0-dimensional biomaterials lack inductive properties"` required a single
+document containing all five terms. That is boolean filtering, not ranked
+retrieval, and it is unsatisfiable for essentially every natural-language query.
+
+**Fix:** `Parser.ImplicitOperator`, defaulting to `OR`. Adjacent terms are
+disjunctive and BM25 decides the order, which is the standard bag-of-words model:
+a document matching more of the query outranks one matching less, but partial
+matches still compete rather than being discarded. Explicit `AND`/`OR`/`NOT`
+continue to mean exactly what they say, and `ImplicitOperator.AND` remains
+available for boolean filtering.
+
+**This also resolves Finding 15 in practice.** With a disjunctive query the
+matched set *is* the scored union, so `SearchEngine`'s rank-then-filter step no
+longer discards anything: the post-ranking filter became a no-op rather than a
+recall ceiling. The underlying ordering issue remains latent for explicit-AND
+queries and is recorded as still open.
+
+**Result — BEIR scifact** (5,183 docs, 300 judged queries, topK=100, lexical only):
+
+| metric | implicit AND | implicit OR |
+|---|---|---|
+| queries returning zero | 299 / 300 | **0 / 300** |
+| median results | 0 | 100 |
+| NDCG@10 | 0.0033 | **0.2647** |
+| Recall@100 | 0.0033 | **0.8276** |
+| latency p50 | 937 ms | **183 ms** |
+
+**Result — BEIR TREC-COVID** (171,332 docs, 50 judged queries, topK=100):
+
+| metric | implicit AND | implicit OR |
+|---|---|---|
+| queries returning zero | 50 / 50 | **0 / 50** |
+| median results | 0 | 100 |
+| NDCG@10 | 0.0000 | **0.4027** |
+| Recall@100 | 0.0000 | **0.0732** |
+| latency p50 | 10,383 ms | **350 ms** |
+| latency p99 | 37,338 ms | **781 ms** |
+
+**On the latency improvement:** it is a side effect of correctness, not an
+optimization. Every query previously returned ∅ and therefore entered the
+spell-correction fallback, which runs `SpellCorrector.correct` per token against
+the full vocabulary and then re-parses and re-executes the query. That confirms
+Finding 16 by removing its cause.
+
+**On Recall@100 = 0.0732 for TREC-COVID:** this looks alarming next to scifact's
+0.83 but is largely structural. TREC-COVID has 66,337 judgments across 50 queries
+(~1,300 per query), so a top-100 run cannot exceed roughly 0.1–0.2 recall no
+matter how good it is. NDCG@10 is the meaningful quality signal on this dataset.
+
+**Reference point, stated honestly:** published BEIR BM25 baselines are ~0.656
+NDCG@10 for TREC-COVID and ~0.665 for scifact. MiniGoogle now reaches 0.403 and
+0.265. Retrieval works and is in a defensible range; it is not at parity with a
+tuned BM25 implementation, and claiming otherwise would be false.
+
+**Status: CONFIRMED, FIXED**
+
+## What this mission did not do, and why
+
+The brief's hypotheses H1 (WAND early termination), H2 (skip structures) and
+H3 (postings representation) were **not** implemented. The baseline step showed
+the engine returned zero results for every query on the mandated corpus, so
+every latency, memory and throughput figure would have been measuring the cost of
+returning ∅. Optimizing that would have been optimizing failure.
+
+Those hypotheses are now genuinely measurable for the first time, on a path that
+returns real results. The correctness oracle the brief asks for (§7) is currently
+trivial — retrieval is exhaustive, with no early termination — so it becomes
+necessary precisely when H1 is attempted, not before.
+
+**Remaining bottlenecks, ranked by measured impact:**
+
+1. **Ranking quality gap.** NDCG@10 0.403 vs ~0.656 reference on TREC-COVID. The
+   largest remaining gap, and it is quality, not speed.
+2. **p50 350 ms / p99 781 ms on 171k docs.** Now worth profiling: the union is
+   scored exhaustively with no early termination (H1) over boxed postings (H3).
+3. **Index size 270 MB for a 212 MB corpus** (postings 234 MB) — 127% of corpus
+   against the `Benchmark.md` target of < 40%. Untouched by this work.
+4. **`SpellCorrector` on the empty-result path** is still O(vocabulary) per token;
+   it is simply no longer hit by most queries.
