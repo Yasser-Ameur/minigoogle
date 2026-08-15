@@ -467,3 +467,78 @@ a tuned BM25 implementation.
 Recall@100 on TREC-COVID is structurally capped: with ~1,300 judgments per query,
 a top-100 run cannot exceed roughly 0.1–0.2. NDCG@10 is the meaningful signal on
 that dataset; Recall@100 is meaningful on scifact, where it reaches 0.83.
+
+---
+
+## QUALITY — rerank stage A/B (2026-08-15)
+
+**Benchmark:** `RetrievalOracleDiagnostic` (DIAGNOSTIC + QUALITY). Reconstructs
+the exhaustive candidate union independently of `SearchEngine` to separate a
+recall failure from a ranking failure, then evaluates the production path.
+
+**Datasets:** BEIR scifact (5,183 docs / 300 judged queries) and trec-covid
+(171,332 docs / 50 judged queries), `test` split.
+
+**Environment:** Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, 8 GB heap.
+
+**Configuration:** lexical only (`semantic.enabled=false`), diversification off,
+`deepK=100`. The only variable between runs is `ranking.rerank.enabled`.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.RetrievalOracleDiagnostic" \
+  -Dbeir.dir=data/beir/scifact -Dbeir.dataset=scifact \
+  -Dbeir.deepK=100 -Dbeir.rerank=false
+```
+
+### Is it recall or ranking?
+
+| dataset | candidate recall | Recall@1000 | Recall@100 | Recall@10 |
+|---|---|---|---|---|
+| scifact | 0.9643 | 0.9377 | 0.5259 | 0.2497 |
+| trec-covid | 0.7508 | 0.2732 | 0.0732 | 0.0108 |
+
+scifact: 96% of relevant documents reach scoring, so the loss is ranking.
+trec-covid: 25% never reach scoring, so it has a real recall component too.
+
+### Rerank stage, controlled
+
+| dataset | metric | rerank ON | rerank OFF | delta |
+|---|---|---|---|---|
+| scifact | NDCG@10 | 0.2647 | **0.5938** | **+0.3291** |
+| scifact | Recall@10 | 0.4153 | **0.7303** | +0.3150 |
+| scifact | MRR@10 | 0.2198 | **0.5560** | +0.3362 |
+| scifact | Recall@100 | 0.8276 | 0.8276 | 0.0000 |
+| trec-covid | NDCG@10 | **0.4027** | 0.3660 | −0.0367 |
+| trec-covid | MRR@10 | **0.6489** | 0.6017 | −0.0472 |
+| trec-covid | Recall@100 | 0.0732 | 0.0732 | 0.0000 |
+
+`Recall@100` is unchanged on both, as it must be — reranking reorders a set
+without changing its membership. That invariance is a useful check that the two
+runs really are apples-to-apples.
+
+### Interpretation
+
+Not a clean sweep, and reported as such. Disabling the fallback reranker is worth
++0.329 NDCG@10 on scifact and −0.037 on trec-covid. The decision rests on the
+magnitude ratio (~9:1) plus the design argument: with no vector index the stage
+replaces a calibrated BM25 + PageRank score with an uncalibrated term-overlap
+fraction computed against a 150-character snippet. Its occasional benefit on a
+corpus with ~1,300 judgments per query is treated as incidental.
+
+`ranking.rerank.enabled` therefore defaults to `semantic.enabled`: the semantic
+path blends cosine similarity *with* the normalized lexical score and is kept;
+the lexical-only fallback is not.
+
+**Reference points:** published BEIR BM25 baselines are ~0.665 (scifact) and
+~0.656 (trec-covid). Lexical-only MiniGoogle now reaches 0.5938 and 0.3660.
+scifact is close to reference; trec-covid is not, and its remaining gap is
+primarily candidate recall (0.7508), not ranking.
+
+### Rejected
+
+**BM25 parameter tuning was not attempted.** The measurement showed the dominant
+defect was a stage downstream of BM25 that discarded its output entirely. Tuning
+k1/b first would have fitted parameters to compensate for a bug, and any gain
+would have been an artifact of that bug.

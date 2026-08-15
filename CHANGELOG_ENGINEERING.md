@@ -5,6 +5,92 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Stop the fallback reranker from discarding BM25
+
+### Problem
+
+NDCG@10 changed with `topK` on a fixed corpus and query set — 0.2647 at topK=100,
+0.1716 at topK=1000. Ranking quality must not depend on how many results are
+requested, so something was reordering whatever pool it was handed.
+
+`SearchEngine:263` called `reranker.rerank(query, ranked)` unconditionally, and
+`SearchEngineBuilder:139` builds `new CrossEncoderRanker()` with a null vector
+index whenever `semantic.enabled=false`. In that state `rerank` falls through to
+`rerankByTermOverlap`, which computes a term-overlap fraction against the
+150-character snippet and **replaces** `finalScore` with it. The fused BM25 +
+PageRank score was computed, used to select the top-K, then discarded for
+ordering. A coarse fraction in [0,1] also ties heavily, and ties resolved
+arbitrarily. A larger pool meant more damage, which is what the `topK`
+sensitivity was.
+
+### Hypothesis
+
+Ranking quality is being destroyed downstream of BM25, not produced by it. If the
+fallback reranker is removed, lexical ranking should improve substantially
+without any change to BM25 itself.
+
+### Implementation
+
+`ranking.rerank.enabled`, defaulting to the value of `semantic.enabled`.
+`SearchEngine` consults it before invoking the reranker.
+
+The semantic path is untouched and stays on: with a vector index the reranker
+blends cosine similarity with the normalized lexical score
+(`(1-w)·normalizedLexical + w·semantic`), which preserves the lexical signal.
+Only the lexical-only fallback — which replaces rather than blends — is gated off.
+
+### Correctness validation
+
+Full suite: **784 tests, 0 failures**. `Recall@100` is bit-identical with the
+stage on and off on both datasets (0.8276 scifact, 0.0732 trec-covid), which is
+the expected invariant: reranking reorders a set without changing its membership.
+That invariance also confirms the two runs are apples-to-apples.
+
+### Quality impact
+
+Identical corpus, queries, judgments and configuration; only the flag differs.
+
+| dataset | metric | rerank ON | rerank OFF |
+|---|---|---|---|
+| scifact | NDCG@10 | 0.2647 | 0.5938 |
+| scifact | Recall@10 | 0.4153 | 0.7303 |
+| scifact | MRR@10 | 0.2198 | 0.5560 |
+| trec-covid | NDCG@10 | 0.4027 | 0.3660 |
+| trec-covid | MRR@10 | 0.6489 | 0.6017 |
+
+**The result is mixed and is not smoothed over.** Disabling the fallback gains
++0.329 NDCG@10 on scifact and loses 0.037 on trec-covid. On a corpus with ~1,300
+judgments per query, where many documents are broadly on-topic, crude term
+overlap evidently acts as a weak precision filter at rank 10.
+
+The decision rests on the ~9:1 magnitude ratio plus the design argument: replacing
+a calibrated score with an uncalibrated fraction is not a defensible ranking
+mechanism, so its occasional benefit is treated as incidental rather than as
+evidence for the technique.
+
+### Performance impact
+
+Not measured as part of this change. The stage runs over at most `topK`
+documents, so its cost is bounded and small relative to candidate scoring; no
+latency claim is made either way.
+
+### Tradeoffs
+
+- TREC-COVID NDCG@10 regresses 0.4027 → 0.3660. Accepted deliberately, recorded
+  in `BENCHMARKS.md`, and reversible with `ranking.rerank.enabled=true`.
+- The flag adds a configuration surface. It exists because the stage needed to be
+  a controlled experimental variable, and it stays for the same reason.
+
+### Conclusion
+
+Kept. The largest single quality defect found in this mission, and it was
+downstream of the ranking formula rather than in it — which is why BM25
+parameters were deliberately not tuned first. Tuning k1/b to compensate for a
+stage that discarded BM25's output would have produced gains that were artifacts
+of the bug.
+
+---
+
 ## 2026-08-15 — Make retrieval return results at all (P2 baseline)
 
 ### Problem

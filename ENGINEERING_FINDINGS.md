@@ -1030,3 +1030,127 @@ necessary precisely when H1 is attempted, not before.
    against the `Benchmark.md` target of < 40%. Untouched by this work.
 4. **`SpellCorrector` on the empty-result path** is still O(vocabulary) per token;
    it is simply no longer hit by most queries.
+
+---
+
+# P2 Track A — is 0.4027 a recall problem or a ranking problem? (2026-08-15)
+
+## Finding 18 — Measured: it is predominantly a ranking problem
+
+**Observation:** the brief's first question, answered before touching any ranking
+formula.
+
+**Experiment:** `RetrievalOracleDiagnostic` reconstructs the exhaustive candidate
+union independently of `SearchEngine` — executing each analyzed term through the
+planner and unioning the posting lists — then compares it against the judgments.
+Retrieval is exhaustive, so that union *is* the set of documents that reached
+scoring. Candidate recall therefore separates the two failure modes exactly.
+
+**Result (scifact, 5,183 docs, 300 judged queries, lexical only):**
+
+```
+mean candidate union : 2130 docs (41.1% of corpus)
+CANDIDATE RECALL     : 0.9643   <- relevant docs that reached scoring
+Recall@1000          : 0.9377
+Recall@100           : 0.5259
+Recall@10            : 0.2497
+
+reached scoring but not returned in top-100 : 0.4384 of relevant
+never reached scoring at all                : 0.0357 of relevant
+```
+
+96% of relevant documents were scored and then ranked below the cutoff. Only 3.6%
+were lost by candidate generation.
+
+**Result (trec-covid, 171,332 docs, 50 judged queries):**
+
+```
+mean candidate union : 51574 docs (30.1% of corpus)
+CANDIDATE RECALL     : 0.7508
+Recall@1000          : 0.2732
+Recall@100           : 0.0732
+```
+
+Mixed here: 25% of relevant documents never reach scoring, so TREC-COVID has a
+genuine recall component in addition to the ranking one.
+
+**Conclusion:** ranking dominates. Set algebra and candidate generation were not
+the bottleneck, so no work was spent on them.
+
+**Status: CONFIRMED**
+
+## Finding 19 — The cross-encoder fallback discards BM25 entirely *(FIXED)*
+
+**Observation:** NDCG@10 changed with `topK` (0.2647 at 100, 0.1716 at 1000) on
+the same corpus and query set. Ranking quality must not depend on how many
+results are requested — that pointed at a stage that reorders whatever pool it is
+given.
+
+**Evidence:** `SearchEngine.java:263` called `reranker.rerank(query, ranked)`
+unconditionally. `SearchEngineBuilder.java:139` constructs
+`new CrossEncoderRanker()` — with a null vector index — whenever
+`semantic.enabled=false`. In that state `rerank` falls through to
+`rerankByTermOverlap`, which computes
+
+```java
+double score = scoreWith(query, doc.title(), doc.snippet());
+```
+
+and **replaces** `finalScore` with it. So the final ordering was a term-overlap
+fraction measured against a 150-character snippet, and the fused BM25 + PageRank
+score — the entire lexical ranking — was computed, used to select the top-K, and
+then thrown away. A coarse fraction in [0,1] also produces heavy ties, which then
+resolve arbitrarily.
+
+Enlarging the pool enlarges the damage, which is exactly the `topK` sensitivity
+that exposed it.
+
+**Experiment:** `ranking.rerank.enabled` makes the stage a controlled variable.
+Identical corpus, queries, judgments, `deepK=100`, lexical-only configuration;
+only the flag differs.
+
+| dataset | metric | rerank ON | rerank OFF |
+|---|---|---|---|
+| scifact | NDCG@10 | 0.2647 | **0.5938** |
+| scifact | Recall@10 | 0.4153 | **0.7303** |
+| scifact | MRR@10 | 0.2198 | **0.5560** |
+| trec-covid | NDCG@10 | **0.4027** | 0.3660 |
+| trec-covid | MRR@10 | **0.6489** | 0.6017 |
+
+`Recall@100` is identical either way (0.8276 / 0.0732), as it must be: reranking
+reorders a set without changing its membership.
+
+**The result is mixed, and that is reported rather than smoothed.** Disabling the
+fallback is worth +0.329 NDCG@10 on scifact and −0.037 on trec-covid — a ratio of
+roughly 9:1 in favour of disabling, but not a clean sweep. On TREC-COVID, where
+~1,300 documents per query are judged and many are broadly on-topic, crude term
+overlap evidently acts as a weak precision filter at rank 10.
+
+**Decision:** `ranking.rerank.enabled` defaults to the value of
+`semantic.enabled`. With a vector index the reranker blends a real cosine
+similarity with the normalized lexical score
+(`(1-w)·normalizedLexical + w·semantic`) and preserves the lexical signal — that
+path is principled and stays on. Without one it replaces a calibrated score with
+an uncalibrated fraction, which is not a defensible ranking design regardless of
+where it happens to help. The TREC-COVID gain is treated as incidental, not as
+evidence for the technique.
+
+**Status: CONFIRMED, FIXED**
+
+## Remaining quality gap, measured
+
+With the fallback disabled, lexical-only NDCG@10 is 0.5938 (scifact) and 0.3660
+(trec-covid) against published BEIR BM25 references of ~0.665 and ~0.656. scifact
+is now close; TREC-COVID is not, and its diagnosis is different:
+
+1. **Candidate recall 0.7508** — a quarter of relevant documents never reach
+   scoring. That is an analysis/expansion/recall problem, not a ranking one, and
+   it is the largest remaining TREC-COVID gap.
+2. Recall@1000 is 0.2732 against Recall@100 of 0.0732, so of the documents that
+   *are* scored, many sit between ranks 100 and 1000 — a genuine ranking
+   component on top of the recall gap.
+
+These are the next two experiments, in that order. BM25 parameters were **not**
+tuned: the evidence says the dominant defect was a stage downstream of BM25, and
+tuning k1/b before removing it would have been fitting parameters to compensate
+for a bug.
