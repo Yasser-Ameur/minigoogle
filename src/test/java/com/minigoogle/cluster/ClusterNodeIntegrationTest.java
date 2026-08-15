@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ClusterNodeIntegrationTest {
@@ -156,13 +157,57 @@ class ClusterNodeIntegrationTest {
         assertTrue(waitUntil(() -> exactlyOneLeader(), CONVERGENCE_DEADLINE_MS),
                 "No single leader elected over the transport");
 
-        RaftConsensus leader = currentLeader();
-        int index = leader.appendEntry("replicate-me".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        // Leadership is not stable across the append-and-verify cycle. Two
+        // distinct races make a single-shot attempt flaky:
+        //   1. An election can fire between locating the leader and appending,
+        //      so the node rejects the append ("Only the leader may append").
+        //   2. A leader that accepts an entry and then loses leadership before
+        //      replicating it never replicates that entry at all — Raft
+        //      explicitly permits discarding uncommitted entries on a term
+        //      change, so waiting on that index forever is simply wrong.
+        // Retry the whole cycle against the current leader until one attempt
+        // carries an entry all the way to replication and commit. This asserts
+        // the real property (the cluster eventually replicates and commits over
+        // real HTTP) without weakening either check.
+        long overallDeadline = System.currentTimeMillis() + 30_000;
+        boolean replicatedAndCommitted = false;
+        int attempts = 0;
 
-        assertTrue(waitUntil(() -> followersReplicated(index), CONVERGENCE_DEADLINE_MS),
-                "The entry must replicate to every follower over real HTTP");
-        assertTrue(waitUntil(() -> leader.getCommitIndex() >= index, CONVERGENCE_DEADLINE_MS),
-                "The leader must commit the entry once a majority has replicated it");
+        while (System.currentTimeMillis() < overallDeadline && !replicatedAndCommitted) {
+            final RaftConsensus leader;
+            final int index;
+            try {
+                leader = currentLeader();
+                index = leader.appendEntry(
+                        "replicate-me".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (IllegalStateException | AssertionError leadershipChanged) {
+                Thread.sleep(20);
+                continue;
+            }
+            attempts++;
+
+            // Stop waiting the moment leadership is lost: this attempt's entry
+            // may never replicate, and the next iteration retries on the new
+            // leader rather than burning the deadline on a doomed index.
+            boolean stillLeader = waitUntil(
+                    () -> followersReplicated(index)
+                            || leader.getState() != RaftConsensus.RaftState.LEADER,
+                    CONVERGENCE_DEADLINE_MS)
+                    && leader.getState() == RaftConsensus.RaftState.LEADER;
+            if (!stillLeader) {
+                continue;
+            }
+
+            waitUntil(() -> leader.getCommitIndex() >= index
+                            || leader.getState() != RaftConsensus.RaftState.LEADER,
+                    CONVERGENCE_DEADLINE_MS);
+            replicatedAndCommitted = followersReplicated(index)
+                    && leader.getCommitIndex() >= index;
+        }
+
+        assertTrue(replicatedAndCommitted,
+                "An entry must replicate to every follower over real HTTP and commit "
+                        + "on the leader (attempts: " + attempts + ")");
     }
 
     private RaftConsensus currentLeader() {
