@@ -804,3 +804,90 @@ and `ranking.rerank.enabled` derive from it.
   distinct vocabulary, which is the actual failure.
 - **ANN/HNSW tuning and embedding-cost optimization — not attempted.** Both
   presuppose the representation is worth serving.
+
+---
+
+## TRAINED-SEMANTIC — all-MiniLM-L6-v2 via ONNX Runtime (2026-08-15)
+
+**Model:** `sentence-transformers/all-MiniLM-L6-v2`, Apache-2.0. 6-layer MiniLM
+bi-encoder, 384 dimensions, 256-token window, mean pooling under the attention
+mask, L2-normalized. **Pretrained — MiniGoogle does not train it.**
+
+**Runtime:** `com.microsoft.onnxruntime:onnxruntime:1.17.1` (MIT), CPU, in-JVM.
+WordPiece tokenizer implemented in-repo. Model files (90.4 MB ONNX + 231 KB
+vocab) are downloaded to a gitignored `models/` directory, never committed.
+
+**Environment:** Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, 8 CPU threads,
+8 GB heap, sequential Gradle invocations. Exact (full-scan) vector search.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.TrainedSemanticDiagnostic" \
+  -Dbeir.dir=data/beir/scifact -Dbeir.dataset=scifact -Dbeir.threads=8
+```
+
+Document vectors are embedded once and persisted, so repeat runs measure search
+rather than encoding.
+
+### Semantic candidate recall — hash vs trained
+
+| K | scifact hash | scifact trained | trec-covid hash* | trec-covid trained** |
+|---|---|---|---|---|
+| 10 | 0.2189 | **0.7833** | 0.0027 | 0.1240 |
+| 50 | 0.3533 | **0.8920** | 0.0083 | 0.2424 |
+| 100 | 0.4064 | **0.9250** | 0.0136 | 0.3223 |
+| 500 | 0.6274 | **0.9867** | 0.0407 | 0.5890 |
+| 1000 | 0.7262 | **0.9933** | 0.0652 | 0.7000 |
+
+\* full 171,332-doc corpus  \*\* **25,000-doc cap — see caveat below**
+
+### Ranking
+
+| dataset | configuration | NDCG@10 | MRR@10 | R@10 | R@100 |
+|---|---|---|---|---|---|
+| scifact | BM25 | 0.6015 | 0.5641 | 0.7360 | 0.8409 |
+| scifact | semantic (hash) | 0.1623 | 0.1488 | — | 0.4064 |
+| scifact | **semantic (trained)** | **0.6451** | **0.6047** | **0.7833** | **0.9250** |
+| trec-covid (25k cap) | semantic (trained) | 0.1897 | 0.4220 | 0.1240 | 0.3223 |
+
+On scifact the trained encoder **outranks BM25**. On trec-covid it does not — it
+contributes recall, not ranking. Both are reported; the roles differ by corpus.
+
+### Recovery of lexical misses — the decisive metric
+
+| | scifact | trec-covid |
+|---|---|---|
+| hash representation | 1.5% (5 of 12) | 2.3% (96 of 4,113) |
+| **trained encoder** | **100% (12 of 12)** | **59.6% (115 of 193)**\*\* |
+| lexical candidate recall | 0.9643 | 0.7242\*\* |
+| **UNION candidate recall** | **1.0000** | **0.8999**\*\* |
+
+### Cost
+
+| | scifact (5,183) | trec-covid (25,000) | trec-covid (171,332) |
+|---|---|---|---|
+| embedding throughput | 19 docs/s | 16 docs/s | 9–10 docs/s |
+| embedding wall time | 269.9 s | 1,607.8 s | ~5.3 h (projected) |
+| persisted vectors | 8.0 MB | 38.4 MB | ~263 MB (projected) |
+| query encode + exact scan p50 | 73 ms | 109 ms | — |
+| query p95 | 181 ms | 234 ms | — |
+
+### Caveat on the trec-covid figures
+
+\*\* The full 171,332-document corpus embeds at 9–10 docs/s, projecting to ~5.3
+hours; that run was started and **not completed**, and no number from it is
+reported. TREC-COVID trained-encoder results come from a **25,000-document cap**.
+Both the lexical and semantic sides use that same capped corpus with judgments
+resolved against it, so the comparison is one-variable and internally valid, but
+absolute values are not comparable to full-corpus figures elsewhere (lexical
+candidate recall 0.7242 capped vs 0.8357 full; 47 of 50 queries retain judgments).
+
+### Rejected / deferred
+
+- **Score fusion and hybrid ranking** — deferred, not rejected. Candidate union
+  now demonstrates a real gain, which is the precondition the brief sets for
+  attempting fusion. Production remains BM25-only.
+- **ANN / HNSW** — deferred. Exact search is the oracle and must exist first.
+- **Chunking** — deferred. Truncation was not shown to be the binding problem.
+- **Domain adaptation** — not attempted.

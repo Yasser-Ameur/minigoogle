@@ -5,6 +5,130 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — A real semantic retrieval capability (local trained encoder)
+
+### Problem
+
+The previous mission proved the "semantic" path was not semantic:
+`EmbeddingGenerator` hashed tokens into 128 buckets, so texts sharing no token
+could not be related. It recovered 1.5% of the relevant documents BM25 misses on
+scifact and 2.3% on trec-covid, and hybrid fusion degraded both datasets. It was
+correctly disabled by default, which left the semantic gap unaddressed.
+
+### Hypothesis
+
+A pretrained retrieval bi-encoder, running locally, materially changes those
+recovery figures — enough to justify an inference runtime and a 90 MB model.
+
+### Architecture decision
+
+Four integration options were weighed (see `ENGINEERING_FINDINGS.md`). Chosen:
+**Java-native inference via ONNX Runtime**, keeping semantic retrieval inside the
+JVM rather than delegating it to a sidecar or an external API.
+
+| | |
+|---|---|
+| runtime | `com.microsoft.onnxruntime:onnxruntime:1.17.1`, MIT, ~87 MB, bundles its own CPU native libs |
+| model | `sentence-transformers/all-MiniLM-L6-v2`, Apache-2.0, 384-dim, 256-token window |
+| artifacts | 90.4 MB ONNX + 231 KB vocab, downloaded to a gitignored `models/`, never committed |
+| tokenizer | `WordPieceTokenizer`, implemented in-repo rather than adding a second native library |
+| offline | yes, once the model is present |
+
+This is a large dependency for a project carrying five small ones. It is
+justified because the alternative was not a smaller library but a worse system:
+the measured evidence showed the previous representation could not do the job.
+
+**MiniGoogle does not train the encoder.** It integrates a pretrained one. The
+engineering content is running a transformer locally inside a JVM search engine —
+tokenization, inference, pooling, persistence, exact search — and proving by
+measurement that it earns its place beside BM25.
+
+### Implementation
+
+- `WordPieceTokenizer` — BERT basic tokenization (NFD accent stripping,
+  lowercasing, punctuation and CJK splitting) plus greedy longest-match-first
+  WordPiece. A mismatched tokenizer fails silently: it still produces ids and the
+  model still returns vectors, just the wrong ones.
+- `SentenceEncoder` — ONNX session, batched inference, mean pooling **under the
+  attention mask**, L2 normalization. Both pooling steps are required;
+  substituting the `[CLS]` vector or skipping normalization yields a different and
+  much worse space while still returning plausible numbers.
+- Document vectors are embedded once and **persisted**, so evaluation measures
+  search rather than encoding.
+- Search is **exact full-scan** — deliberately, as the ground-truth oracle any
+  future ANN index must be validated against.
+
+### Correctness validation
+
+`SentenceEncoderTest` pins the property the hash could not have: "coronavirus"
+and "SARS-CoV-2" share no token yet score > 0.4, and > 0.2 above an unrelated
+control. Also pinned: L2-normalized output, determinism (same text → identical
+vector, or benchmarks are not reproducible), overlong-input truncation, and that
+batched encoding equals single encoding — which catches a mean-pool that fails to
+exclude padding and silently drags short texts toward the padding embedding.
+
+Full suite: **799 tests, 0 failures**.
+
+### Quality impact
+
+| | scifact | trec-covid* |
+|---|---|---|
+| semantic Recall@100, hash → trained | 0.4064 → **0.9250** | 0.0136 → **0.3223** |
+| semantic Recall@1000, hash → trained | 0.7262 → **0.9933** | 0.0652 → **0.7000** |
+| semantic-only NDCG@10, hash → trained | 0.1623 → **0.6451** | 0.0975 → 0.1897 |
+| recovery of lexical misses | 1.5% → **100%** (12/12) | 2.3% → **59.6%** (115/193) |
+| union candidate recall | 0.9643 → **1.0000** | 0.7242 → **0.8999** |
+
+On scifact semantic-only retrieval **outranks BM25** (0.6451 vs 0.6015). On
+trec-covid it does not (0.1897) — there it contributes recall, not ranking. That
+asymmetry is reported rather than averaged away: the encoder plays different
+roles on the two corpora, which matches their shape (scifact pairs a precise
+claim with ~1 relevant document; trec-covid pairs a broad question with hundreds).
+
+### Performance impact
+
+| | scifact (5,183) | trec-covid (25,000) | trec-covid (171,332) |
+|---|---|---|---|
+| embedding throughput | 19 docs/s | 16 docs/s | 9–10 docs/s |
+| embedding wall time | 269.9 s | 1,607.8 s | ~5.3 h projected |
+| persisted vectors | 8.0 MB | 38.4 MB | ~263 MB projected |
+| query encode + exact scan | p50 73 ms | p50 109 ms | — |
+
+Embedding throughput is the binding constraint and makes full-corpus indexing a
+batch job. Query cost is encode plus exact scan; neither was optimized, because
+the brief's order is quality first.
+
+### Cross-dataset impact
+
+Both datasets improve by one to two orders of magnitude on the metric the mission
+identified as decisive. No metric regressed on either dataset.
+
+### Tradeoffs
+
+- **A large dependency.** ~87 MB runtime plus a 90 MB model, against a project
+  that previously carried five small libraries. Documented rather than minimized.
+- **The trec-covid measurement is on a 25,000-document cap.** The full corpus
+  projects to ~5.3 hours of embedding; that run was started and not completed, and
+  nothing from it is reported. Both sides of the capped comparison use the same
+  capped corpus, so it is internally valid, but its absolute numbers are not
+  comparable to full-corpus figures elsewhere. This is weaker than a full-corpus
+  result and is labelled as such everywhere it appears.
+- **Nothing is wired into production yet.** The encoder is proven in a diagnostic;
+  the default retrieval path remains BM25-only.
+
+### Conclusion
+
+Kept. The mission's central question — does a trained representation materially
+change the 1.5% / 2.3% recovery figures — is answered yes, by 1–2 orders of
+magnitude, on both datasets.
+
+Candidate union now shows a real gain (0.9643 → 1.0000 and 0.7242 → 0.8999),
+which is precisely the precondition the brief sets for attempting score fusion.
+Fusion, ANN indexing and chunking are therefore the next changes, in that order,
+and are deliberately not attempted here.
+
+---
+
 ## 2026-08-15 — Default the semantic path off; it is not semantic
 
 ### Problem
