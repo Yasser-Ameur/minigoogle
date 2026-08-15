@@ -58,8 +58,11 @@ class RankingScoreDiagnostic {
         Map<String, Map<Integer, Integer>> qrels = corpus.resolveQrels("test");
 
         Map<String, String> props = new HashMap<>();
-        props.put("semantic.enabled", "false");
-        props.put("semantic.hybrid.enabled", "false");
+        String semantic = System.getProperty("beir.semantic", "false");
+        String hybrid = System.getProperty("beir.hybrid", "false");
+        props.put("semantic.enabled", semantic);
+        props.put("semantic.hybrid.enabled", hybrid);
+        props.put("semantic.index.mode", "flat");
         String expansion = System.getProperty("beir.expansion", "false");
         props.put("semantic.expansion.enabled", expansion);
         props.put("ranking.topK", String.valueOf(deepK));
@@ -75,7 +78,8 @@ class RankingScoreDiagnostic {
 
         System.out.println("=== Ranking diagnosis: " + dataset + " (" + corpus.docs().size()
                 + " docs, deepK=" + deepK + ", pagerank=" + pagerank
-                + ", expansion=" + expansion + ") ===");
+                + ", expansion=" + expansion + ", semantic=" + semantic
+                + ", hybrid=" + hybrid + ") ===");
 
         // ── PageRank component: is it a real signal on this corpus? ──
         Set<Double> distinctPageRank = new HashSet<>(pageRankScores.values());

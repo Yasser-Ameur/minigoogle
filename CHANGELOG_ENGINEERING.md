@@ -5,6 +5,125 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Default the semantic path off; it is not semantic
+
+### Problem
+
+The previous mission concluded the residual quality gap was semantic: relevant
+documents that share no lexical overlap with the query. The repository already
+contained a semantic/hybrid path, enabled by default, that had never been
+evaluated on a real corpus.
+
+### Hypothesis
+
+If the semantic path works, it should recover relevant documents the lexical path
+misses, and hybrid fusion should improve top-K quality.
+
+### Experiment
+
+`SemanticRetrievalDiagnostic` builds an independent semantic index exactly as
+`SearchEngineBuilder` does and classifies every relevant document by which path
+can reach it. `RankingScoreDiagnostic` runs the BM25 / semantic / hybrid A/B with
+reranking disabled, so fusion is isolated from reranking.
+
+**Semantic candidate recall vs lexical:**
+
+| | scifact | trec-covid |
+|---|---|---|
+| lexical candidate recall | 0.9643 | 0.8357 |
+| semantic @1000 | 0.7262 | 0.0652 |
+| semantic @100 | 0.4064 | 0.0136 |
+| semantic-only NDCG@10 | 0.1623 | 0.0975 |
+
+**Does it recover lexical misses?**
+
+| | scifact | trec-covid |
+|---|---|---|
+| BOTH | 71.4% | 6.2% |
+| LEXICAL ONLY | 25.1% | 77.1% |
+| SEMANTIC ONLY | 1.5% (5 docs) | 0.4% (96 docs) |
+| NEITHER | 2.1% | 16.3% |
+
+Of the 4,113 relevant documents lexical misses on trec-covid, semantic recovers
+96 — **2.3%**.
+
+**Hybrid fusion:**
+
+| dataset | metric | BM25 only | hybrid |
+|---|---|---|---|
+| scifact | NDCG@10 | 0.6015 | 0.3611 |
+| scifact | Recall@10 | 0.7360 | 0.4278 |
+| scifact | Recall@1000 | 0.9343 | 0.9410 |
+| trec-covid | NDCG@10 | 0.3890 | 0.2660 |
+| trec-covid | Recall@100 | 0.0822 | 0.0540 |
+| trec-covid | Recall@1000 | 0.3118 | 0.3074 |
+
+### Root cause
+
+`EmbeddingGenerator` is the hashing trick over raw tokens:
+`bucket = hash(token) % 128`, `vector[bucket] += ±1`, L2-normalize. There is no
+model and no training — a token's contribution is decided by `String.hashCode()`.
+
+Two texts sharing no token therefore share no bucket except by collision, so
+cosine similarity approximates *lexical* overlap corrupted by collisions. It
+cannot relate `SARS-CoV-2` to `coronavirus`, which is exactly the gap it was
+expected to close. At dimension 128 against a vocabulary in the hundreds of
+thousands, every bucket aggregates thousands of unrelated terms, degrading even
+the lexical signal it does carry.
+
+The class comment already said "in production, this would use a trained model
+(e.g. sentence-transformers)". The limitation was documented; what was missing
+was a measurement of what it costs when enabled by default.
+
+### Implementation
+
+`semantic.enabled` defaults to `false` in `SearchEngineBuilder` and
+`SearchEngineConfig` (was `true`). `semantic.hybrid.enabled` and
+`ranking.rerank.enabled` derive from it, so all three follow.
+
+### Quality impact
+
+Restores BM25-only quality as the default: scifact NDCG@10 0.3611 → 0.6015,
+trec-covid 0.3890 (unchanged from the lexical baseline, since hybrid was what
+degraded it to 0.2660).
+
+### Latency impact
+
+Removes embedding generation from index build and exact vector search from the
+query path — 118 ms p50 on trec-covid, material against a ~350 ms budget. Not
+benchmarked as an isolated latency change, since the change was made on quality
+grounds.
+
+### Cross-dataset impact
+
+Consistent on both. Hybrid loses 40.0% NDCG@10 on scifact and 31.6% on
+trec-covid, with Recall@1000 flat either way. This is the first change in the
+quality work where both datasets agree unambiguously in the same direction.
+
+### Tradeoffs
+
+- An advertised capability is off by default. It remains one flag away, and the
+  measurement sits next to the flag.
+- The semantic gap identified previously is now **unaddressed** rather than
+  addressed badly. That is a more honest position, not a solved one.
+- RRF and other calibrated fusions were not implemented. Rank fusion of a strong
+  ranker with a near-random one lands between them and cannot exceed the better
+  input; semantic-only NDCG@10 is 0.0975 against lexical 0.3890. Building better
+  fusion for a signal with no semantic content would be optimizing a broken
+  input.
+
+### Conclusion
+
+Kept. The semantic path did not earn its place: it is strictly worse than lexical
+retrieval on both datasets, recovers 2.3% of the documents it was supposed to
+recover, and degrades top-K quality when fused.
+
+The next step is to replace the representation with a trained retrieval embedding
+— not to tune fusion, the index, or the hash dimension, none of which change what
+the vectors mean.
+
+---
+
 ## 2026-08-15 — Default query expansion off; verify BM25; clear PageRank
 
 ### Problem

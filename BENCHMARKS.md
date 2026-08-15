@@ -717,3 +717,90 @@ fit noise.
 **Field weighting (title vs body) — not attempted.** It follows the same logic:
 worth testing only once the semantic path has been evaluated, since the dominant
 residual is documents with no lexical overlap at all.
+
+---
+
+## SEMANTIC — pure semantic retrieval and hybrid fusion (2026-08-15)
+
+**Benchmark:** `SemanticRetrievalDiagnostic` (semantic candidate recall,
+lexical/semantic reachability) and `RankingScoreDiagnostic` (hybrid A/B).
+
+**Environment:** Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, 8 GB heap,
+strictly sequential Gradle invocations.
+
+**Model under test:** `EmbeddingGenerator`, dimension 128, feature hashing over
+raw tokens (`bucket = hash(token) % dim`, ±1, L2-normalized). Deterministic, no
+training, no external dependency. `VectorIndex` in EXACT mode (linear scan).
+Documents embedded from `title + " " + text`.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.SemanticRetrievalDiagnostic" \
+  -Dbeir.dir=data/beir/trec-covid -Dbeir.dataset=trec-covid
+```
+
+### Semantic candidate recall by depth
+
+| K | scifact | trec-covid |
+|---|---|---|
+| 10 | 0.2189 | 0.0027 |
+| 50 | 0.3533 | 0.0083 |
+| 100 | 0.4064 | 0.0136 |
+| 500 | 0.6274 | 0.0407 |
+| 1000 | 0.7262 | 0.0652 |
+| **lexical (for comparison)** | **0.9643** | **0.8357** |
+
+### Reachability of relevant documents (semantic depth 1000)
+
+| | scifact | trec-covid |
+|---|---|---|
+| BOTH | 71.4% | 6.2% |
+| LEXICAL ONLY | 25.1% | 77.1% |
+| SEMANTIC ONLY | 1.5% (5 docs) | 0.4% (96 docs) |
+| NEITHER | 2.1% | 16.3% |
+
+Of the relevant documents lexical retrieval misses, semantic recovers **2.3% on
+trec-covid** (96 of 4,113) and 5 of 12 on scifact.
+
+### BM25 vs semantic vs hybrid
+
+| dataset | configuration | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 |
+|---|---|---|---|---|---|---|
+| scifact | BM25 only | **0.6015** | **0.5641** | **0.7360** | **0.8409** | 0.9343 |
+| scifact | semantic only | 0.1623 | 0.1488 | — | — | 0.7262 (cand) |
+| scifact | hybrid | 0.3611 | 0.3468 | 0.4278 | 0.8230 | **0.9410** |
+| trec-covid | BM25 only | **0.3890** | **0.6093** | **0.0121** | **0.0822** | **0.3118** |
+| trec-covid | semantic only | 0.0975 | 0.1636 | — | — | 0.0652 (cand) |
+| trec-covid | hybrid | 0.2660 | 0.4533 | 0.0074 | 0.0540 | 0.3074 |
+
+Hybrid loses 40.0% NDCG@10 on scifact and 31.6% on trec-covid while Recall@1000
+moves by less than 1.5% either way — it promotes weaker documents over ones BM25
+already ranked correctly rather than finding new ones.
+
+### Cost
+
+| | scifact (5,183 docs) | trec-covid (171,332 docs) |
+|---|---|---|
+| embedding + index build | 0.4 s (13,096 docs/s) | 5.4 s (31,850 docs/s) |
+| exact search p50 (top-1000) | 2 ms | 118 ms |
+| exact search p95 | 5 ms | 150 ms |
+
+118 ms p50 is material against a ~350 ms total query budget, but was not
+optimized: there is no value in serving a signal this weak faster.
+
+### Accepted change
+
+`semantic.enabled` defaults to `false` (was `true`). `semantic.hybrid.enabled`
+and `ranking.rerank.enabled` derive from it.
+
+### Rejected
+
+- **RRF and other calibrated fusions — not implemented.** Rank fusion of a strong
+  ranker with a near-random one lands between them and cannot exceed the better
+  input. Semantic-only NDCG@10 is 0.0975 against lexical 0.3890; no fusion rule
+  recovers from that. Replace the representation, then revisit fusion.
+- **Chunking — cannot help.** Chunking a bag-of-words hash still cannot relate
+  distinct vocabulary, which is the actual failure.
+- **ANN/HNSW tuning and embedding-cost optimization — not attempted.** Both
+  presuppose the representation is worth serving.

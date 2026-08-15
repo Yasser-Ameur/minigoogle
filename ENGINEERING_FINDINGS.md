@@ -1416,3 +1416,147 @@ measured impact on trec-covid:
 2. Candidate recall is 0.8357 — improved and no longer dominant.
 3. Execution (WAND, postings representation) — untouched, and now has a clean
    quality oracle to be validated against.
+
+---
+
+# P4 — Semantic retrieval evaluation (2026-08-15)
+
+## The semantic architecture, as traced
+
+```
+query/document text
+  → EmbeddingGenerator.embed          feature hashing, dim 128
+      lowercase, split on [^a-z0-9]+
+      bucket = hash(token) % dim
+      vector[bucket] += (hash>>>16 & 1) == 0 ? +1 : -1
+      L2 normalize
+  → VectorIndex                        EXACT (linear scan) or HNSW
+  → cosine similarity
+  → RetrievalPipeline.mergeResults     max-normalized weighted sum,
+                                       lexicalWeight default 0.5
+  → CrossEncoderRanker                 blends cosine with normalized lexical
+```
+
+Documents are embedded from `title + " " + text` — the semantic side already
+included titles before the lexical path did.
+
+## Finding 27 — The "embedding model" is not a semantic model
+
+**Observation:** `EmbeddingGenerator` is the hashing trick over raw tokens. There
+is no model, no training, and no learned representation. A token's contribution
+is decided by `String.hashCode()`.
+
+**Consequence, by construction:** two texts that share no token have no shared
+bucket except by hash collision, so cosine similarity approximates *lexical*
+overlap corrupted by collisions. It cannot relate `SARS-CoV-2` to `coronavirus`,
+which is precisely the gap it was expected to close. At dimension 128 against a
+corpus vocabulary in the hundreds of thousands, every bucket aggregates thousands
+of unrelated terms, so even the lexical signal it does carry is heavily degraded.
+
+The class comment says "In production, this would use a trained model (e.g.
+sentence-transformers)" — the limitation was known and documented; what was
+missing was a measurement of what it costs.
+
+**Status: CONFIRMED**
+
+## Finding 28 — Semantic retrieval is strictly worse than lexical, on both datasets
+
+`SemanticRetrievalDiagnostic` builds an independent semantic index the same way
+`SearchEngineBuilder` does and measures pure semantic retrieval.
+
+| | scifact | trec-covid |
+|---|---|---|
+| lexical candidate recall | **0.9643** | **0.8357** |
+| semantic candidate recall @10 | 0.2189 | 0.0027 |
+| semantic candidate recall @100 | 0.4064 | 0.0136 |
+| semantic candidate recall @1000 | 0.7262 | 0.0652 |
+| semantic-only NDCG@10 | 0.1623 | 0.0975 |
+| lexical NDCG@10 | **0.6015** | **0.3890** |
+
+On trec-covid the lexical path reaches 0.8357 of relevant documents while
+semantic reaches 0.0652 at a depth of 1000 — nearly 13× worse.
+
+## Finding 29 — Semantic retrieval does not recover lexical misses
+
+This was the central question of the mission. Classifying every relevant document
+by which path can reach it (semantic depth 1000):
+
+| | scifact | trec-covid |
+|---|---|---|
+| BOTH | 71.4% | 6.2% |
+| LEXICAL ONLY | 25.1% | 77.1% |
+| **SEMANTIC ONLY** | **1.5%** (5 docs) | **0.4%** (96 docs) |
+| NEITHER | 2.1% | 16.3% |
+
+**Of the 4,113 relevant documents the lexical path misses on trec-covid,
+semantic retrieval recovers 96 — 2.3%.** On scifact it recovers 5 of 12.
+
+The hypothesis that semantic retrieval addresses the residual gap is therefore
+**rejected with direct evidence**. It is the answer the representation predicts:
+a hashed bag of words cannot reach a document that shares no vocabulary.
+
+## Finding 30 — Hybrid fusion degrades both datasets *(FIXED)*
+
+Controlled A/B, everything else identical, reranking disabled so fusion is
+isolated from reranking:
+
+| dataset | metric | BM25 only | hybrid | change |
+|---|---|---|---|---|
+| scifact | NDCG@10 | 0.6015 | 0.3611 | **−40.0%** |
+| scifact | MRR@10 | 0.5641 | 0.3468 | −38.5% |
+| scifact | Recall@10 | 0.7360 | 0.4278 | −41.9% |
+| scifact | Recall@1000 | 0.9343 | 0.9410 | +0.7% |
+| trec-covid | NDCG@10 | 0.3890 | 0.2660 | **−31.6%** |
+| trec-covid | MRR@10 | 0.6093 | 0.4533 | −25.6% |
+| trec-covid | Recall@100 | 0.0822 | 0.0540 | −34.3% |
+| trec-covid | Recall@1000 | 0.3118 | 0.3074 | −1.4% |
+
+The signature is identical to query expansion: **Recall@1000 is flat while the
+top-K collapses.** Fusion is not finding new documents, it is promoting weaker
+ones over the documents BM25 already ranked correctly.
+
+**`semantic.enabled` now defaults to `false`** (it was `true`, so production ran
+with hybrid on). `semantic.hybrid.enabled` and `ranking.rerank.enabled` follow it.
+
+**Status: CONFIRMED, FIXED**
+
+## Cost, for completeness
+
+| | scifact (5,183) | trec-covid (171,332) |
+|---|---|---|
+| embedding + index build | 0.4 s (13,096 docs/s) | 5.4 s (31,850 docs/s) |
+| exact search p50 / p95 (top-1000) | 2 ms / 5 ms | 118 ms / 150 ms |
+
+Cheap to build; 118 ms p50 for exact search on trec-covid is material against a
+350 ms total query budget. Not optimized, because there is no value in retrieving
+a signal this weak faster.
+
+## Rejected and not attempted
+
+- **RRF and other fusion calibrations — not implemented, deliberately.** The
+  mission proposes RRF because BM25 and cosine are on incompatible scales, and
+  that reasoning is sound. But RRF fuses *rankings*, and the semantic ranking it
+  would fuse has NDCG@10 of 0.0975 against lexical 0.3890. Rank fusion of a
+  strong ranker with a near-random one lands between them; it cannot exceed the
+  better input. Building a better fusion for a signal with no semantic content
+  would be optimizing the combination of a broken input — the same error as
+  optimizing retrieval speed for a path that returns nothing. The correct
+  sequence is: replace the representation first, then revisit fusion.
+- **ANN/HNSW tuning, chunking, embedding-cost optimization — not attempted.**
+  All presuppose the representation is worth serving. Chunking in particular
+  cannot help: chunking a bag-of-words hash still cannot relate distinct
+  vocabulary.
+- **Replacing the embedding model — out of scope here.** It requires a trained
+  model and a dependency the project does not have, which is a larger decision
+  than this mission's brief. It is recorded as the single highest-value next step.
+
+## Remaining bottleneck
+
+**The semantic representation itself.** The gap identified in the previous
+mission — relevant documents with no lexical overlap — is real and is *not*
+addressed by anything currently in the repository. Closing it requires a trained
+retrieval embedding (a sentence-transformer or equivalent), not a better fusion,
+a better index, or a bigger hash dimension.
+
+Until then the defensible architecture is lexical BM25 alone, which is what the
+defaults now express.
