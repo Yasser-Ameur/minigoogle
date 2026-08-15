@@ -11,7 +11,7 @@ A from-scratch distributed search engine built in Java 21 — crawler, indexer, 
 
 ## What is this?
 
-MiniGoogle is a full-stack search engine that crawls web pages, builds an inverted index, ranks results with BM25 + PageRank, and serves queries over REST. It runs as a single node or scales out across a cluster with gossip-based membership, consistent hashing, and automatic shard rebalancing.
+MiniGoogle is a full-stack search engine that crawls web pages, builds an inverted index, ranks results with BM25 + PageRank, and serves queries over REST. It runs as a single node, or as a multi-node cluster with Raft consensus, gossip-based membership and consistent hashing (see [Running a cluster](#running-a-cluster)).
 
 No Spring. No框架. Just Java, a handful of libraries, and ~275 source files.
 
@@ -68,7 +68,7 @@ No Spring. No框架. Just Java, a handful of libraries, and ~275 source files.
 | **Query** | Lexer → Parser (AST) → Query Planner (boolean, phrase, NOT), wildcard expansion |
 | **Ranking** | BM25 scoring, PageRank (iterative), popularity boosting, cross-encoder neural re-ranking |
 | **Semantic** | HNSW vector index, embedding generation, hybrid lexical + semantic retrieval, RAG pipeline |
-| **Cluster** | Raft leader election, gossip membership, consistent hashing, automatic shard rebalancing |
+| **Cluster** | Raft leader election + log replication, gossip membership, consistent hashing — all reachable via `NODE_TYPE=CLUSTER`. Shard rebalancing is implemented and unit-tested but **not yet wired into the running application**. |
 | **Network** | Lightweight REST server (JDK HttpServer), REST client, request routing, error handling |
 | **Monitoring** | Metric registry, structured logging, health checks, distributed tracing spans |
 | **Demo** | Google-style UI, live autocomplete, spell correction, query expansion, analytics dashboard |
@@ -187,14 +187,42 @@ src/main/java/com/minigoogle/
 
 ---
 
-## Docker
+## Running a cluster
+
+`NODE_TYPE=CLUSTER` starts the full consensus stack — gossip membership, Raft
+(leader election + log replication), the consistent-hash ring and the internal
+RPC server — alongside that node's local index and REST API. Peers are addressed
+through `CLUSTER_PEERS`; every node must share `MINIGOGLE_CLUSTER_SECRET` or
+peers reject each other's RPCs.
 
 ```bash
-docker compose build
-docker compose up
+docker compose up --build
 ```
 
-Spins up a 4-node cluster: 1 coordinator, 2 search nodes, 1 monitoring — all connected via bridge network with health checks.
+Three nodes: REST on 8080/8081/8082, internal Raft/gossip RPC on 9080/9081/9082.
+
+```bash
+# Who is the leader?
+curl localhost:8080/api/v1/cluster/status
+
+# A linearizable write, committed by a majority before it returns
+curl -X POST localhost:8080/api/v1/cluster/kv -d '{"key":"k","value":"v"}'
+
+# Read it back from a different node
+curl 'localhost:8081/api/v1/cluster/kv?key=k'
+
+# Kill the leader and watch a survivor take over
+docker compose stop minigoogle-1
+curl localhost:8081/api/v1/cluster/status
+```
+
+Raft state (term, vote, log, snapshot, committed configuration) persists per node
+under `$INDEX_DIR/raft`, on a named volume, so a restarted node recovers rather
+than rejoining empty.
+
+**Verified by** `DeployedClusterIntegrationTest` (startup → election → replicated
+write → leader kill → re-election → continued service → restart → convergence)
+and measured by `ClusterFailoverBenchmarks`.
 
 ---
 
@@ -202,10 +230,24 @@ Spins up a 4-node cluster: 1 coordinator, 2 search nodes, 1 monitoring — all c
 
 ```bash
 kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/
+kubectl apply -f k8s/configmap.yaml
+kubectl -n minigoogle create secret generic minigoogle-cluster-secret   --from-literal=secret="$(openssl rand -hex 32)"
+kubectl apply -f k8s/statefulset-cluster.yaml
 ```
 
-Full K8s manifests: namespace, deployments, services, HPA, ingress, network policy, configmap.
+The cluster runs as a **StatefulSet** with a headless Service: Raft needs stable
+per-pod DNS names and durable per-pod volumes, neither of which a Deployment
+provides.
+
+```bash
+kubectl -n minigoogle get endpoints minigoogle-cluster   # must be non-empty
+kubectl -n minigoogle exec minigoogle-cluster-0 --   curl -s localhost:8080/api/v1/cluster/status
+```
+
+The single-node manifests (`deployment-*.yaml`, `service-*.yaml`) remain for the
+standalone/coordinator topology. `DeploymentTopologyTest` pins that every Service
+selector matches real pod labels and that compose sets only variables the
+application actually reads — both were silently broken before.
 
 ---
 

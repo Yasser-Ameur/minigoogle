@@ -5,6 +5,155 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Operationalize the distributed system (P0)
+
+**Problem.**
+Every distributed component existed and was heavily tested, but none was
+reachable from the running application. `new ClusterNode` appeared **0 times in
+`src/main` and 20 times in `src/test`**; `MiniGoogleApp` branched only on
+`COORDINATOR`/`SEARCH`. What actually deployed was a single-node search engine
+plus a flat HTTP registry. Compose started four containers that could not form a
+cluster, and every Kubernetes Service selected `app: minigoogle` while the
+workloads labelled pods `app.kubernetes.io/name` — **0 endpoints**.
+
+**The concrete missing link** was smaller than expected: no production
+`NodeDirectory` implementation existed at all. The interface has one method, and
+the only implementations were lambdas inside tests, so `ClusterNode` could not be
+constructed outside a test.
+
+**Implementation.**
+- `StaticNodeDirectory` — parses `cluster.peers` (`nodeId=http://host:port`,
+  `nodeId@host:port`, or a bare address defaulting the id to the host). Rejects
+  entries without an explicit port rather than guessing one, since a wrong guess
+  yields a node that starts cleanly and then fails every RPC.
+- `MiniGoogleApp.startClusterRuntime` — `NODE_TYPE=CLUSTER` starts gossip, Raft,
+  the hash ring and the internal RPC server *alongside* the node's local index
+  and REST API. A CLUSTER node is a full search node that also participates in
+  consensus, not a separate mode. Peers seed gossip; the bootstrap configuration
+  is established once and thereafter the persisted committed configuration wins.
+- `/api/v1/cluster/status` and `/api/v1/cluster/kv` expose membership and the
+  replicated state machine, so consensus is reachable by a user request rather
+  than only by internal RPC.
+- The shard executor is a `LocalSearchExecutor` backed by the live index, so a
+  peer's `/cluster/v1/search/dispatch` runs a real query against real postings.
+- `ConfigurationLoader` now reads unprefixed `CLUSTER_PEERS`, `NODE_ID`,
+  `CLUSTER_PORT`, `CLUSTER_SECRET`, `ADVERTISED_HOST`, `INDEX_DIR`. Compose had
+  been setting `CLUSTER_PEERS` while only `MINIGOGLE_CLUSTER_PEERS` was mapped,
+  so the peer list was silently discarded.
+- `ClusterNode(..., Path storageDirectory)` now also builds a
+  `ReplicatedKeyValueStore` and a durable `RaftAppliedStore`. Previously the most
+  production-shaped constructor passed `null` for both, producing durable
+  consensus with nothing to apply it to — every `put`/`get` threw.
+
+**Deployment.**
+`docker-compose.yml` rewritten as three `NODE_TYPE=CLUSTER` nodes with published
+RPC ports, a shared secret and named volumes for Raft state.
+`k8s/statefulset-cluster.yaml` adds a StatefulSet plus headless Service — Raft
+needs stable per-pod DNS and durable per-pod volumes, neither of which a
+Deployment provides. The three broken Service selectors are corrected.
+
+**Validation.**
+- `DeployedClusterIntegrationTest` — three nodes built through the production
+  collaborators over real HTTP: startup, election, gossip convergence, a
+  replicated write readable from every node, leader kill, re-election, continued
+  service, restart, convergence; plus committed state surviving a full cluster
+  restart.
+- `StaticNodeDirectoryTest` — 12 tests on the peer parser.
+- `DeploymentTopologyTest` — every Service selector must match real pod labels;
+  compose must use CLUSTER mode, ports must be explicit, and every variable
+  compose sets must be one the loader reads. Both original defects would have
+  been caught by this.
+- Full suite: **736 tests, 0 failures**.
+
+**Benchmark.** See the next entry and `BENCHMARKS.md`: steady-state replicated
+write p50 9.24 ms / p99 16.33 ms at 101 writes/s; failover election p50 869 ms.
+
+**Tradeoffs.**
+Sharding, replication and rebalancing remain unwired (`Rebalancer`,
+`ShardManager`, `ReplicaManager` still have 0 construction sites in `src/main`).
+That is now stated explicitly in the README rather than implied as working.
+`cluster.secret` falls back to a fixed development value with a warning when
+unset, which is convenient locally and must be overridden in production.
+
+**Conclusion.**
+Kept. The architectural claim is now true of the deployed system, not only of the
+test suite.
+
+---
+
+## 2026-08-15 — Raft: commit an entry of the new term on election
+
+**Problem.**
+Found by the new integration test, not by inspection. After any leader change —
+including a full cluster restart — committed data became unreadable and followers
+never applied it. A probe captured the state exactly:
+
+```
+PROBE3 post n1 state=LEADER   applied=1 lastLog=1 commit=0
+PROBE3 post n2 state=FOLLOWER applied=0 lastLog=1 commit=0
+PROBE3 post n3 state=FOLLOWER applied=0 lastLog=1 commit=0
+```
+
+`advanceCommitIndex` is correctly term-guarded — Raft §5.4.2 forbids committing a
+prior-term entry by counting replicas, and the implementation honours that. But
+`becomeLeader()` appended nothing of its own term, so a carried-over tail could
+never commit: followers never applied it, and a linearizable read (which waits
+for `commitIndex` to reach its read index) could not be satisfied until a client
+happened to write. No safety violation — data was never lost — but committed
+state was unreadable for an unbounded period after every leader change.
+
+**Implementation.**
+`becomeLeader()` appends an empty no-op entry in the current term; committing it
+carries every preceding entry with it. `applyEntry` skips empty payloads (config
+frames carry a leading opcode byte, state-machine commands are never empty).
+
+The no-op is appended **only when `log.lastIndex() > commitIndex`** — only when a
+carried-over tail actually exists. An unconditional no-op is equally correct but
+shifts every log index by one, which broke 15 existing tests asserting absolute
+indices; the conditional form is correct for the same reason (there is nothing to
+carry when the log is fully committed) and took failures from 15 to 0.
+
+**Result.** Client-visible write interruption after a leader kill is 878 ms p50
+against an election latency of 869 ms p50 — service resumes within ~9 ms of a
+leader existing, instead of waiting for the next client write.
+
+**Tradeoffs.** One extra log entry per leadership change.
+`ClusterNodeDurableRaftTest` now appends a real `KvCommand` rather than raw
+bytes, because a durable node now carries a state machine that decodes what it
+applies.
+
+**Conclusion.**
+Kept. This is the standard Raft remedy and the defect was demonstrated, not
+hypothesized.
+
+---
+
+## 2026-08-15 — Fix a lost-update race in the crawl frontier's counters
+
+**Problem.**
+`DistributedFrontierTest.testConcurrentDuplicateEnqueueEnqueuesOnlyOnce` failed
+once under full-suite load with `expected: <15> but was: <14>`, and passed 4/4 in
+isolation. The dedup itself was correct (`accepted == 1`, registry size 1); the
+*count* was wrong.
+
+`totalEnqueued`/`totalDuplicates`/`totalAssigned`/`totalCompleted`/`totalFailed`
+were `volatile long` fields incremented with `++` from every crawler worker
+thread. `volatile` guarantees visibility but **not** atomicity of a
+read-modify-write: two threads read the same value and both write back value+1,
+losing an increment. The bug only surfaces when the enqueue race genuinely
+occurs, which is why it was load-dependent.
+
+**Implementation.** All five counters are now `LongAdder` — designed for exactly
+this shape (hot contended increments, rare reads via `sum()`).
+
+**Validation.** Crawler suite green; full suite 736 tests, 0 failures.
+
+**Conclusion.**
+Kept. A statistics counter that undercounts precisely when contention occurs is
+worse than useless for diagnosing a crawler under load.
+
+---
+
 ## 2026-08-15 — Cut learning-to-rank feature extraction cost by 1.75x
 
 **Problem.**

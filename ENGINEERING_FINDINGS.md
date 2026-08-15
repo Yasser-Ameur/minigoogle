@@ -459,3 +459,183 @@ Raft implementation is judged on.
 5. Re-test H2's memo at BEIR scale (~171k documents). The 3.2k → 20k trend
    suggests the benefit keeps growing with posting-list length, but that is an
    extrapolation, not a measurement.
+
+---
+
+# P0 Audit — is the distributed system reachable? (2026-08-15)
+
+Independent verification of the suspected P0/P1/P2 findings, performed by tracing
+the production startup path rather than by reading class names.
+
+## Finding 1 — The cluster stack is unreachable from the running application
+
+**Observation:** every distributed component exists and is heavily tested, but no
+production code path constructs any of them.
+
+**Evidence:**
+- `grep -c "new ClusterNode" src/main` → **0**; `src/test` → **20**.
+- `MiniGoogleApp.start()` reads `node.type` and branches on `COORDINATOR` and
+  `SEARCH` only (`MiniGoogleApp.java:98-101,391`); every other value falls
+  through to standalone. There is no cluster node type.
+- Production wiring is `ClusterCoordinator` (a flat in-memory HTTP registry) plus
+  `SearchCoordinator` (scatter-gather) — not Raft, gossip or the hash ring.
+- **No production `NodeDirectory` implementation exists at all.** The interface
+  has a single method (`URI getBaseUri(String)`), and the only implementations
+  are lambdas inside tests. This is the concrete missing link: `ClusterNode`
+  cannot be constructed without one.
+
+**Conclusion:** what a user runs today is a single-node search engine with an
+HTTP registry. Raft, gossip, consistent hashing, sharding and replication are
+unreachable.
+
+**Impact:** the project's central architectural claim is true of the test suite
+and false of the deployed system.
+
+**Status: CONFIRMED**
+
+## Finding 2 — Docker Compose cannot form a cluster
+
+**Evidence:**
+- `docker-compose.yml` sets `NODE_TYPE=search-node` and `monitoring`; the app
+  uppercases and matches only `COORDINATOR`/`SEARCH`, so these silently become
+  standalone.
+- Compose sets a bare `CLUSTER_PEERS` variable, but `ConfigurationLoader`
+  (`:37-51`) maps only `MINIGOGLE_CLUSTER_PEERS` (note the misspelling), plus
+  `NODE_TYPE`/`NODE_PORT`. **`CLUSTER_PEERS` is never read.**
+- The cluster/RPC port is never published; host ports map to container 8080 only.
+
+**Conclusion:** the four containers are four independent single-node servers.
+
+**Status: CONFIRMED**
+
+## Finding 3 — Kubernetes Services select no pods
+
+**Evidence:** `k8s/service-*.yaml` selectors are `app: minigoogle` + `component`;
+`k8s/deployment-*.yaml` label pods `app.kubernetes.io/name` +
+`app.kubernetes.io/component`. The selector key `app` matches no pod.
+
+**Conclusion:** all three Services resolve to **0 endpoints**.
+
+**Status: CONFIRMED**
+
+## Finding 4 — The failover benchmark measures unreachable code
+
+**Evidence:** `SearchPerformanceBenchmarks.raftLeaderFailoverLatency` constructs
+`ClusterNode` directly (the only way to reach Raft). It uses real HTTP between
+in-process nodes, so it is a valid **COMPONENT** benchmark — but it exercises
+machinery no deployed process runs, so it cannot support a system-level claim.
+
+**Status: CONFIRMED** (benchmark is real; its framing as a system result is not)
+
+## Finding 5 — Retrieval scalability mechanisms are not wired (P2)
+
+**Evidence:**
+- `new BlockMaxWAND` / `new WANDExecutor` in `src/main` → **0**. No early
+  termination; retrieval scores the full posting union then truncates.
+- `PostingList` still carries `// In the future: Add skip pointers generation
+  logic here`. No skip pointers.
+- `VariableByteEncoder` / `SkipListIndex` appear nowhere outside the
+  `performance` package — not on the read path.
+- `PostingReader.read` builds `List<Integer>` gaps, `List<Integer>` frequencies
+  and `List<List<Integer>>` positions, then reconstructs `Posting` objects each
+  holding a `List<Integer>`. Every id, frequency and position is a boxed
+  `Integer`.
+
+**Status: CONFIRMED** (deferred behind P0/P1 per the priority policy)
+
+## Finding 6 — SSRF hardening is already wired (contradicts the older audit)
+
+**Evidence:** `NetworkSafetyPolicy` is constructed by `HttpDownloader`'s default
+constructor (`HttpDownloader.java:51,57,61`) and the downloader enforces
+compressed/decompressed size caps.
+
+**Conclusion:** audit finding #4 is substantially addressed in the committed
+tree. Recorded here because the older `docs/audit-status.md` still lists it as
+STILL BROKEN.
+
+**Status: REJECTED** (as a current defect)
+
+---
+
+# P0 Resolution — the distributed system is now reachable
+
+## Finding 7 — The durable constructor built a node that could not apply anything
+
+**Observation:** `ClusterNode(..., Path storageDirectory)` — the most
+production-shaped constructor, and the only one that yields durable Raft — passed
+`null` for both the state machine and the applied-index store.
+
+**Evidence:** wiring the production path and issuing a replicated write failed
+with `IllegalStateException: Node ... has no replicated key-value state machine`
+from `ensureStateMachine()`. The node had durable consensus with nothing to apply
+it to.
+
+**Conclusion:** a durable node now also gets a `ReplicatedKeyValueStore` and a
+durable `RaftAppliedStore` (`StorageLayout.getRaftAppliedPath`). Every other
+constructor is unchanged.
+
+**Impact:** without this, `NODE_TYPE=CLUSTER` could elect a leader but could not
+serve a single replicated operation.
+
+**Status: CONFIRMED, FIXED**
+
+## Finding 8 — A new leader never committed an entry of its own term
+
+**Observation:** after a leader change (including a full cluster restart),
+committed data became unreadable and followers never applied it.
+
+**Evidence:** the new `DeployedClusterIntegrationTest` full-restart case failed.
+A probe showed the state precisely — post-restart, `commitIndex=0` on all three
+nodes while the entry sat durably at `lastLog=1`:
+
+```
+PROBE3 post n1 state=LEADER   applied=1 lastLog=1 commit=0
+PROBE3 post n2 state=FOLLOWER applied=0 lastLog=1 commit=0
+PROBE3 post n3 state=FOLLOWER applied=0 lastLog=1 commit=0
+```
+
+`advanceCommitIndex` is correctly term-guarded
+(`log.termAt(n) == currentTerm && countMatches(n) >= threshold`, `:1071`), which
+is required for safety — Raft §5.4.2 forbids committing a prior-term entry by
+counting replicas. But `becomeLeader()` appended nothing of its own term, so the
+carried-over tail could never commit. Followers never applied it, and a
+linearizable read (which waits for `commitIndex` to reach its read index) could
+not be satisfied until a client happened to write.
+
+**This was a real liveness/correctness defect, not a test artifact.** No safety
+violation — data was never lost — but committed state was unreadable for an
+unbounded period after every leader change.
+
+**Fix:** `becomeLeader()` now appends an empty no-op entry in the current term,
+the standard Raft remedy. Committing it carries every preceding entry with it.
+`applyEntry` skips empty payloads (config frames are identified by a leading
+opcode byte and state-machine commands are never empty).
+
+**Design note:** the no-op is appended **only when `log.lastIndex() > commitIndex`**
+— i.e. only when a carried-over tail actually exists. An unconditional no-op is
+also correct but shifts every log index by one, which broke 15 existing tests
+that assert absolute indices. The conditional form is equally correct (there is
+nothing to carry when the log is fully committed) and left those indices with
+their natural meaning; failures went from 15 to 0.
+
+**Measured effect:** client-visible write interruption after a leader kill is now
+878 ms p50 against an election latency of 869 ms p50 — service resumes within
+~9 ms of a leader existing, rather than waiting for the next client write.
+
+**Status: CONFIRMED, FIXED**
+
+## What now runs
+
+`NODE_TYPE=CLUSTER` starts, from `MiniGoogleApp.startClusterRuntime`:
+
+| Component | Reachable | How |
+|---|---|---|
+| Gossip membership | yes | seeded from `cluster.peers`, converges without a registry |
+| Raft election + replication | yes | over `HttpRaftTransport` on `cluster.port` |
+| Consistent-hash ring | yes | maintained by `RingMembershipListener` from gossip |
+| Replicated state machine | yes | `POST/GET /api/v1/cluster/kv`, linearizable |
+| Durable Raft state | yes | `$INDEX_DIR/raft` (term, vote, log, snapshot, config) |
+| Search dispatch to peers | yes | `/cluster/v1/search/dispatch` backed by the local index |
+| Shard rebalancing | **no** | `Rebalancer`/`ShardManager`/`ReplicaManager` still have 0 construction sites in `src/main` |
+
+The last row is stated in the README rather than left implied.

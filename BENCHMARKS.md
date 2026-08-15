@@ -264,3 +264,67 @@ and only the `snippet` string field is affected — but this is reasoning, not
 measurement, and is listed as a confirmation step in `ENGINEERING_FINDINGS.md`.
 The memoization likewise returns identical posting lists, so it cannot alter
 ranking; that too is reasoning rather than measurement.
+
+---
+
+## Deployed-path cluster benchmarks (2026-08-15)
+
+### Why these replace the previous failover figure
+
+`SearchPerformanceBenchmarks.raftLeaderFailoverLatency` is a valid COMPONENT
+benchmark, but it measured machinery no deployed process could reach: at the time
+it was written, `new ClusterNode` appeared zero times in `src/main`. Its number
+could not support a system-level claim.
+
+`ClusterFailoverBenchmarks` builds every node through the same collaborators the
+production application uses — `StaticNodeDirectory` parsed from a `cluster.peers`
+string, a shared `ClusterSecurity` secret, a durable per-node Raft directory —
+over real HTTP. It is classified FAILURE / END_TO_END.
+
+### Environment
+
+Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, single developer machine.
+3-node cluster, all nodes in one JVM, real HTTP loopback transport.
+Raft election timeout 1200 ms, heartbeat 250 ms, gossip interval 200 ms.
+
+### Command
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.ClusterFailoverBenchmarks"
+```
+
+### Steady-state replicated write
+
+100 committed writes after 20 warmup. Each write returns only once a majority has
+replicated **and** applied the entry, so this is end-to-end commit latency, not
+fire-and-forget.
+
+| metric | value |
+|---|---|
+| p50 | 9.24 ms |
+| p95 | 14.21 ms |
+| p99 | 16.33 ms |
+| throughput | 101 writes/s |
+
+### Leader failover
+
+3 leader kills, each followed by a real committed write and node restart.
+
+| metric | p50 | max |
+|---|---|---|
+| election latency (kill → new leader) | 869 ms | 1532 ms |
+| write interruption (kill → write commits) | 878 ms | 1542 ms |
+
+**Interpretation.** Election latency sits just below the 1200 ms election
+timeout, as expected — a follower must first time out before campaigning, so the
+floor is the timeout itself and the spread reflects the randomized backoff.
+
+The gap between election and write interruption is the meaningful number: **9 ms
+at p50**. Before the leadership no-op fix (Finding 8) a new leader had no entry
+of its own term to commit, so committed state stayed unapplied and linearizable
+reads could not be satisfied until a client happened to write — an unbounded
+window. Service now resumes essentially the moment a leader exists.
+
+Single-run caveats from the rest of this document apply: these are three failover
+rounds on a loaded developer machine, so treat the p50 as indicative and the
+election/interruption *gap* as the robust result.
