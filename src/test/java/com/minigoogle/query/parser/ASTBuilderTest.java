@@ -53,8 +53,16 @@ class ASTBuilderTest {
     }
 
     @Test
-    void testImplicitAnd() {
+    void testImplicitOperatorDefaultsToOr() {
+        // See Parser.ImplicitOperator: OR is the bag-of-words retrieval model.
         QueryNode node = ASTBuilder.build("java compiler");
+        assertNotNull(node);
+        assertTrue(node instanceof OrNode, "adjacent terms must default to OR");
+    }
+
+    @Test
+    void testExplicitAndStillBuildsAnAndNode() {
+        QueryNode node = ASTBuilder.build("java AND compiler");
         assertNotNull(node);
         assertTrue(node instanceof AndNode);
     }

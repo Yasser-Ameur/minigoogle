@@ -57,8 +57,16 @@ class QueryExpanderExpansionTest {
     }
 
     @Test
-    void multiWordQueryKeepsParserImplicitAnd() {
+    void multiWordQueryKeepsTheParsersImplicitOperator() {
+        // Expansion rewrites word leaves only; the boolean structure the parser
+        // produced must survive it. That structure is now OR by default.
         QueryNode expanded = expander.expand(parse("java compiler"), 4);
+        assertInstanceOf(OrNode.class, expanded);
+    }
+
+    @Test
+    void explicitAndSurvivesExpansion() {
+        QueryNode expanded = expander.expand(parse("java AND compiler"), 4);
         assertInstanceOf(AndNode.class, expanded);
     }
 

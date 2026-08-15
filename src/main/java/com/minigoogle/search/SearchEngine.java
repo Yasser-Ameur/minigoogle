@@ -18,6 +18,7 @@ import com.minigoogle.query.ast.WordNode;
 import com.minigoogle.query.lexer.Lexer;
 import com.minigoogle.query.lexer.Token;
 import com.minigoogle.query.lexer.TokenType;
+import com.minigoogle.query.QueryStopWordFilter;
 import com.minigoogle.query.parser.Parser;
 import com.minigoogle.query.planner.QueryPlanner;
 import com.minigoogle.ranking.model.RankedDocument;
@@ -67,6 +68,7 @@ public class SearchEngine {
     private final CaseFolder caseFolder;
     private final PorterStemmer stemmer;
     private final SearchEngineConfig config;
+    private final QueryStopWordFilter stopWordFilter = new QueryStopWordFilter();
 
     public SearchEngine(QueryPlanner planner,
                         RankingPipeline ranking,
@@ -118,7 +120,10 @@ public class SearchEngine {
         // (OR-ing each word with its synonyms) and never touches phrase nodes,
         // so exact-phrase semantics survive expansion. Adjacent unquoted words
         // keep the parser's documented implicit-AND behavior.
-        List<Token> tokens = lexer.tokenize(query);
+        // Query analysis must match index analysis. The indexer drops stop words,
+        // so a stop word can never match anything; leaving it in an implicit-AND
+        // query makes the conjunction unsatisfiable and returns nothing at all.
+        List<Token> tokens = stopWordFilter.filter(lexer.tokenize(query));
         QueryNode ast = new Parser(tokens).parse();
         if (ast == null) {
             return new RetrievalResult(List.of(), null);

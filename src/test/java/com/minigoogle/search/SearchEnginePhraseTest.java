@@ -53,12 +53,32 @@ class SearchEnginePhraseTest {
     }
 
     @Test
-    void unquotedMultiWordQueryUsesImplicitAnd() throws Exception {
+    void unquotedMultiWordQueryRanksFullMatchesAbovePartialOnes() throws Exception {
+        // Adjacent terms are OR-ed, so a document matching one term still
+        // competes -- but documents matching both must outrank it. Requiring
+        // both (the previous implicit AND) returned nothing at all for
+        // natural-language queries on a real corpus.
         RetrievalResult result = engine().retrieveCandidates("java compiler", 10);
         List<String> urls = result.ranked().stream().map(RankedDocument::url).toList();
-        assertTrue(urls.contains("https://doc3"));
-        assertTrue(urls.contains("https://doc4"));
-        assertFalse(urls.contains("https://doc1"));
-        assertFalse(urls.contains("https://doc2"));
+
+        assertTrue(urls.contains("https://doc3"), urls.toString());
+        assertTrue(urls.contains("https://doc4"), urls.toString());
+        // doc1 has "java" only: retrieved, but must rank below both-term matches.
+        assertTrue(urls.indexOf("https://doc3") < urls.indexOf("https://doc1"),
+                "a both-term match must outrank a single-term match: " + urls);
+        assertTrue(urls.indexOf("https://doc4") < urls.indexOf("https://doc1"),
+                "a both-term match must outrank a single-term match: " + urls);
+        // doc2 contains neither term.
+        assertFalse(urls.contains("https://doc2"), urls.toString());
+    }
+
+    @Test
+    void explicitAndStillRequiresEveryTerm() throws Exception {
+        RetrievalResult result = engine().retrieveCandidates("java AND compiler", 10);
+        List<String> urls = result.ranked().stream().map(RankedDocument::url).toList();
+        assertTrue(urls.contains("https://doc3"), urls.toString());
+        assertTrue(urls.contains("https://doc4"), urls.toString());
+        assertFalse(urls.contains("https://doc1"), urls.toString());
+        assertFalse(urls.contains("https://doc2"), urls.toString());
     }
 }

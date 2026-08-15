@@ -23,15 +23,39 @@ class ParserTest {
     }
 
     @Test
-    void testImplicitAnd() {
+    void testImplicitOperatorDefaultsToOr() {
+        // Adjacent terms are OR-ed so partial matches still compete, ranked by
+        // BM25. The previous AND default made a multi-term natural-language
+        // query unsatisfiable: on BEIR TREC-COVID it returned zero results for
+        // all 50 queries.
         Lexer lexer = new Lexer();
-        Parser parser = new Parser(lexer.tokenize("java compiler"));
-        QueryNode node = parser.parse();
-        
+        QueryNode node = new Parser(lexer.tokenize("java compiler")).parse();
+
+        assertTrue(node instanceof OrNode, "adjacent terms must default to OR");
+        OrNode orNode = (OrNode) node;
+        assertEquals("java", ((WordNode) orNode.left()).word());
+        assertEquals("compiler", ((WordNode) orNode.right()).word());
+    }
+
+    @Test
+    void testImplicitAndStillAvailableExplicitly() {
+        // Conjunctive matching is still reachable for boolean filtering.
+        Lexer lexer = new Lexer();
+        QueryNode node = new Parser(lexer.tokenize("java compiler"),
+                Parser.ImplicitOperator.AND).parse();
+
         assertTrue(node instanceof AndNode);
         AndNode andNode = (AndNode) node;
         assertEquals("java", ((WordNode) andNode.left()).word());
         assertEquals("compiler", ((WordNode) andNode.right()).word());
+    }
+
+    @Test
+    void testExplicitAndIsAlwaysHonoured() {
+        Lexer lexer = new Lexer();
+        QueryNode node = new Parser(lexer.tokenize("java AND compiler")).parse();
+        assertTrue(node instanceof AndNode,
+                "an explicit AND must mean AND regardless of the implicit default");
     }
 
     @Test

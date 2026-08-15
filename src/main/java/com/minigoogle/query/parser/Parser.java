@@ -8,14 +8,48 @@ import java.util.List;
 /**
  * A simple recursive descent parser for search queries.
  * Precedence: NOT > AND > OR.
- * Implicit AND is supported (e.g. "java compiler" -> "java AND compiler")
+ *
+ * <p>Adjacent terms with no operator between them are combined with the
+ * {@linkplain ImplicitOperator implicit operator}. Explicit {@code AND},
+ * {@code OR} and {@code NOT} always mean exactly what they say.</p>
  */
 public class Parser {
+
+    /** How adjacent terms with no operator between them are combined. */
+    public enum ImplicitOperator {
+        /**
+         * Every term must be present. Correct for boolean filtering, and the
+         * wrong default for natural-language search: a five-term question needs
+         * one document containing all five terms, which on BEIR scifact returned
+         * zero results for 299 of 300 queries.
+         */
+        AND,
+        /**
+         * Any term may match, with BM25 ranking deciding the order. This is the
+         * standard bag-of-words retrieval model: a document matching more of the
+         * query outranks one matching less, but partial matches still compete
+         * instead of being discarded.
+         */
+        OR
+    }
+
+    /**
+     * Adjacent terms are OR-ed by default. See {@link ImplicitOperator#OR}; the
+     * previous AND default made realistic queries unsatisfiable.
+     */
+    public static final ImplicitOperator DEFAULT_IMPLICIT_OPERATOR = ImplicitOperator.OR;
+
     private final List<Token> tokens;
+    private final ImplicitOperator implicitOperator;
     private int current;
 
     public Parser(List<Token> tokens) {
+        this(tokens, DEFAULT_IMPLICIT_OPERATOR);
+    }
+
+    public Parser(List<Token> tokens, ImplicitOperator implicitOperator) {
         this.tokens = tokens;
+        this.implicitOperator = implicitOperator;
         this.current = 0;
     }
 
@@ -49,9 +83,11 @@ public class Parser {
                 QueryNode right = notExpression();
                 node = new AndNode(node, right);
             } else if (isNextImplicitAnd()) {
-                // Implicit AND for adjacent words without operators
+                // Adjacent terms with no operator between them.
                 QueryNode right = notExpression();
-                node = new AndNode(node, right);
+                node = implicitOperator == ImplicitOperator.AND
+                        ? new AndNode(node, right)
+                        : new OrNode(node, right);
             } else {
                 break;
             }
