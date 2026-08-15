@@ -18,6 +18,12 @@ dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind:2.16.1")
     implementation("com.google.code.gson:gson:2.10.1")
 
+    // Local transformer inference for the semantic retrieval path. MIT
+    // licensed, self-contained (bundles its own native runtime), and CPU-only:
+    // it keeps semantic search inside the JVM rather than delegating it to an
+    // external service. See ENGINEERING_FINDINGS.md for the options considered.
+    implementation("com.microsoft.onnxruntime:onnxruntime:1.17.1")
+
     // Logging
     implementation("org.slf4j:slf4j-api:2.0.12")
     implementation("ch.qos.logback:logback-classic:1.4.14")

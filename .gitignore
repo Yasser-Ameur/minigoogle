@@ -37,3 +37,7 @@ data/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+
+# Downloaded ML model artifacts. Fetched on demand by SentenceEncoder with a
+# SHA-256 check; never committed - all-MiniLM-L6-v2 alone is 90 MB.
+/models/
