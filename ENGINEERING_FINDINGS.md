@@ -706,3 +706,133 @@ failure-injection at each boundary (before replacement, after temp write, after
 flush, after rename), not just a happy-path truncation test.
 
 **Status: CONFIRMED, OPEN**
+
+---
+
+# P1 Resolution — Raft persistence is now crash-safe (2026-08-15)
+
+## The durability model, as verified
+
+| File | Written by | Atomicity |
+|---|---|---|
+| `raft-metadata.bin` (term, votedFor) | `RaftMetadataStore` | temp → `force(true)` → `ATOMIC_MOVE` |
+| `raft-applied.bin` (apply watermark) | `RaftAppliedStore` | temp → `force(true)` → `ATOMIC_MOVE` |
+| `raft-config.bin` (committed membership) | `RaftConfigurationStore` | temp → `force(true)` → `ATOMIC_MOVE` |
+| `raft-snapshot.bin` | `RaftSnapshotStore` | temp → `force(true)` → `ATOMIC_MOVE` |
+| `raft-log.bin` | `WriteAheadLog` | **was destructive; now temp → `force(true)` → `ATOMIC_MOVE` → directory fsync** |
+
+The Raft log was the *only* store using destructive semantics. Every other file
+already followed the write-temp-then-rename discipline — which is what made the
+log's clear-then-rewrite stand out as an outlier rather than a house style.
+
+Record format is `[op:1][length:4 BE][payload:length]`, one `force(true)` per
+append. `RaftLog` frames a payload as `[term:4 BE][payload]` inside that record.
+
+## Finding 11 — WAL replay could not tolerate a torn tail *(FIXED)*
+
+`readAll` read records with no bounds checking: `hasRemaining()` only guarantees
+one byte, the length field was unvalidated, and the payload read could underflow.
+A crash mid-append — the normal way a process dies — left a partial trailing
+record, and replay threw. `ClusterNode.createRaftLog` propagated it, so **the node
+refused to start**.
+
+Recovery now classifies damage explicitly:
+
+| Shape on disk | Classification | Behaviour |
+|---|---|---|
+| Complete records | valid | replayed |
+| Ran out of bytes mid-record | recoverable torn tail | prefix replayed, file truncated to the last complete record |
+| Negative length | corruption | `CorruptWalException` |
+| Length > `maxRecordBytes` (256 MiB) | corruption | `CorruptWalException` |
+
+**A length exceeding the file size is *not* corruption.** Appending a large
+payload to a short log and crashing produces exactly that, and it is fully
+recoverable. An earlier version of this fix treated it as corruption; the Case C
+test caught the mistake, which is why the classification is by *shape* rather
+than by magnitude alone.
+
+Corrupt logs are left untouched on disk rather than trimmed, so an operator can
+inspect them instead of receiving a silently shortened log presented as clean.
+
+## Finding 12 — Truncation and compaction destroyed the log before rewriting it *(FIXED)*
+
+`truncateFrom` and `compact` called `wal.clear()` (`Files.deleteIfExists`) and
+then re-appended the survivors. A crash in that window lost **the entire
+persisted log, including committed entries** — `truncateFrom`'s retained prefix
+`[firstIndex, index-1]` is precisely the agreed, committed portion.
+
+Both now build the retained list and hand it to `WriteAheadLog.replaceAll`:
+write a temp file in the same directory → `force(true)` → `ATOMIC_MOVE` over the
+live log → fsync the directory. A crash leaves the complete old log or the
+complete new log, never a missing or partial one.
+
+The `compact` docstring previously claimed "no committed entry is ever lost".
+That reasoning held only for the snapshot path and never for truncation; it has
+been corrected to state that safety comes from the atomic replacement itself.
+
+## Finding 13 — Snapshot and log could disagree after a crash *(FIXED)*
+
+Found by the adversarial review, not by the original backlog.
+
+`maybeSnapshot` persists the snapshot and *then* compacts the log. A crash
+between the two leaves a durable snapshot at index N while the log file still
+holds the uncompacted log. WAL records carry a term and a payload but **not their
+absolute index** — replay infers the index from the record's position — so
+recovery re-based the uncompacted entries against the snapshot's index and
+renumbered every one of them. Entry 1 became entry N+1, carrying entry 1's term
+to a completely different index: a silent log-matching violation.
+
+Fixed by making the log self-describing. A base marker (`RAFT_BASE_OP`,
+`[baseIndex:4][baseTerm:4]`) is written as the first record of the *same atomic
+replacement* that compacts, truncates or resets the log, so the base and the
+entries can never disagree — including after a crash, since the file is entirely
+one version or the other. Replay takes the base from the marker when present and
+falls back to the caller-supplied base otherwise, which keeps logs written before
+this change readable.
+
+`resetTo` previously deleted the log outright; an empty file recovers as a log
+starting at index 1, contradicting the installed snapshot. It now writes a
+marker-only log through the same atomic path.
+
+## Crash matrix (all rows automated)
+
+| Operation | Crash point | Recovered state |
+|---|---|---|
+| append | partial record | prior records intact; tail truncated; appends resume |
+| append | after force | record present |
+| truncate | AFTER_TEMP_WRITE / AFTER_TEMP_FORCE / BEFORE_RENAME | complete pre-truncation log |
+| truncate | AFTER_RENAME / AFTER_DIRECTORY_SYNC | complete post-truncation log |
+| compact | before rename | complete pre-compaction log |
+| compact | after rename | retained tail complete, at correct absolute indexes |
+| snapshot saved, compact interrupted | — | uncompacted log at original indexes |
+| resetTo | — | empty log at the snapshot's base |
+
+`RaftLogCrashSafetyTest` drives these in-JVM via a failure injector;
+`RaftLogProcessCrashTest` repeats the critical ones in a **real subprocess killed
+with `Runtime.halt()`**, which runs no shutdown hooks and flushes nothing, so
+anything readable afterwards was genuinely on disk.
+
+**The tests were validated against the old implementation**: reverting
+`truncateFrom` to clear-then-rewrite fails 3 of them. Two others passed
+vacuously in that state (the old path never reaches an instrumented boundary), so
+they now assert that a crash was actually injected before drawing a conclusion.
+
+## Remaining durability limitations (explicit)
+
+1. **No per-record checksum.** Damage that leaves a *plausible* header is
+   indistinguishable from valid data. Recovery assumes a crash truncates an
+   append rather than leaving arbitrary bytes in its place — true for a
+   sequential fsynced writer on a journaling filesystem, not guaranteed by POSIX
+   for the final block. A CRC32 per record would close this; it was not added
+   because it changes the on-disk format, and the mission scope favoured the
+   simplest design that preserves the existing model.
+2. **Directory fsync is skipped on Windows**, which cannot open a directory as a
+   `FileChannel`. `ATOMIC_MOVE` there uses `MOVEFILE_WRITE_THROUGH`, which
+   carries the ordering. This is a documented platform assumption, not a verified
+   guarantee on every Windows filesystem.
+3. **Orphaned temp files** (`.wal-replace-*`) can survive a hard kill, since a
+   killed process cannot run its own cleanup. They are inert — recovery reads
+   only the authoritative log — but nothing sweeps them.
+4. **`maybeSnapshot` is still two operations**, not one atomic unit. The base
+   marker makes the interrupted state *recoverable and consistent*, not
+   *impossible*.

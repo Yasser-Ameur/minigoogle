@@ -5,6 +5,123 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Make Raft persistence crash-safe (P1)
+
+### Problem
+
+Three defects in how the Raft log reached disk. The first two were on the P1
+backlog; the third was found by the adversarial review afterwards.
+
+1. **WAL replay could not tolerate a torn tail.** `readAll` read records with no
+   bounds checking. A crash mid-append left a partial trailing record and replay
+   threw, so **the node refused to start** — the normal outcome of a normal crash.
+2. **Truncation and compaction deleted the log before rewriting it.**
+   `wal.clear()` is `Files.deleteIfExists`; a crash before the survivors were
+   re-appended lost **the entire persisted log, including committed entries**.
+   `truncateFrom`'s retained prefix is precisely the agreed, committed portion.
+3. **Snapshot and log could disagree after a crash.** `maybeSnapshot` saves the
+   snapshot then compacts. A crash between leaves a durable snapshot at index N
+   with the uncompacted log still on disk. WAL records carry a term and payload
+   but **not their absolute index**, so replay re-based the uncompacted entries
+   against the snapshot and renumbered every one — attaching entry 1's term to
+   index N+1. A silent log-matching violation.
+
+### Root cause
+
+The Raft log was the only store using destructive persistence.
+`RaftMetadataStore`, `RaftAppliedStore`, `RaftConfigurationStore` and
+`RaftSnapshotStore` all already used write-temp → `force(true)` → `ATOMIC_MOVE`.
+The log alone did delete-then-rewrite, and alone had no way to describe which
+absolute index its first record represented.
+
+### Failure scenario
+
+`truncateFrom(4)` on a 10-entry log whose entries 1–3 are committed: the process
+dies after `Files.deleteIfExists` and before the third re-append completes. The
+node restarts with a shorter log — or none at all — and rejoins the cluster
+advertising a log that is missing committed entries.
+
+### Implementation
+
+- `WriteAheadLog.replaceAll(entries)` — write a temp file in the log's own
+  directory, `force(true)`, `ATOMIC_MOVE` over the live log, fsync the directory.
+  `truncateFrom`, `compact` and `resetTo` all route through it.
+- `WriteAheadLog.readAll` — bounds-checked replay classifying damage explicitly:
+  ran-out-of-bytes is a recoverable torn tail (prefix replayed, file truncated to
+  the last complete record); a negative length or one beyond `maxRecordBytes` is
+  `CorruptWalException`. A corrupt log is left untouched rather than trimmed.
+- `RaftLog.RAFT_BASE_OP` — a base marker `[baseIndex:4][baseTerm:4]` written as
+  the first record of the same atomic replacement that compacts, truncates or
+  resets, so base and entries can never disagree. Replay prefers the marker and
+  falls back to the caller-supplied base, keeping older logs readable.
+
+**A length exceeding the file size is not corruption.** An early version of this
+fix treated it as such; appending a large payload to a short log and crashing
+produces exactly that shape, and it is fully recoverable. The Case C test caught
+it, which is why classification is by shape rather than magnitude.
+
+### Failure-injection test
+
+`WriteAheadLog.setFailureInjector` exposes five persistence boundaries
+(`AFTER_TEMP_WRITE`, `AFTER_TEMP_FORCE`, `BEFORE_RENAME`, `AFTER_RENAME`,
+`AFTER_DIRECTORY_SYNC`); production never installs one.
+
+- `RaftLogCrashSafetyTest` — aborts truncation and compaction at every boundary
+  and asserts on what a fresh `RaftLog` recovers from the files left behind.
+- `RaftLogProcessCrashTest` — repeats the critical cases in a **real subprocess
+  killed with `Runtime.halt()`**, which runs no shutdown hooks and flushes
+  nothing, so anything readable afterwards was genuinely on disk.
+- `WriteAheadLogRecoveryTest` — Cases A–D driven by writing real bytes.
+- `SnapshotLogConsistencyTest` — the snapshot/log divergence window.
+
+**The tests were validated against the old implementation.** Reverting
+`truncateFrom` to clear-then-rewrite fails 3 of them. Two others passed
+*vacuously* in that state, because the old path never reaches an instrumented
+boundary — those now assert a crash was actually injected before concluding
+anything.
+
+### Result
+
+All crash-matrix rows recover to either the complete pre-operation state or the
+complete post-operation state. Full suite: **770 tests, 0 failures**; `bench`
+green.
+
+Persistence cost, both sides measured back to back:
+
+| retained entries | atomic swap p50 | clear+rewrite p50 | change |
+|---|---|---|---|
+| 10 | 1.582 ms | 7.747 ms | 4.9× faster |
+| 100 | 1.669 ms | 61.206 ms | 36.7× faster |
+| 1,000 | 6.850 ms | 2491.309 ms | 363.7× faster |
+
+Crash safety was not a tax — the old path fsynced once per retained entry, the
+new one fsyncs once per file. Append latency (p50 0.492 ms) is unchanged;
+recovery is 0.344 ms at 100 entries and 1.616 ms at 10,000.
+
+### Tradeoffs
+
+- **No per-record checksum.** Damage leaving a *plausible* header is
+  indistinguishable from valid data; recovery assumes a crash truncates an append
+  rather than substituting arbitrary bytes. A CRC32 would close this but changes
+  the on-disk format, and the brief favoured the simplest design preserving the
+  existing model.
+- **Directory fsync is skipped on Windows**, which cannot open a directory as a
+  `FileChannel`; `ATOMIC_MOVE` there uses `MOVEFILE_WRITE_THROUGH`. Documented as
+  a platform assumption, not a verified guarantee on every Windows filesystem.
+- **Orphaned `.wal-replace-*` temp files** can survive a hard kill. They are
+  inert — recovery reads only the authoritative log — but nothing sweeps them.
+- **`maybeSnapshot` is still two operations.** The base marker makes the
+  interrupted state recoverable and consistent, not impossible.
+- The base marker adds one small record to every replaced log.
+
+### Conclusion
+
+Kept. Committed Raft state now survives a crash at any persistence boundary,
+demonstrated by injection at each one and by real process kills — and the
+operations that were previously unsafe also became substantially faster.
+
+---
+
 ## 2026-08-15 — Operationalize the distributed system (P0)
 
 **Problem.**

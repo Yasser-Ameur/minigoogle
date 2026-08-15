@@ -328,3 +328,55 @@ window. Service now resumes essentially the moment a leader exists.
 Single-run caveats from the rest of this document apply: these are three failover
 rounds on a loaded developer machine, so treat the p50 as indicative and the
 election/interruption *gap* as the robust result.
+
+---
+
+## Raft persistence (2026-08-15) — `RaftPersistenceBenchmarks`
+
+Classified COMPONENT. Same machine and JVM as every other section.
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.RaftPersistenceBenchmarks"
+```
+
+### Crash-safe replacement vs the destructive path it replaced
+
+Both sides measured here, back to back, so the comparison is on one filesystem
+rather than against a remembered figure. "clear+rewrite" reconstructs the old
+implementation exactly: delete the log, then append each retained entry back.
+
+| retained entries | atomic swap p50 | clear+rewrite p50 | change |
+|---|---|---|---|
+| 10 | 1.582 ms | 7.747 ms | **4.9× faster** |
+| 100 | 1.669 ms | 61.206 ms | **36.7× faster** |
+| 1,000 | 6.850 ms | 2491.309 ms | **363.7× faster** |
+
+**Crash safety was not a tax here — it removed work.** The old path issued one
+`fsync` *per retained entry*, because it replayed survivors through `append`.
+The atomic replacement writes the whole file and fsyncs once, so cost grows with
+bytes rather than with entry count. The gap widens with the retained size, which
+is exactly the direction that matters: compaction and truncation on a large log
+were the slowest and least safe operations, and are now the biggest winners.
+
+### Append and recovery
+
+| Measurement | Result |
+|---|---|
+| WAL append (one fsync per record) | p50 0.492 ms, p95 0.639 ms, p99 0.986 ms, 1,880 appends/s |
+| Recovery, 100 entries (3.1 KB) | p50 0.344 ms |
+| Recovery, 1,000 entries (32 KB) | p50 0.718 ms |
+| Recovery, 10,000 entries (338 KB) | p50 1.616 ms |
+| Recovery, clean 5,000-entry log | p50 0.413 ms |
+| Recovery, same log with a torn tail | p50 1.094 ms |
+
+Append latency is fsync-bound and unchanged by this work — the append path was
+already correct. Recovery scales with log size as expected. Torn-tail recovery
+costs about 0.7 ms more than a clean read because it additionally truncates the
+file and fsyncs; that is paid once, on the startup of a node that crashed
+mid-append.
+
+### Interpretation
+
+The durability guarantee is affordable in the only sense that matters: nothing
+on the hot path got slower, and the operations that were previously unsafe also
+got substantially faster. There was no correctness/performance trade to make.
