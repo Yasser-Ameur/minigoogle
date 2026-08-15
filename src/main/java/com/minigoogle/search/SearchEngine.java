@@ -260,7 +260,13 @@ public class SearchEngine {
         }
 
         // Re-rank with cross-encoder
-        ranked = reranker.rerank(query, ranked);
+        // The reranker is a semantic signal. Without a vector index it degrades
+        // to a term-overlap fraction computed against the 150-character snippet,
+        // and because it REPLACES finalScore that discards the BM25 + PageRank
+        // ordering entirely. Gate it on the signal actually being available.
+        if (config.rerankEnabled()) {
+            ranked = reranker.rerank(query, ranked);
+        }
 
         return new RetrievalResult(ranked, didYouMean);
     }

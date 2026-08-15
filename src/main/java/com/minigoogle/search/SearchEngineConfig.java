@@ -22,7 +22,8 @@ public record SearchEngineConfig(
         int defaultTopK,
         int rankingTopK,
         boolean pagerankEnabled,
-        boolean diversifyEnabled) {
+        boolean diversifyEnabled,
+        boolean rerankEnabled) {
 
     public static SearchEngineConfig from(Configuration config) {
         boolean semantic = config.getBoolean("semantic.enabled", true);
@@ -34,7 +35,11 @@ public record SearchEngineConfig(
         int rankingTopK = config.getInt("ranking.topK", 20);
         boolean pagerank = config.getBoolean("ranking.pagerank.enabled", true);
         boolean diversify = config.getBoolean("ranking.diversify.enabled", true);
+        // Defaults to the semantic switch: the cross-encoder only carries a real
+        // signal when a vector index exists. With semantic off it replaces the
+        // BM25 ordering with snippet term overlap, which is strictly worse.
+        boolean rerank = config.getBoolean("ranking.rerank.enabled", semantic);
         return new SearchEngineConfig(hybrid, fetchK, lexicalWeight, maxExpansions, topK,
-                rankingTopK, pagerank, diversify);
+                rankingTopK, pagerank, diversify, rerank);
     }
 }
