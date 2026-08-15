@@ -639,3 +639,70 @@ their natural meaning; failures went from 15 to 0.
 | Shard rebalancing | **no** | `Rebalancer`/`ShardManager`/`ReplicaManager` still have 0 construction sites in `src/main` |
 
 The last row is stated in the README rather than left implied.
+
+---
+
+# P1 — Durability gaps (verified, NOT fixed in this pass)
+
+Both were re-verified against the current tree after the P0 work. They are the
+top of the remaining backlog. They are recorded here with exact evidence so the
+next pass does not need to rediscover them.
+
+## Finding 9 — WAL replay cannot tolerate a torn tail
+
+**Observation:** `WriteAheadLog.readAll` reads records with no bounds checking.
+
+**Evidence** (`WriteAheadLog.java:60-66`):
+
+```java
+while (reader.hasRemaining()) {
+    byte op = reader.readByte();
+    int len = reader.readInt();          // no check that 4 bytes remain
+    byte[] payload = new byte[len];      // len is unvalidated
+    buf.get(payload);                    // throws if fewer than len bytes remain
+    entries.add(new WalEntry(op, payload));
+}
+```
+
+`hasRemaining()` only guarantees ≥1 byte. A crash mid-append — the normal way a
+process dies — leaves a partial final record, and replay then throws
+`BufferUnderflowException` (or allocates a garbage-sized array from a torn
+length field). `ClusterNode.createRaftLog` propagates the failure, so **the node
+refuses to start**.
+
+**Intended semantics to settle first:** a torn *tail* is recoverable and should
+truncate to the last complete record — the entry was never acknowledged. A torn
+record in the *middle* is genuine corruption and must not be silently skipped.
+The current code distinguishes neither.
+
+**Status: CONFIRMED, OPEN**
+
+## Finding 10 — `RaftLog.truncateFrom` deletes the log before rewriting it
+
+**Observation:** truncation and compaction are implemented as clear-then-rewrite.
+
+**Evidence** (`RaftLog.java:187-197`):
+
+```java
+wal.clear();                                   // Files.deleteIfExists(logPath)
+for (int i = firstIndex(); i < index; i++) {
+    wal.append(RAFT_ENTRY_OP, toFrame(...));   // re-append the surviving prefix
+}
+```
+
+`clear()` deletes the file outright. A crash between the delete and the
+completion of the re-append loop loses **the entire persisted log, including
+committed entries**. `compact` (`:225-234`) has the same shape.
+
+This is strictly worse than Finding 9: that one fails to start, this one loses
+acknowledged data. It is the single most serious open defect in the repository.
+
+**Fix shape:** write the surviving prefix to a temporary file, fsync it, then
+`ATOMIC_MOVE` it over the live log — so the log is either the old complete file
+or the new complete file, never absent.
+
+**Validation required before claiming crash safety:** deterministic
+failure-injection at each boundary (before replacement, after temp write, after
+flush, after rename), not just a happy-path truncation test.
+
+**Status: CONFIRMED, OPEN**
