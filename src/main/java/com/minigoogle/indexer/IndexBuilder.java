@@ -48,7 +48,14 @@ public class IndexBuilder {
         int docId = currentDocId;
         processedDocs.add(doc);
         
-        String text = doc.text();
+        // Index the title alongside the body. Titles were previously not
+        // tokenized at all, so a document whose only match was in its title was
+        // absent from the candidate set entirely. On BEIR TREC-COVID that
+        // accounted for 1,962 of 6,074 never-retrieved relevant judgments
+        // (32.3%) - the single largest recoverable candidate-recall loss.
+        String title = doc.title() == null ? "" : doc.title();
+        String body = doc.text() == null ? "" : doc.text();
+        String text = title.isEmpty() ? body : (title + " " + body);
         String normalizedText = normalizer.normalize(text);
         List<String> rawTokens = tokenizer.tokenize(normalizedText);
         
