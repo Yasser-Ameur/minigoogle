@@ -1,8 +1,11 @@
-# Build output
-build/
-.gradle/
-out/
-bin/
+# Build output. Anchored to the repository root: a bare `build/` also matches
+# any nested directory of that name, which silently excluded the Java package
+# src/test/java/com/minigoogle/build/ -- DockerfileConsistencyTest was never
+# committed and never ran in CI.
+/build/
+/.gradle/
+/out/
+/bin/
 
 # IDE
 .idea/
