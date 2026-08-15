@@ -21,6 +21,7 @@ import com.minigoogle.query.lexer.TokenType;
 import com.minigoogle.query.QueryStopWordFilter;
 import com.minigoogle.query.parser.Parser;
 import com.minigoogle.query.planner.QueryPlanner;
+import com.minigoogle.ranking.fusion.ReciprocalRankFusion;
 import com.minigoogle.ranking.model.RankedDocument;
 import com.minigoogle.ranking.pipeline.RankingPipeline;
 import com.minigoogle.semantic.EmbeddingGenerator;
@@ -68,8 +69,10 @@ public class SearchEngine {
     private final CaseFolder caseFolder;
     private final PorterStemmer stemmer;
     private final SearchEngineConfig config;
+    private final SemanticCandidateSource semanticSource;
     private final QueryStopWordFilter stopWordFilter = new QueryStopWordFilter();
 
+    /** Lexical-only engine: {@code ranking.mode} beyond BM25 has no source to use. */
     public SearchEngine(QueryPlanner planner,
                         RankingPipeline ranking,
                         Lexer lexer,
@@ -87,6 +90,30 @@ public class SearchEngine {
                         CaseFolder caseFolder,
                         PorterStemmer stemmer,
                         SearchEngineConfig config) {
+        this(planner, ranking, lexer, spellCorrector, queryExpander, reranker, vectorIndex,
+                embeddingGenerator, featureExtractor, dictionary, docUrls, docTitles, docBodies,
+                normalizer, caseFolder, stemmer, config, null);
+    }
+
+    public SearchEngine(QueryPlanner planner,
+                        RankingPipeline ranking,
+                        Lexer lexer,
+                        SpellCorrector spellCorrector,
+                        QueryExpander queryExpander,
+                        CrossEncoderRanker reranker,
+                        VectorIndex vectorIndex,
+                        EmbeddingGenerator embeddingGenerator,
+                        FeatureExtractor featureExtractor,
+                        Map<String, DictionaryEntry> dictionary,
+                        Map<Integer, String> docUrls,
+                        Map<Integer, String> docTitles,
+                        Map<Integer, String> docBodies,
+                        UnicodeNormalizer normalizer,
+                        CaseFolder caseFolder,
+                        PorterStemmer stemmer,
+                        SearchEngineConfig config,
+                        SemanticCandidateSource semanticSource) {
+        this.semanticSource = semanticSource;
         this.planner = planner;
         this.ranking = ranking;
         this.lexer = lexer;
@@ -170,7 +197,9 @@ public class SearchEngine {
         boolean hybridEnabled = config.hybridEnabled()
                 && vectorIndex != null && embeddingGenerator != null;
 
-        if (results.getPostings().isEmpty() && !hybridEnabled) {
+        boolean semanticModeActive = config.rankingMode() != RankingMode.BM25 && semanticSource != null;
+
+        if (results.getPostings().isEmpty() && !hybridEnabled && !semanticModeActive) {
             return new RetrievalResult(List.of(), didYouMean);
         }
 
@@ -259,6 +288,13 @@ public class SearchEngine {
             }
         }
 
+        // Second retrieval channel. BM25 mode leaves the lexical ordering exactly
+        // as it was; the other two modes are applied here, after lexical ranking
+        // and before re-ranking, so all three share one code path.
+        if (semanticModeActive) {
+            ranked = applySemanticMode(query, ranked);
+        }
+
         // Re-rank with cross-encoder
         // The reranker is a semantic signal. Without a vector index it degrades
         // to a term-overlap fraction computed against the 150-character snippet,
@@ -269,6 +305,74 @@ public class SearchEngine {
         }
 
         return new RetrievalResult(ranked, didYouMean);
+    }
+
+    /**
+     * Applies {@code ranking.mode} to a completed lexical ranking.
+     *
+     * <p>RRF combines the two rankings by position only. That is the whole
+     * reason it works here: BM25 is an unbounded sum of IDF-weighted term
+     * contributions and cosine similarity is bounded in [-1, 1], so adding the
+     * two — measured on this corpus — replaced a good ordering with a worse one.
+     * Positions have no such calibration problem.</p>
+     *
+     * <p>It is also the only mechanism so far that can rank a document holding
+     * none of the query terms: {@code RankingPipeline.rank} builds its candidate
+     * map from query-term posting lists and {@code BM25Calculator} guards
+     * {@code tf > 0}, so such a document scores exactly zero lexically. Under RRF
+     * its semantic position alone carries it.</p>
+     */
+    private List<RankedDocument> applySemanticMode(String query, List<RankedDocument> lexical) {
+        List<Integer> semanticIds = semanticSource.retrieve(query, config.semanticDepth());
+        if (semanticIds.isEmpty()) {
+            // Nothing to fuse with. The lexical ranking stands rather than being
+            // replaced by an empty one.
+            return lexical;
+        }
+
+        Map<Integer, RankedDocument> byId = new HashMap<>();
+        for (RankedDocument d : lexical) {
+            byId.put(d.documentId(), d);
+        }
+
+        if (config.rankingMode() == RankingMode.SEMANTIC) {
+            List<RankedDocument> out = new ArrayList<>(semanticIds.size());
+            for (int i = 0; i < semanticIds.size(); i++) {
+                int docId = semanticIds.get(i);
+                // A descending score that carries the semantic order. The
+                // similarity itself is intentionally not surfaced: see
+                // SemanticCandidateSource on why this path handles ranks only.
+                out.add(withFinalScore(byId.get(docId), docId, 1.0 / (i + 1)));
+            }
+            return out;
+        }
+
+        List<Integer> lexicalIds = new ArrayList<>(lexical.size());
+        for (RankedDocument d : lexical) {
+            lexicalIds.add(d.documentId());
+        }
+        List<ReciprocalRankFusion.Fused> fused =
+                new ReciprocalRankFusion(config.fusionK()).fuse(lexicalIds, semanticIds);
+
+        List<RankedDocument> out = new ArrayList<>(fused.size());
+        for (ReciprocalRankFusion.Fused f : fused) {
+            out.add(withFinalScore(byId.get(f.documentId()), f.documentId(), f.score()));
+        }
+        return out;
+    }
+
+    /**
+     * Replaces only the final score, keeping the BM25 and PageRank components
+     * intact for explainability. A document the lexical stage never scored has
+     * its metadata filled in from the document maps, as the hybrid path does.
+     */
+    private RankedDocument withFinalScore(RankedDocument existing, int docId, double score) {
+        if (existing != null) {
+            return new RankedDocument(existing.documentId(), existing.url(), existing.title(),
+                    existing.bm25Score(), existing.pageRankScore(), score, existing.snippet());
+        }
+        return new RankedDocument(docId, docUrls.getOrDefault(docId, ""),
+                docTitles.getOrDefault(docId, ""), 0.0, 0.0, score, snippetFor(docId));
     }
 
     /**

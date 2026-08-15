@@ -16,8 +16,11 @@ import com.minigoogle.ranking.bm25.BM25Parameters;
 import com.minigoogle.ranking.pagerank.GraphBuilder;
 import com.minigoogle.ranking.pagerank.PageRankCalculator;
 import com.minigoogle.ranking.pipeline.RankingPipeline;
+import ai.onnxruntime.OrtException;
 import com.minigoogle.semantic.EmbeddingGenerator;
 import com.minigoogle.semantic.VectorIndex;
+import com.minigoogle.semantic.encoder.SemanticRetriever;
+import com.minigoogle.semantic.encoder.SentenceEncoder;
 import com.minigoogle.semantic.autocomplete.TrieAutocomplete;
 import com.minigoogle.semantic.expansion.PmiThesaurusBuilder;
 import com.minigoogle.semantic.expansion.QueryExpander;
@@ -39,6 +42,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -214,15 +218,76 @@ public final class SearchEngineBuilder {
         FeatureExtractor featureExtractor = new FeatureExtractor(docUrls, docTitles, docBodies,
                 docLengths, pageRankScores, vectorIndex, embeddingGenerator);
 
+        SearchEngineConfig engineConfig = SearchEngineConfig.from(config);
         SearchEngine engine = new SearchEngine(
                 planner, ranking, lexer, spellCorrector, queryExpander, reranker,
                 vectorIndex, embeddingGenerator, featureExtractor, dictionary,
                 docUrls, docTitles, docBodies, normalizer, caseFolder, stemmer,
-                SearchEngineConfig.from(config));
+                engineConfig, buildSemanticSource(engineConfig, config));
 
         return new SearchEngineBuild(
                 engine, mmapIndex, metadata, autocomplete, spellCorrector, ranking, planner,
                 featureExtractor, urlToDocId, docUrls, docTitles, docBodies, docLengths, pageRankScores);
+    }
+
+    /**
+     * Builds the semantic retrieval channel for {@code ranking.mode=semantic|rrf}.
+     *
+     * <p>Requires two artifacts that are expensive and are therefore never built
+     * here: the encoder model ({@code ranking.semantic.modelDir}) and a prebuilt
+     * vector store ({@code ranking.semantic.vectors}, produced by
+     * {@code SemanticRetriever.buildVectorStore}). Embedding a corpus runs at
+     * roughly 9–19 documents per second, so doing it during engine construction
+     * would turn a node start into an hours-long operation.</p>
+     *
+     * <p>A missing artifact fails the build rather than silently degrading to
+     * BM25: the operator asked for a mode, and a node that answers with a
+     * different ranking than it was configured for is a quality regression with
+     * no visible cause.</p>
+     */
+    private static SemanticCandidateSource buildSemanticSource(SearchEngineConfig engineConfig,
+                                                               Configuration config)
+            throws IOException {
+        if (engineConfig.rankingMode() == RankingMode.BM25) {
+            return null;
+        }
+        Path modelDir = Path.of(config.get("ranking.semantic.modelDir", "models/all-MiniLM-L6-v2"));
+        Path vectorFile = Path.of(config.get("ranking.semantic.vectors", ""));
+
+        if (!SentenceEncoder.isAvailable(modelDir)) {
+            throw new IOException("ranking.mode=" + engineConfig.rankingMode().name().toLowerCase(Locale.ROOT)
+                    + " needs an encoder model at " + modelDir
+                    + " (set ranking.semantic.modelDir)");
+        }
+        if (!SemanticRetriever.hasVectorStore(vectorFile)) {
+            throw new IOException("ranking.mode=" + engineConfig.rankingMode().name().toLowerCase(Locale.ROOT)
+                    + " needs a prebuilt vector store; set ranking.semantic.vectors"
+                    + (vectorFile.toString().isEmpty() ? "" : " (no file at " + vectorFile + ")"));
+        }
+
+        int threads = config.getInt("ranking.semantic.threads", 4);
+        SentenceEncoder encoder;
+        try {
+            encoder = SentenceEncoder.load(modelDir,
+                    SentenceEncoder.DEFAULT_MAX_TOKENS, SentenceEncoder.MINILM_DIMENSION, threads);
+        } catch (OrtException e) {
+            throw new IOException("Failed to load the encoder model at " + modelDir, e);
+        }
+        SemanticRetriever retriever = SemanticRetriever.load(encoder, vectorFile);
+
+        return (query, k) -> {
+            try {
+                List<Integer> ids = new ArrayList<>(k);
+                for (SemanticRetriever.Candidate c : retriever.retrieve(query, k)) {
+                    ids.add(c.documentId());
+                }
+                return ids;
+            } catch (OrtException e) {
+                // Loud, not silent: returning an empty list here would look like
+                // "semantic found nothing" and quietly answer with BM25 only.
+                throw new IllegalStateException("Semantic retrieval failed for query: " + query, e);
+            }
+        };
     }
 
     /**

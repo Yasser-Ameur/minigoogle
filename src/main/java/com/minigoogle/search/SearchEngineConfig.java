@@ -1,6 +1,7 @@
 package com.minigoogle.search;
 
 import com.minigoogle.core.config.Configuration;
+import com.minigoogle.ranking.fusion.ReciprocalRankFusion;
 
 /**
  * Retrieval-stage tunables for the shared {@link SearchEngine}. All defaults
@@ -23,7 +24,10 @@ public record SearchEngineConfig(
         int rankingTopK,
         boolean pagerankEnabled,
         boolean diversifyEnabled,
-        boolean rerankEnabled) {
+        boolean rerankEnabled,
+        RankingMode rankingMode,
+        int fusionK,
+        int semanticDepth) {
 
     public static SearchEngineConfig from(Configuration config) {
         // See SearchEngineBuilder: the embedding is feature hashing, not a
@@ -41,7 +45,15 @@ public record SearchEngineConfig(
         // signal when a vector index exists. With semantic off it replaces the
         // BM25 ordering with snippet term overlap, which is strictly worse.
         boolean rerank = config.getBoolean("ranking.rerank.enabled", semantic);
+        // Stays BM25 until a corpus is measured. RRF beat BM25 on both BEIR
+        // datasets tested, but it costs a 384-dimension encoder pass per query
+        // and a prebuilt vector store; a deployment without those must keep
+        // working, and silently defaulting to a mode whose data may be missing
+        // is worse than requiring one line of configuration.
+        RankingMode mode = RankingMode.from(config.get("ranking.mode", "bm25"));
+        int fusionK = config.getInt("ranking.rrf.k", ReciprocalRankFusion.DEFAULT_K);
+        int semanticDepth = config.getInt("ranking.semantic.depth", 1000);
         return new SearchEngineConfig(hybrid, fetchK, lexicalWeight, maxExpansions, topK,
-                rankingTopK, pagerank, diversify, rerank);
+                rankingTopK, pagerank, diversify, rerank, mode, fusionK, semanticDepth);
     }
 }
