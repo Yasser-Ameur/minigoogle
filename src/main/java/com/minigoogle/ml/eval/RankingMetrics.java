@@ -1,5 +1,6 @@
 package com.minigoogle.ml.eval;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -39,34 +40,76 @@ public final class RankingMetrics {
      * @param relevance Graded relevance (0 = not relevant, 1-4 relevant).
      */
     public static Scores evaluate(List<Integer> ranked, Map<Integer, Integer> relevance) {
-        List<Integer> top10 = ranked.size() > DEFAULT_K ? ranked.subList(0, DEFAULT_K) : ranked;
         List<Integer> top5 = ranked.size() > 5 ? ranked.subList(0, 5) : ranked;
         return new Scores(
-                ndcgAt(top10, relevance, DEFAULT_K),
+                // ndcgAt truncates to k internally; pass the full ranking so the
+                // cutoff is applied in exactly one place.
+                ndcgAt(ranked, relevance, DEFAULT_K),
                 map(ranked, relevance),
                 recallAt(top5, relevance),
                 precisionAt(top5, relevance),
                 mrr(ranked, relevance));
     }
 
+    /**
+     * NDCG@K with the standard TREC formulation: gain {@code 2^rel - 1},
+     * discount {@code 1/log2(rank+1)}, normalized by the ideal ranking.
+     *
+     * <p>The ideal ranking (IDCG) is the best achievable ordering of the judged
+     * documents truncated at {@code k}, and is deliberately <em>independent of
+     * how many documents the system returned</em>. Scaling the ideal down to the
+     * served list length would let a system that returns a single relevant
+     * document score a perfect 1.0, which rewards returning fewer results.</p>
+     *
+     * <p>Negative judgments (some qrel formats use -1 for "explicitly
+     * non-relevant") are clamped to 0, so they contribute no gain rather than a
+     * negative one.</p>
+     *
+     * @param ranked    served document ids in rank order
+     * @param relevance graded relevance per document id
+     * @param k         cutoff; values &lt;= 0 yield 0.0
+     * @return NDCG@K in [0, 1], or 0.0 when no relevant document is judged
+     */
     public static double ndcgAt(List<Integer> ranked, Map<Integer, Integer> relevance, int k) {
-        if (ranked.isEmpty()) {
+        if (ranked == null || ranked.isEmpty() || relevance == null || relevance.isEmpty() || k <= 0) {
             return 0.0;
         }
+
         double dcg = 0.0;
-        for (int i = 0; i < Math.min(k, ranked.size()); i++) {
-            double gain = Math.pow(2, relevance.getOrDefault(ranked.get(i), 0)) - 1.0;
-            dcg += gain / log2(i + 2);
+        int served = Math.min(k, ranked.size());
+        for (int i = 0; i < served; i++) {
+            dcg += gain(relevance.getOrDefault(ranked.get(i), 0)) / log2(i + 2);
         }
-        double idcg = 0.0;
+
+        // Ideal ranking: the k highest judgments available, regardless of what
+        // the system actually returned.
         List<Integer> ideal = relevance.values().stream()
-                .sorted((a, b) -> Integer.compare(b, a))
-                .limit(Math.min(k, ranked.size()))
+                .map(RankingMetrics::clampGrade)
+                .filter(grade -> grade > 0)
+                .sorted(Comparator.reverseOrder())
+                .limit(k)
                 .toList();
+
+        double idcg = 0.0;
         for (int i = 0; i < ideal.size(); i++) {
-            idcg += (Math.pow(2, ideal.get(i)) - 1.0) / log2(i + 2);
+            idcg += gain(ideal.get(i)) / log2(i + 2);
         }
+
         return idcg <= 0.0 ? 0.0 : dcg / idcg;
+    }
+
+    /** Convenience alias for the reported headline metric. */
+    public static double ndcgAt10(List<Integer> ranked, Map<Integer, Integer> relevance) {
+        return ndcgAt(ranked, relevance, DEFAULT_K);
+    }
+
+    /** Exponential gain {@code 2^rel - 1}, with negative judgments treated as 0. */
+    private static double gain(int grade) {
+        return Math.pow(2, clampGrade(grade)) - 1.0;
+    }
+
+    private static int clampGrade(int grade) {
+        return Math.max(0, grade);
     }
 
     /**
