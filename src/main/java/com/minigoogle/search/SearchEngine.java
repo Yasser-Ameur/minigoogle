@@ -128,9 +128,9 @@ public class SearchEngine {
         // resolution deserializes the term's posting list from the mapped file.
         // A planner scoped to this query memoizes those lookups so each term is
         // read once. The memo is confined to this call and released with it.
-        
+        QueryPlanner scopedPlanner = planner.forQuery();
         QueryNode expandedAst = queryExpander.expand(ast, config.maxExpansions());
-        PostingList results = planner.execute(expandedAst);
+        PostingList results = scopedPlanner.execute(expandedAst);
 
         // Spell correction fallback
         String didYouMean = null;
@@ -158,7 +158,7 @@ public class SearchEngine {
                 didYouMean = String.join(" ", correctedPieces);
                 QueryNode correctedAst = new Parser(lexer.tokenize(didYouMean)).parse();
                 expandedAst = queryExpander.expand(correctedAst, config.maxExpansions());
-                results = planner.execute(expandedAst);
+                results = scopedPlanner.execute(expandedAst);
             }
         }
 
@@ -179,7 +179,7 @@ public class SearchEngine {
             String processed = stemmer.stem(caseFolder.fold(normalizer.normalize(word)));
             if (!processed.isEmpty()) {
                 QueryNode termNode = new WordNode(processed);
-                PostingList termResults = planner.execute(termNode);
+                PostingList termResults = scopedPlanner.execute(termNode);
                 if (!termResults.getPostings().isEmpty()) {
                     candidatePostings.put(processed, termResults);
                     documentFrequencies.put(processed, termResults.getPostings().size());

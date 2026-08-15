@@ -34,10 +34,47 @@ public class QueryPlanner implements QueryVisitor<PostingList> {
     private final CaseFolder caseFolder = new CaseFolder();
     private final PorterStemmer stemmer = new PorterStemmer();
 
+    /**
+     * Per-query memo of term → posting list, or null on a shared planner.
+     *
+     * <p>A single query reads the same term's postings more than once: the
+     * boolean pass resolves every word leaf of the AST, and the ranking stage
+     * then resolves each leaf again to collect per-term postings. Each read is a
+     * full deserialization of the list from the mapped file. Memoizing within one
+     * query removes the repeat reads.</p>
+     *
+     * <p>The memo lives on a short-lived planner created by {@link #forQuery()},
+     * so it is confined to the executing thread and is released with that
+     * planner. The shared planner keeps this null and stays stateless, which is
+     * what makes concurrent queries safe.</p>
+     */
+    private final Map<String, PostingList> memo;
+
     public QueryPlanner(MemoryMappedIndex index, Map<String, DictionaryEntry> dictionary, int documentCount) {
         this.index = index;
         this.dictionary = dictionary;
         this.universe = buildUniverse(documentCount);
+        this.memo = null;
+    }
+
+    /**
+     * Creates a query-scoped planner that memoizes term lookups. Shares the
+     * index, dictionary and document universe with this planner (no copying),
+     * and adds a memo private to the returned instance.
+     *
+     * <p>Safe because the index and dictionary are immutable for this planner's
+     * lifetime: a rebuild publishes a whole new engine rather than mutating this
+     * one, so a memo can never serve a stale posting list.</p>
+     */
+    public QueryPlanner forQuery() {
+        return new QueryPlanner(this);
+    }
+
+    private QueryPlanner(QueryPlanner base) {
+        this.index = base.index;
+        this.dictionary = base.dictionary;
+        this.universe = base.universe;
+        this.memo = new java.util.HashMap<>();
     }
 
     /**
@@ -65,12 +102,28 @@ public class QueryPlanner implements QueryVisitor<PostingList> {
         if (processed == null || processed.isEmpty()) {
             return new PostingList();
         }
+        if (memo != null) {
+            PostingList cached = memo.get(processed);
+            if (cached != null) {
+                return cached;
+            }
+        }
         DictionaryEntry entry = dictionary.get(processed);
         if (entry == null) {
-            return new PostingList();
+            // Cache the miss too: an absent term is resolved once per query
+            // rather than on every occurrence.
+            PostingList empty = new PostingList();
+            if (memo != null) {
+                memo.put(processed, empty);
+            }
+            return empty;
         }
         try {
-            return index.readPostingList(entry.postingOffset());
+            PostingList pl = index.readPostingList(entry.postingOffset());
+            if (memo != null) {
+                memo.put(processed, pl);
+            }
+            return pl;
         } catch (java.io.IOException e) {
             throw new RuntimeException("Failed to read posting list at offset " + entry.postingOffset(), e);
         }
