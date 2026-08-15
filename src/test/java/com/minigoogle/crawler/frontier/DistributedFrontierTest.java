@@ -12,6 +12,12 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -131,6 +137,31 @@ class DistributedFrontierTest {
     }
 
     @Test
+    void testFreshHeartbeatNotFlaggedStale() {
+        WorkerHeartbeat heartbeat = new WorkerHeartbeat("worker-1", Duration.ofMillis(200));
+        frontier.registerWorkerHeartbeat(heartbeat);
+        // The worker ticks its own heartbeat while idle/running.
+        heartbeat.tick();
+
+        List<String> failed = frontier.checkWorkerHealth();
+        assertTrue(failed.isEmpty(), "A freshly heartbeated worker must not be flagged stale");
+    }
+
+    @Test
+    void testCompleteTaskUpdatesWorkerHeartbeat() {
+        WorkerHeartbeat heartbeat = new WorkerHeartbeat("worker-1", Duration.ofSeconds(10));
+        frontier.registerWorkerHeartbeat(heartbeat);
+
+        frontier.addUrl(URI.create("https://example.com"), 0);
+        frontier.requestWork("worker-1");
+        assertNotNull(heartbeat.getCurrentTask(), "Assigned task should be tracked on the heartbeat");
+
+        frontier.completeTask("https://example.com");
+        assertNull(heartbeat.getCurrentTask());
+        assertEquals(1, heartbeat.getTotalTasksCompleted());
+    }
+
+    @Test
     void testGetStats() {
         frontier.addUrl(URI.create("https://example.com"), 0);
         Map<String, Object> stats = frontier.getStats();
@@ -217,5 +248,114 @@ class DistributedFrontierTest {
         frontier.completeTask(task.getUrl().toString());
 
         assertTrue(frontier.requestWork("worker-1").isEmpty(), "Not-yet-due tasks should not be recrawled");
+    }
+
+    @Test
+    void testConcurrentDuplicateEnqueueEnqueuesOnlyOnce() throws InterruptedException {
+        int threads = 16;
+        URI url = URI.create("https://example.com/same-url");
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        for (int i = 0; i < threads; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (frontier.addUrl(url, 1)) {
+                    accepted.incrementAndGet();
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS), "Enqueue threads did not finish");
+
+        assertEquals(1, accepted.get(), "Exactly one concurrent enqueue should win the dedup race");
+        assertEquals(1, frontier.getRegistrySize());
+        assertEquals(1L, frontier.getStats().get("totalEnqueued"));
+        assertEquals(threads - 1L, frontier.getStats().get("totalDuplicates"));
+
+        Optional<CrawlTask> dispatched = frontier.requestWork("worker-1");
+        assertTrue(dispatched.isPresent());
+        Optional<CrawlTask> second = frontier.requestWork("worker-1");
+        assertTrue(second.isEmpty(), "The URL must not be dispatched twice from the scheduler");
+    }
+
+    @Test
+    void testRegistryEvictedDownToLimit() {
+        DistributedFrontier small = new DistributedFrontier(10000, 0.01, 5000, 5);
+
+        for (int i = 0; i < 5; i++) {
+            small.addUrl(URI.create("https://example.com/p" + i), 0);
+        }
+        small.completeTask("https://example.com/p0");
+        small.completeTask("https://example.com/p1");
+        small.completeTask("https://example.com/p2");
+
+        // Two more URLs: the registry is at its limit of 5, so each enqueue
+        // evicts one completed task. After both, all three completed tasks
+        // (p0, p1, p2) have been reclaimed.
+        small.addUrl(URI.create("https://example.com/p5"), 0);
+        small.addUrl(URI.create("https://example.com/p6"), 0);
+
+        assertEquals(5, small.getRegistrySize(),
+                "Registry must be held at its limit while completed tasks remain to evict");
+
+        // Active tasks are never eviction candidates, so all four must survive.
+        assertNotNull(small.getTask("https://example.com/p3"), "Active queued tasks must be retained");
+        assertNotNull(small.getTask("https://example.com/p4"));
+        assertNotNull(small.getTask("https://example.com/p5"));
+        assertNotNull(small.getTask("https://example.com/p6"));
+
+        // Exactly two of the three completed tasks were reclaimed to make room.
+        // Which two is not asserted: the eviction order sorts by discoveredAt,
+        // and these tasks are enqueued far faster than the clock's resolution,
+        // so ties are broken by registry iteration order.
+        long completedRemaining = Stream.of("p0", "p1", "p2")
+                .filter(p -> small.getTask("https://example.com/" + p) != null)
+                .count();
+        assertEquals(1, completedRemaining,
+                "Completed tasks must be the ones evicted to honor the limit");
+    }
+
+    /**
+     * Active tasks are never evicted, so once the active set alone exceeds the
+     * configured limit the registry legitimately grows past it. This pins that
+     * documented trade-off: bounding the registry must never cost us a queued
+     * task, because dropping one would lose the URL entirely (the bloom filter
+     * prevents it from ever being re-enqueued).
+     */
+    @Test
+    void testRegistryGrowsPastLimitWhenAllTasksAreActive() {
+        DistributedFrontier small = new DistributedFrontier(10000, 0.01, 5000, 5);
+
+        for (int i = 0; i < 9; i++) {
+            small.addUrl(URI.create("https://example.com/a" + i), 0);
+        }
+
+        assertEquals(9, small.getRegistrySize(),
+                "Queued tasks must never be evicted to satisfy the registry limit");
+        for (int i = 0; i < 9; i++) {
+            assertNotNull(small.getTask("https://example.com/a" + i),
+                    "active task a" + i + " must be retained");
+        }
+    }
+
+    @Test
+    void testActiveTasksNeverEvicted() {
+        DistributedFrontier small = new DistributedFrontier(10000, 0.01, 5000, 3);
+        for (int i = 0; i < 10; i++) {
+            small.addUrl(URI.create("https://example.com/p" + i), 0);
+        }
+
+        assertEquals(10, small.getRegistrySize(), "Queued tasks cannot be evicted");
+        for (int i = 0; i < 10; i++) {
+            assertNotNull(small.getTask("https://example.com/p" + i));
+        }
     }
 }

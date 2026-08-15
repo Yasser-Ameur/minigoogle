@@ -23,12 +23,16 @@ public class DistributedFrontier {
 
     private static final Logger logger = LoggerFactory.getLogger(DistributedFrontier.class);
 
+    /** Default cap on the number of task metadata entries retained in the registry. */
+    public static final int DEFAULT_MAX_REGISTRY_SIZE = 1_000_000;
+
     private final BloomFilter bloomFilter;
     private final UrlScheduler scheduler;
     private final ConcurrentHashMap<String, CrawlTask> taskRegistry;
     private final ConcurrentHashMap<String, WorkerHeartbeat> workerHeartbeats;
     private final ReentrantLock assignmentLock;
     private final long heartbeatTimeoutMillis;
+    private final int maxRegistrySize;
 
     private volatile long totalEnqueued;
     private volatile long totalDuplicates;
@@ -38,12 +42,17 @@ public class DistributedFrontier {
     private volatile java.util.function.Function<URI, Instant> recrawlPolicy;
 
     public DistributedFrontier(int bloomFilterExpectedElements, double bloomFilterFalsePositiveRate, long heartbeatTimeoutMillis) {
+        this(bloomFilterExpectedElements, bloomFilterFalsePositiveRate, heartbeatTimeoutMillis, DEFAULT_MAX_REGISTRY_SIZE);
+    }
+
+    public DistributedFrontier(int bloomFilterExpectedElements, double bloomFilterFalsePositiveRate, long heartbeatTimeoutMillis, int maxRegistrySize) {
         this.bloomFilter = new BloomFilter(bloomFilterExpectedElements, bloomFilterFalsePositiveRate);
         this.scheduler = new UrlScheduler();
         this.taskRegistry = new ConcurrentHashMap<>();
         this.workerHeartbeats = new ConcurrentHashMap<>();
         this.assignmentLock = new ReentrantLock();
         this.heartbeatTimeoutMillis = heartbeatTimeoutMillis;
+        this.maxRegistrySize = maxRegistrySize;
         this.totalEnqueued = 0;
         this.totalDuplicates = 0;
         this.totalAssigned = 0;
@@ -64,12 +73,56 @@ public class DistributedFrontier {
         bloomFilter.add(urlString);
 
         CrawlTask task = new CrawlTask(url, domain, depth, Instant.now());
-        taskRegistry.put(urlString, task);
+        CrawlTask existing = taskRegistry.putIfAbsent(urlString, task);
+        if (existing != null) {
+            totalDuplicates++;
+            logger.debug("Duplicate URL rejected (concurrent enqueue): {}", url);
+            return false;
+        }
+
         scheduler.submitTask(task);
         totalEnqueued++;
 
+        evictToLimit();
+
         logger.debug("Enqueued URL: {} (total: {}, duplicates: {})", url, totalEnqueued, totalDuplicates);
         return true;
+    }
+
+    /**
+     * Bounds the task registry to {@code maxRegistrySize} by evicting the oldest
+     * completed (INDEXED/FETCHED/FAILED) tasks. Deduplication is preserved
+     * independently by the bloom filter, so evicted URLs are never re-enqueued;
+     * the trade-off is that evicted completed tasks are no longer eligible for
+     * recrawl scheduling. Active (QUEUED/RETRY/ASSIGNED) tasks are never evicted.
+     */
+    public void evictToLimit() {
+        if (taskRegistry.size() <= maxRegistrySize) {
+            return;
+        }
+        long toEvict = taskRegistry.size() - maxRegistrySize;
+        List<Map.Entry<String, CrawlTask>> evictionCandidates = new ArrayList<>();
+        for (Map.Entry<String, CrawlTask> entry : taskRegistry.entrySet()) {
+            UrlState state = entry.getValue().getState();
+            if (state == UrlState.INDEXED || state == UrlState.FETCHED || state == UrlState.FAILED) {
+                evictionCandidates.add(entry);
+            }
+        }
+        evictionCandidates.sort(Comparator.comparing(e -> e.getValue().getDiscoveredAt()));
+        long evicted = 0;
+        for (Map.Entry<String, CrawlTask> entry : evictionCandidates) {
+            if (evicted >= toEvict || taskRegistry.size() <= maxRegistrySize) {
+                break;
+            }
+            taskRegistry.remove(entry.getKey(), entry.getValue());
+            evicted++;
+        }
+        if (evicted > 0) {
+            logger.info("Evicted {} completed task(s); registry size now {}", evicted, taskRegistry.size());
+        }
+        if (taskRegistry.size() > maxRegistrySize) {
+            logger.warn("Registry still exceeds limit ({}) with no more completed tasks to evict", maxRegistrySize);
+        }
     }
 
     public boolean isDuplicate(URI url) {
@@ -118,8 +171,17 @@ public class DistributedFrontier {
                 task.setNextCrawl(recrawlPolicy.apply(task.getUrl()));
             }
             totalCompleted++;
+
+            String workerId = task.getAssignedWorkerId();
+            WorkerHeartbeat heartbeat = workerId != null ? workerHeartbeats.get(workerId) : null;
+            if (heartbeat != null) {
+                heartbeat.completeTask();
+            }
+
             scheduler.onTaskCompleted(urlString);
             logger.debug("Task completed: {}", urlString);
+
+            evictToLimit();
         }
     }
 

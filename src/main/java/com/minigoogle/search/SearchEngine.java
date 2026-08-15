@@ -1,5 +1,6 @@
 package com.minigoogle.search;
 
+import com.minigoogle.indexer.inverted.Posting;
 import com.minigoogle.indexer.inverted.PostingList;
 import com.minigoogle.indexer.normalization.CaseFolder;
 import com.minigoogle.indexer.normalization.UnicodeNormalizer;
@@ -7,10 +8,16 @@ import com.minigoogle.indexer.stemming.PorterStemmer;
 import com.minigoogle.ml.features.FeatureExtractor;
 import com.minigoogle.ml.features.NormalizationContext;
 import com.minigoogle.ml.features.RawFeatures;
+import com.minigoogle.query.ast.AndNode;
+import com.minigoogle.query.ast.NotNode;
+import com.minigoogle.query.ast.OrNode;
+import com.minigoogle.query.ast.PhraseNode;
 import com.minigoogle.query.ast.QueryNode;
+import com.minigoogle.query.ast.QueryVisitor;
 import com.minigoogle.query.ast.WordNode;
 import com.minigoogle.query.lexer.Lexer;
 import com.minigoogle.query.lexer.Token;
+import com.minigoogle.query.lexer.TokenType;
 import com.minigoogle.query.parser.Parser;
 import com.minigoogle.query.planner.QueryPlanner;
 import com.minigoogle.ranking.model.RankedDocument;
@@ -27,6 +34,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -105,44 +113,52 @@ public class SearchEngine {
      * (standalone) or by the coordinator (distributed).
      */
     public RetrievalResult retrieveCandidates(String query, int pageSize) {
-        // Expand query with synonyms. Expansions are OR-ed with the original
-        // terms so a single-word query (e.g. "text") is not turned into an
-        // AND query that requires every expanded term to match.
-        List<String> expandedTerms = queryExpander.expand(query, config.maxExpansions());
-        String expandedQuery = String.join(" OR ", expandedTerms);
-
-        // Parse and execute query
-        List<Token> tokens = lexer.tokenize(expandedQuery);
-        Parser parser = new Parser(tokens);
-        QueryNode ast = parser.parse();
-        PostingList results = planner.execute(ast);
+        // Parse the original query first so quoted phrases and boolean
+        // structure are preserved. Expansion then rewrites only the word leaves
+        // (OR-ing each word with its synonyms) and never touches phrase nodes,
+        // so exact-phrase semantics survive expansion. Adjacent unquoted words
+        // keep the parser's documented implicit-AND behavior.
+        List<Token> tokens = lexer.tokenize(query);
+        QueryNode ast = new Parser(tokens).parse();
+        if (ast == null) {
+            return new RetrievalResult(List.of(), null);
+        }
+        // Query-scoped planner: the boolean pass below and the per-term ranking
+        // pass further down both resolve the same word leaves, and each
+        // resolution deserializes the term's posting list from the mapped file.
+        // A planner scoped to this query memoizes those lookups so each term is
+        // read once. The memo is confined to this call and released with it.
+        
+        QueryNode expandedAst = queryExpander.expand(ast, config.maxExpansions());
+        PostingList results = planner.execute(expandedAst);
 
         // Spell correction fallback
         String didYouMean = null;
         if (results.getPostings().isEmpty()) {
-            List<String> corrected = new ArrayList<>();
-            List<Token> origTokens = lexer.tokenize(query);
-            for (Token t : origTokens) {
+            List<String> correctedPieces = new ArrayList<>();
+            List<String> originalPieces = new ArrayList<>();
+            for (Token t : tokens) {
+                if (t.type() == TokenType.PHRASE) {
+                    // Phrases are exact-match units; keep them verbatim.
+                    String quoted = "\"" + t.value() + "\"";
+                    originalPieces.add(quoted);
+                    correctedPieces.add(quoted);
+                    continue;
+                }
                 String stemmed = stemmer.stem(caseFolder.fold(normalizer.normalize(t.value())));
-                if (stemmed.isEmpty()) continue;
-                if (dictionary.containsKey(stemmed)) {
-                    corrected.add(t.value());
+                originalPieces.add(t.value());
+                if (stemmed.isEmpty() || dictionary.containsKey(stemmed)) {
+                    correctedPieces.add(t.value());
                 } else {
                     String fix = spellCorrector.correct(stemmed);
-                    if (!fix.equals(stemmed)) {
-                        corrected.add(fix);
-                    } else {
-                        corrected.add(t.value());
-                    }
+                    correctedPieces.add(fix.equals(stemmed) ? t.value() : fix);
                 }
             }
-            if (!corrected.equals(origTokens.stream().map(Token::value).collect(Collectors.toList()))) {
-                didYouMean = String.join(" ", corrected);
-                String correctedQuery = String.join(" ", corrected);
-                List<String> correctedExpanded = queryExpander.expand(correctedQuery, config.maxExpansions());
-                tokens = lexer.tokenize(String.join(" ", correctedExpanded));
-                ast = new Parser(tokens).parse();
-                results = planner.execute(ast);
+            if (!correctedPieces.equals(originalPieces)) {
+                didYouMean = String.join(" ", correctedPieces);
+                QueryNode correctedAst = new Parser(lexer.tokenize(didYouMean)).parse();
+                expandedAst = queryExpander.expand(correctedAst, config.maxExpansions());
+                results = planner.execute(expandedAst);
             }
         }
 
@@ -153,12 +169,14 @@ public class SearchEngine {
             return new RetrievalResult(List.of(), didYouMean);
         }
 
-        // Build per-term posting lists for ranking
+        // Build per-term posting lists for ranking from the expanded query's
+        // word leaves (original terms plus synonyms; phrase contents are
+        // handled positionally by the phrase executor and not re-ranked here).
         Map<String, PostingList> candidatePostings = new HashMap<>();
         Map<String, Integer> documentFrequencies = new HashMap<>();
 
-        for (Token token : tokens) {
-            String processed = stemmer.stem(caseFolder.fold(normalizer.normalize(token.value())));
+        for (String word : collectWordLeaves(expandedAst)) {
+            String processed = stemmer.stem(caseFolder.fold(normalizer.normalize(word)));
             if (!processed.isEmpty()) {
                 QueryNode termNode = new WordNode(processed);
                 PostingList termResults = planner.execute(termNode);
@@ -175,8 +193,7 @@ public class SearchEngine {
         }
 
         // Rank with BM25 + PageRank
-        List<String> queryTerms = tokens.stream()
-            .map(t -> t.value())
+        List<String> queryTerms = collectWordLeaves(expandedAst).stream()
             .map(v -> stemmer.stem(caseFolder.fold(normalizer.normalize(v))))
             .filter(t -> !t.isEmpty())
             .collect(Collectors.toList());
@@ -185,8 +202,23 @@ public class SearchEngine {
         if (results.getPostings().isEmpty()) {
             // No lexical matches; rely on semantic recall below.
             ranked = new ArrayList<>();
+        } else if (queryTerms.isEmpty() || expandedAst instanceof NotNode) {
+            // No individual word leaves to score (pure phrase query) or the
+            // root is NOT, so the matched set is a complement of the term
+            // postings (nothing to BM25-rank against); rank the matched
+            // documents directly instead of dropping them.
+            ranked = rankedFromPostings(results);
         } else {
             ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
+            // The ranking stage scores every document in the candidate term
+            // posting lists; restrict its output to the documents that satisfy
+            // the boolean query (AND/OR/NOT/phrase) computed above.
+            Set<Integer> matchedDocIds = results.getPostings().stream()
+                    .map(Posting::getDocumentId)
+                    .collect(Collectors.toSet());
+            ranked = ranked.stream()
+                    .filter(r -> matchedDocIds.contains(r.documentId()))
+                    .collect(Collectors.toList());
         }
 
         // Hybrid recall: merge lexical candidates with semantically-similar
@@ -260,5 +292,65 @@ public class SearchEngine {
         }
         String cleaned = body.replaceAll("\\s+", " ").trim();
         return cleaned.length() > 160 ? cleaned.substring(0, 160) : cleaned;
+    }
+
+    /**
+     * Collects the raw word leaves of an (expanded) query tree, synonyms
+     * included and phrase contents excluded, for per-term ranking features.
+     */
+    private static List<String> collectWordLeaves(QueryNode root) {
+        WordCollector collector = new WordCollector();
+        root.accept(collector);
+        return collector.words;
+    }
+
+    /**
+     * Builds ranked documents directly from a posting list when the query has
+     * no individual word leaves to score (e.g. a pure phrase query).
+     */
+    private List<RankedDocument> rankedFromPostings(PostingList results) {
+        List<RankedDocument> ranked = new ArrayList<>();
+        for (Posting posting : results.getPostings()) {
+            int docId = posting.getDocumentId();
+            String url = docUrls.getOrDefault(docId, "");
+            String title = docTitles.getOrDefault(docId, "");
+            ranked.add(new RankedDocument(docId, url, title, 0.0, 0.0, 1.0, snippetFor(docId)));
+        }
+        return ranked;
+    }
+
+    private static final class WordCollector implements QueryVisitor<List<String>> {
+        private final List<String> words = new ArrayList<>();
+
+        @Override
+        public List<String> visit(WordNode node) {
+            words.add(node.word());
+            return words;
+        }
+
+        @Override
+        public List<String> visit(PhraseNode node) {
+            return words;
+        }
+
+        @Override
+        public List<String> visit(AndNode node) {
+            node.left().accept(this);
+            node.right().accept(this);
+            return words;
+        }
+
+        @Override
+        public List<String> visit(OrNode node) {
+            node.left().accept(this);
+            node.right().accept(this);
+            return words;
+        }
+
+        @Override
+        public List<String> visit(NotNode node) {
+            node.operand().accept(this);
+            return words;
+        }
     }
 }

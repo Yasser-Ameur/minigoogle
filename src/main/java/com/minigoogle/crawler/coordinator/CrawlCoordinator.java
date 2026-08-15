@@ -1,5 +1,8 @@
 package com.minigoogle.crawler.coordinator;
 
+import com.minigoogle.core.config.Configuration;
+import com.minigoogle.core.config.ConfigurationLoader;
+import com.minigoogle.crawler.downloader.Downloader;
 import com.minigoogle.crawler.downloader.HttpDownloader;
 import com.minigoogle.crawler.frontier.DistributedFrontier;
 import com.minigoogle.crawler.heartbeat.WorkerHeartbeat;
@@ -11,16 +14,19 @@ import com.minigoogle.crawler.persistence.FrontierSnapshot;
 import com.minigoogle.crawler.robots.RobotsCache;
 import com.minigoogle.crawler.robots.RobotsManager;
 import com.minigoogle.crawler.worker.CrawlWorker;
+import com.minigoogle.indexer.CrawlIndexSink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 
 /**
  * Orchestrates the full crawl lifecycle: scheduling, downloading, parsing, and deduplication.
@@ -37,6 +43,7 @@ public class CrawlCoordinator {
     private static final long HEALTH_CHECK_INTERVAL_MS = 5_000;
     private static final long SNAPSHOT_INTERVAL_MS = 300_000;
     private static final String SNAPSHOT_DIR = "snapshots/crawler";
+    private static final int DEFAULT_MAX_DEPTH = 4;
 
     private static final Duration WIKI_RECRAWL_INTERVAL = Duration.ofMinutes(30);
     private static final Duration UNIVERSITY_RECRAWL_INTERVAL = Duration.ofDays(7);
@@ -47,18 +54,35 @@ public class CrawlCoordinator {
     private final StandardUrlNormalizer normalizer;
     private final RobotsCache robotsCache;
     private final FrontierSnapshot snapshot;
+    private final Downloader downloader;
     private final ExecutorService workerPool;
     private final BlockingQueue<ParsedDocument> indexerQueue;
+    private final List<Consumer<ParsedDocument>> indexSinks = new CopyOnWriteArrayList<>();
     private final int numWorkers;
+    private final int maxDepth;
     private volatile boolean running;
 
     public CrawlCoordinator(int numWorkers) {
+        this(numWorkers, DEFAULT_MAX_DEPTH, SNAPSHOT_DIR);
+    }
+
+    public CrawlCoordinator(int numWorkers, int maxDepth) {
+        this(numWorkers, maxDepth, SNAPSHOT_DIR);
+    }
+
+    public CrawlCoordinator(int numWorkers, int maxDepth, String snapshotDir) {
+        this(numWorkers, maxDepth, snapshotDir, new HttpDownloader());
+    }
+
+    public CrawlCoordinator(int numWorkers, int maxDepth, String snapshotDir, Downloader downloader) {
         this.numWorkers = numWorkers;
+        this.maxDepth = maxDepth;
+        this.downloader = downloader;
         this.frontier = new DistributedFrontier(BLOOM_FILTER_EXPECTED_ELEMENTS, BLOOM_FILTER_FALSE_POSITIVE_RATE, HEARTBEAT_TIMEOUT_MS);
         this.frontier.setRecrawlPolicy(this::nextRecrawlInstant);
         this.normalizer = new StandardUrlNormalizer();
         this.robotsCache = new RobotsCache(new RobotsManager());
-        this.snapshot = new FrontierSnapshot(SNAPSHOT_DIR);
+        this.snapshot = new FrontierSnapshot(snapshotDir);
         this.indexerQueue = new LinkedBlockingQueue<>(10000);
         this.workerPool = Executors.newFixedThreadPool(numWorkers);
         this.running = false;
@@ -74,9 +98,7 @@ public class CrawlCoordinator {
             enqueueUrl(seed, 0);
         }
 
-        HttpDownloader downloader = new HttpDownloader();
         JSoupHtmlParser parser = new JSoupHtmlParser();
-
         for (int i = 0; i < numWorkers; i++) {
             String workerId = "worker-" + i;
             WorkerHeartbeat heartbeat = new WorkerHeartbeat(workerId, Duration.ofMillis(HEARTBEAT_TIMEOUT_MS));
@@ -85,11 +107,12 @@ public class CrawlCoordinator {
             CrawlWorker worker = new CrawlWorker(
                 workerId,
                 frontier,
-                downloader,
+                this.downloader,
                 parser,
                 indexerQueue,
                 this::handleParsedDocument,
-                robotsCache
+                robotsCache,
+                heartbeat
             );
             workerPool.submit(worker);
         }
@@ -102,6 +125,13 @@ public class CrawlCoordinator {
                 try {
                     ParsedDocument doc = indexerQueue.take();
                     logger.debug("Indexer queue received: {}", doc.url());
+                    for (Consumer<ParsedDocument> sink : indexSinks) {
+                        try {
+                            sink.accept(doc);
+                        } catch (Exception e) {
+                            logger.error("Index sink failed for {}", doc.url(), e);
+                        }
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -137,7 +167,7 @@ public class CrawlCoordinator {
 
     private void restoreFromSnapshot() {
         try {
-            FrontierSnapshot.SnapshotResult result = FrontierSnapshot.restore(frontier, SNAPSHOT_DIR);
+            FrontierSnapshot.SnapshotResult result = snapshot.restore(frontier);
             if (result.restored()) {
                 frontier.rehydrateScheduler();
                 logger.info("Restored from snapshot: {} tasks in registry", frontier.getRegistrySize());
@@ -151,8 +181,10 @@ public class CrawlCoordinator {
     }
 
     private void handleParsedDocument(ParsedDocument doc) {
+        CrawlTask parent = frontier.getTask(doc.url().toString());
+        int parentDepth = parent != null ? parent.getDepth() : 0;
         for (URI link : doc.outgoingLinks()) {
-            enqueueUrl(link.toString(), 1);
+            enqueueUrl(link.toString(), parentDepth + 1);
         }
     }
 
@@ -161,6 +193,11 @@ public class CrawlCoordinator {
 
         if (normalizedOpt.isPresent()) {
             URI uri = normalizedOpt.get();
+
+            if (depth > maxDepth) {
+                logger.debug("Skipping URL beyond max depth {}: {}", maxDepth, uri);
+                return;
+            }
 
             if (frontier.isDuplicate(uri)) {
                 return;
@@ -274,6 +311,16 @@ public class CrawlCoordinator {
         return indexerQueue;
     }
 
+    /**
+     * Registers a sink that receives every parsed document produced by the
+     * crawler, so downstream subsystems (e.g. the indexer) can consume crawled
+     * pages as they arrive. Sinks run on the coordinator's indexer-consumer
+     * thread and must be safe to call concurrently.
+     */
+    public void addIndexSink(Consumer<ParsedDocument> indexSink) {
+        indexSinks.add(indexSink);
+    }
+
     public boolean isRunning() {
         return running;
     }
@@ -286,10 +333,51 @@ public class CrawlCoordinator {
         logger.info("================================");
     }
 
+    /**
+     * Standalone crawler entry point. Crawls the given seed URLs (or a default
+     * demo seed) and persists every parsed page into a real search index via the
+     * production {@link CrawlIndexSink}, so crawled content is searchable after
+     * the run instead of being log-only.
+     *
+     * <p>Usage: {@code CrawlCoordinator [--config <path>] [--index-dir <dir>] [seedUrl...]}</p>
+     *
+     * @param args optional {@code --config} and {@code --index-dir} followed by seed URLs
+     */
     public static void main(String[] args) {
-        CrawlCoordinator coordinator = new CrawlCoordinator(4);
-        coordinator.start(List.of("https://quotes.toscrape.com"));
+        Path indexDir = Path.of("demo-index/crawled");
+        String configPath = "config/application.yaml";
+        List<String> seeds = new java.util.ArrayList<>();
 
-        Runtime.getRuntime().addShutdownHook(new Thread(coordinator::stop));
+        for (int i = 0; i < args.length; i++) {
+            if ("--config".equals(args[i]) && i + 1 < args.length) {
+                configPath = args[++i];
+            } else if ("--index-dir".equals(args[i]) && i + 1 < args.length) {
+                indexDir = Path.of(args[++i]);
+            } else if (args[i] != null && !args[i].isBlank()) {
+                seeds.add(args[i]);
+            }
+        }
+
+        if (seeds.isEmpty()) {
+            seeds.add("https://quotes.toscrape.com");
+        }
+
+        Configuration config = ConfigurationLoader.load(configPath);
+        int numWorkers = config.getInt("crawler.workers", 4);
+        int maxDepth = config.getInt("crawler.maxDepth", DEFAULT_MAX_DEPTH);
+
+        CrawlCoordinator coordinator = new CrawlCoordinator(numWorkers, maxDepth);
+        CrawlIndexSink indexSink = new CrawlIndexSink(indexDir);
+        coordinator.addIndexSink(indexSink);
+
+        System.out.println("Crawling seeds " + seeds
+            + " (workers=" + numWorkers + ", maxDepth=" + maxDepth
+            + ") into index: " + indexDir);
+        coordinator.start(seeds);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            coordinator.stop();
+            indexSink.close();
+        }));
     }
 }

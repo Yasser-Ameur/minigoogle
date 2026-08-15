@@ -74,8 +74,10 @@ public final class SearchEngineBuilder {
         DictionaryReader dictReader = new DictionaryReader();
         Map<String, DictionaryEntry> dictionary = dictReader.read(indexDir.resolve("dictionary.bin"));
 
+        Metadata metadata = new MetadataReader().read(indexDir.resolve("metadata.bin"));
+
         MemoryMappedIndex mmapIndex = new MemoryMappedIndex(indexDir.resolve("postings.bin"));
-        QueryPlanner planner = new QueryPlanner(mmapIndex, dictionary);
+        QueryPlanner planner = new QueryPlanner(mmapIndex, dictionary, metadata.documentCount());
         Lexer lexer = new Lexer();
         UnicodeNormalizer normalizer = new UnicodeNormalizer();
         CaseFolder caseFolder = new CaseFolder();
@@ -138,7 +140,6 @@ public final class SearchEngineBuilder {
         }
 
         List<IndexedDocument> indexedDocs = new DocumentReader().read(indexDir.resolve("documents.bin"));
-        Metadata metadata = new MetadataReader().read(indexDir.resolve("metadata.bin"));
 
         Map<Integer, IndexedDocument> docIdToIndexed = new HashMap<>();
         for (int i = 0; i < indexedDocs.size(); i++) {
@@ -212,7 +213,7 @@ public final class SearchEngineBuilder {
 
         return new SearchEngineBuild(
                 engine, mmapIndex, metadata, autocomplete, spellCorrector, ranking, planner,
-                featureExtractor, docUrls, docTitles, docBodies, docLengths, pageRankScores);
+                featureExtractor, urlToDocId, docUrls, docTitles, docBodies, docLengths, pageRankScores);
     }
 
     /**

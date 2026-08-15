@@ -45,7 +45,7 @@ class QueryIntegrationTest {
         
         try (MemoryMappedIndex index = new MemoryMappedIndex(postPath)) {
             // 3. Setup Query Engine
-            QueryPlanner planner = new QueryPlanner(index, dictionary);
+            QueryPlanner planner = new QueryPlanner(index, dictionary, 3);
             Lexer lexer = new Lexer();
             
             // Query 1: java AND language
@@ -68,6 +68,22 @@ class QueryIntegrationTest {
             PostingList result3 = planner.execute(ast3);
             
             assertEquals(1, result3.getPostings().size()); // Only doc 3
+
+            // Query 4: NOT java (root-level complement over the universe)
+            Parser parser4 = new Parser(lexer.tokenize("NOT java"));
+            QueryNode ast4 = parser4.parse();
+            PostingList result4 = planner.execute(ast4);
+
+            assertEquals(1, result4.getPostings().size()); // only doc 2
+            assertEquals(2, result4.getPostings().get(0).getDocumentId());
+
+            // Query 5: java AND NOT compiler (nested negation)
+            Parser parser5 = new Parser(lexer.tokenize("java AND NOT compiler"));
+            QueryNode ast5 = parser5.parse();
+            PostingList result5 = planner.execute(ast5);
+
+            assertEquals(1, result5.getPostings().size()); // Only doc 1
+            assertEquals(1, result5.getPostings().get(0).getDocumentId());
         }
     }
 }

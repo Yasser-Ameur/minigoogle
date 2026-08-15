@@ -13,6 +13,7 @@ import com.minigoogle.network.dto.SearchResult;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -80,6 +81,15 @@ class DistributedQueryTest {
     }
 
     @Test
+    void testCacheMultiWordWhitespaceNormalization() {
+        DistributedQueryCache cache = new DistributedQueryCache(100);
+        cache.put("  java   python  ", List.of(new SearchResult("u", "T", "S", 1.0, 1.0, 0.0)), 60_000);
+
+        assertNotNull(cache.get("java python"));
+        assertEquals(1, cache.size(), "Whitespace variants must share one cache entry");
+    }
+
+    @Test
     void testCacheLruEviction() {
         DistributedQueryCache cache = new DistributedQueryCache(2);
         cache.put("q1", List.of(), 60_000);
@@ -117,15 +127,25 @@ class DistributedQueryTest {
 
     @Test
     void testFullDistributedSearchPipeline() {
+        // Counting the shard invocations lets the cache assertion below be
+        // deterministic. The previous version compared executionTimeMs between
+        // the two calls, but both complete in well under a millisecond, so at
+        // millisecond resolution the comparison was scheduling noise, not a
+        // cache check.
+        AtomicInteger shardInvocations = new AtomicInteger();
         List<LocalSearchExecutor> executors = List.of(
-                new LocalSearchExecutor(0, (q, k) -> List.of(
-                        new SearchResult("url-a", "A", q, 9.0, 9.0, 0.0),
-                        new SearchResult("url-b", "B", q, 7.0, 7.0, 0.0)
-                )),
-                new LocalSearchExecutor(1, (q, k) -> List.of(
-                        new SearchResult("url-c", "C", q, 10.0, 10.0, 0.0),
-                        new SearchResult("url-d", "D", q, 6.0, 6.0, 0.0)
-                ))
+                new LocalSearchExecutor(0, (q, k) -> {
+                    shardInvocations.incrementAndGet();
+                    return List.of(
+                            new SearchResult("url-a", "A", q, 9.0, 9.0, 0.0),
+                            new SearchResult("url-b", "B", q, 7.0, 7.0, 0.0));
+                }),
+                new LocalSearchExecutor(1, (q, k) -> {
+                    shardInvocations.incrementAndGet();
+                    return List.of(
+                            new SearchResult("url-c", "C", q, 10.0, 10.0, 0.0),
+                            new SearchResult("url-d", "D", q, 6.0, 6.0, 0.0));
+                })
         );
 
         DistributedSearchCoordinator coordinator = new DistributedSearchCoordinator(
@@ -144,10 +164,18 @@ class DistributedQueryTest {
         assertEquals("url-a", response.results().get(1).url());
         assertEquals("url-b", response.results().get(2).url());
 
-        // Second call should hit cache
+        // Second call must be served from cache: no shard is queried again, and
+        // the results are identical.
+        int invocationsAfterFirstSearch = shardInvocations.get();
+        assertTrue(invocationsAfterFirstSearch > 0, "the first search must query the shards");
+
         SearchResponse cached = coordinator.search("compiler optimization", 3);
-        assertTrue(cached.executionTimeMs() <= response.executionTimeMs());
+        assertEquals(invocationsAfterFirstSearch, shardInvocations.get(),
+                "a cached query must not re-query any shard");
         assertEquals(3, cached.results().size());
+        assertEquals("url-c", cached.results().get(0).url());
+        assertEquals("url-a", cached.results().get(1).url());
+        assertEquals("url-b", cached.results().get(2).url());
 
         coordinator.shutdown();
     }

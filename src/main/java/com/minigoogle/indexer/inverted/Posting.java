@@ -16,6 +16,12 @@ public class Posting {
         this.positions = positions;
     }
 
+    /** Convenience constructor for set-algebra results (NOT universe), where
+     * term frequency and positions are meaningless. */
+    public Posting(int documentId) {
+        this(documentId, 1, List.of());
+    }
+
     public int getDocumentId() {
         return documentId;
     }

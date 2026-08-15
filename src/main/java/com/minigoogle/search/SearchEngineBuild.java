@@ -24,6 +24,7 @@ public record SearchEngineBuild(
         RankingPipeline ranking,
         QueryPlanner planner,
         FeatureExtractor featureExtractor,
+        Map<String, Integer> urlToDocId,
         Map<Integer, String> docUrls,
         Map<Integer, String> docTitles,
         Map<Integer, String> docBodies,

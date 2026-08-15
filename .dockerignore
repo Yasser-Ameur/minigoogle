@@ -4,7 +4,6 @@ build/
 .idea
 *.iml
 demo-index/
-config/
 scripts/
 docs/
 *.md

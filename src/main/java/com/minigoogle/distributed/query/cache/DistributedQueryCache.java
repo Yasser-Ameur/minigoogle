@@ -66,8 +66,16 @@ public class DistributedQueryCache {
         cache.clear();
     }
 
+    /**
+     * Normalizes the cache key from the query's lexical token stream: words are
+     * lowercased and whitespace variants collapse, while boolean operators
+     * (AND/OR/NOT) keep their operator identity. Without this, {@code cat AND
+     * dog} (boolean AND) and {@code cat and dog} (implicit AND) would collide on
+     * the same key. Shared with the standalone cache via {@link
+     * com.minigoogle.query.lexer.QueryKey}.
+     */
     private String normalizeQuery(String query) {
-        return query.strip().toLowerCase();
+        return com.minigoogle.query.lexer.QueryKey.canonicalize(query);
     }
 
     private static class CacheEntry {

@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Orchestrates distributed search requests using the Scatter-Gather pattern.
@@ -55,6 +56,9 @@ import java.util.concurrent.CompletableFuture;
  * merge.</p>
  */
 public class SearchCoordinator {
+
+    /** Default deadline for a full scatter-gather round. */
+    private static final long DEFAULT_TIMEOUT_MS = 5000;
 
     private final RestClient client;
     private final String clusterCoordinatorUrl;
@@ -134,6 +138,20 @@ public class SearchCoordinator {
      * @return List of globally ranked top K results.
      */
     public List<SearchResult> search(String query, int topK) {
+        return search(query, topK, DEFAULT_TIMEOUT_MS);
+    }
+
+    /**
+     * Executes a distributed search query.
+     *
+     * @param query     The user's query string.
+     * @param topK      The number of results to return.
+     * @param timeoutMs Total budget for the scatter-gather round; shards that
+     *                  have not answered by the deadline are skipped so one slow
+     *                  node cannot block the gateway indefinitely.
+     * @return List of globally ranked top K results.
+     */
+    public List<SearchResult> search(String query, int topK, long timeoutMs) {
         // 1. Fetch current cluster state
         ClusterState state = getClusterState();
         if (state == null) {
@@ -164,19 +182,23 @@ public class SearchCoordinator {
             futures.add(future);
         }
 
-        // 4. Gather: Wait for all responses
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        // 4. Gather: wait for all responses up to the deadline, then merge
+        // whatever completed. CompletableFuture.allOf().get(...) returns once
+        // the deadline passes even if some shards are still in flight.
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            // Deadline reached (or interrupted): fall through and gather the
+            // shards that did complete. In-flight shards are skipped below.
+        }
 
         // 5. Merge and rank
         List<SearchResponse> responses = new ArrayList<>(futures.size());
         for (CompletableFuture<SearchResponse> f : futures) {
-            try {
-                SearchResponse response = f.get();
-                if (response != null && response.results() != null) {
-                    responses.add(response);
-                }
-            } catch (Exception ignored) {
-                // Failures are already handled in the exceptionally block
+            SearchResponse response = f.getNow(null);
+            if (response != null && response.results() != null) {
+                responses.add(response);
             }
         }
 

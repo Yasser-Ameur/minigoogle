@@ -3,6 +3,7 @@ package com.minigoogle.ml.ltr;
 import com.minigoogle.ml.features.FeatureName;
 
 import java.util.List;
+import java.util.Random;
 
 /**
  * Pairwise learning-to-rank trainer (RankNet-style logistic loss).
@@ -21,6 +22,13 @@ import java.util.List;
 public final class PairwiseRankerTrainer {
 
     private static final double WEIGHT_DECAY = 1e-4;
+
+    /**
+     * Fixed shuffle seed so the training pass is reproducible: pair order feeds
+     * sequential gradient steps, so an unseeded shuffle made model weights vary
+     * between runs of the same click log.
+     */
+    private static final long PAIR_SHUFFLE_SEED = 42L;
 
     private PairwiseRankerTrainer() {
     }
@@ -45,7 +53,7 @@ public final class PairwiseRankerTrainer {
         double[] step = new double[names.length];
         for (int epoch = 0; epoch < epochs; epoch++) {
             java.util.List<TrainingPair> shuffled = new java.util.ArrayList<>(pairs);
-            java.util.Collections.shuffle(shuffled);
+            java.util.Collections.shuffle(shuffled, new Random(PAIR_SHUFFLE_SEED));
 
             for (TrainingPair pair : shuffled) {
                 double scoreP = model.score(pair.preferred());

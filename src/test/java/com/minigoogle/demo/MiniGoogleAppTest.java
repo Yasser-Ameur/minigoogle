@@ -65,7 +65,7 @@ class MiniGoogleAppTest {
         DictionaryReader dictReader = new DictionaryReader();
         Map<String, DictionaryEntry> dictionary = dictReader.read(dictPath);
         MemoryMappedIndex mmapIndex = new MemoryMappedIndex(postPath);
-        planner = new QueryPlanner(mmapIndex, dictionary);
+        planner = new QueryPlanner(mmapIndex, dictionary, docs.size());
 
         List<IndexedDocument> indexedDocs = new DocumentReader().read(docPath);
         Metadata metadata = new MetadataReader().read(tempDir.resolve("metadata.bin"));

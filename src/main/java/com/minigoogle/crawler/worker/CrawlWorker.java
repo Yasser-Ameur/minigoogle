@@ -2,6 +2,7 @@ package com.minigoogle.crawler.worker;
 
 import com.minigoogle.crawler.downloader.Downloader;
 import com.minigoogle.crawler.frontier.DistributedFrontier;
+import com.minigoogle.crawler.heartbeat.WorkerHeartbeat;
 import com.minigoogle.crawler.model.CrawlTask;
 import com.minigoogle.crawler.model.DownloadedPage;
 import com.minigoogle.crawler.model.ParsedDocument;
@@ -34,10 +35,12 @@ public class CrawlWorker implements Runnable {
     private final Consumer<ParsedDocument> onDocumentParsed;
     private final RobotsCache robotsCache;
     private final ConcurrentLinkedQueue<CompletableFuture<Void>> outstandingRequests;
+    private final WorkerHeartbeat heartbeat;
 
     public CrawlWorker(String workerId, DistributedFrontier frontier, Downloader downloader,
                        HtmlParser parser, BlockingQueue<ParsedDocument> indexerQueue,
-                       Consumer<ParsedDocument> onDocumentParsed, RobotsCache robotsCache) {
+                       Consumer<ParsedDocument> onDocumentParsed, RobotsCache robotsCache,
+                       WorkerHeartbeat heartbeat) {
         this.workerId = workerId;
         this.frontier = frontier;
         this.downloader = downloader;
@@ -46,6 +49,7 @@ public class CrawlWorker implements Runnable {
         this.onDocumentParsed = onDocumentParsed;
         this.robotsCache = robotsCache;
         this.outstandingRequests = new ConcurrentLinkedQueue<>();
+        this.heartbeat = heartbeat;
     }
 
     @Override
@@ -54,6 +58,10 @@ public class CrawlWorker implements Runnable {
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
+                // Keep the heartbeat fresh so an idle or long-running worker is
+                // never falsely detected as stale by the coordinator.
+                heartbeat.tick();
+
                 outstandingRequests.removeIf(CompletableFuture::isDone);
 
                 while (outstandingRequests.size() < MAX_OUTSTANDING_REQUESTS) {
@@ -93,6 +101,7 @@ public class CrawlWorker implements Runnable {
                 logger.debug("Worker {} picked up task: {}", workerId, task.getUrl());
 
                 task.markFetching();
+                heartbeat.tick();
 
                 DownloadedPage page = downloader.download(new com.minigoogle.crawler.model.UrlTask(
                     task.getUrl().toString(),
@@ -100,6 +109,10 @@ public class CrawlWorker implements Runnable {
                     task.getDepth(),
                     task.getDiscoveredAt()
                 ));
+
+                // Downloads are the long pole; refresh liveness right after so a
+                // slow response does not get the worker flagged as dead.
+                heartbeat.tick();
 
                 if (page != null) {
                     Optional<ParsedDocument> parsedOpt = parser.parse(page);

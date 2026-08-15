@@ -16,11 +16,19 @@ public class CrawlCoordinator {
     private final FrontierQueue frontier;
     private final RestServer server;
     private final Gson gson;
+    private final int maxDepth;
+
+    private static final int DEFAULT_MAX_DEPTH = 5;
 
     public CrawlCoordinator(FrontierQueue frontier, int port) {
+        this(frontier, port, DEFAULT_MAX_DEPTH);
+    }
+
+    public CrawlCoordinator(FrontierQueue frontier, int port, int maxDepth) {
         this.frontier = frontier;
         this.server = new RestServer(port);
         this.gson = new Gson();
+        this.maxDepth = maxDepth;
         setupRoutes();
     }
 
@@ -43,6 +51,9 @@ public class CrawlCoordinator {
             DiscoveredLinks req = gson.fromJson(body, DiscoveredLinks.class);
             if (req != null && req.links != null && req.depth != null) {
                 for (String link : req.links) {
+                    if (req.depth + 1 > maxDepth) {
+                        continue;
+                    }
                     String domain = extractDomain(link);
                     frontier.add(new UrlTask(link, domain, req.depth + 1, Instant.now()));
                 }

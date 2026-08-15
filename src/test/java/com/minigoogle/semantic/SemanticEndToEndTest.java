@@ -60,7 +60,7 @@ class SemanticEndToEndTest {
         DictionaryReader dictReader = new DictionaryReader();
         Map<String, DictionaryEntry> dictionary = dictReader.read(dictPath);
         MemoryMappedIndex mmapIndex = new MemoryMappedIndex(postPath);
-        QueryPlanner planner = new QueryPlanner(mmapIndex, dictionary);
+        QueryPlanner planner = new QueryPlanner(mmapIndex, dictionary, docs.size());
         mmapIndex.close();
 
         List<IndexedDocument> indexedDocs = new DocumentReader().read(docPath);
@@ -157,7 +157,7 @@ class SemanticEndToEndTest {
 
         Map<String, DictionaryEntry> dictionary = new DictionaryReader().read(dictPath);
         MemoryMappedIndex mmapIndex = new MemoryMappedIndex(postPath);
-        QueryPlanner planner = new QueryPlanner(mmapIndex, dictionary);
+        QueryPlanner planner = new QueryPlanner(mmapIndex, dictionary, docs.size());
         mmapIndex.close();
 
         List<com.minigoogle.indexer.model.IndexedDocument> indexed =

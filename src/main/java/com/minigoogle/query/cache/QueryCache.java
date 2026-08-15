@@ -79,7 +79,14 @@ public class QueryCache {
         return cache.containsKey(normalizeQuery(query));
     }
 
+    /**
+     * Normalizes the cache key from the query's lexical token stream: words are
+     * lowercased and whitespace variants collapse, while boolean operators
+     * (AND/OR/NOT) keep their operator identity. Without this, {@code cat AND
+     * dog} (boolean AND) and {@code cat and dog} (implicit AND) would collide on
+     * the same key.
+     */
     private String normalizeQuery(String query) {
-        return query.strip().toLowerCase();
+        return com.minigoogle.query.lexer.QueryKey.canonicalize(query);
     }
 }

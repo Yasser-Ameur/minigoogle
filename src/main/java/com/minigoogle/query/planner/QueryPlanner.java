@@ -3,6 +3,7 @@ package com.minigoogle.query.planner;
 import com.minigoogle.query.ast.*;
 import com.minigoogle.query.executor.BooleanExecutor;
 import com.minigoogle.query.executor.PhraseExecutor;
+import com.minigoogle.indexer.inverted.Posting;
 import com.minigoogle.indexer.inverted.PostingList;
 import com.minigoogle.storage.dictionary.DictionaryEntry;
 import com.minigoogle.storage.dictionary.DictionaryReader;
@@ -27,14 +28,29 @@ public class QueryPlanner implements QueryVisitor<PostingList> {
     private final Map<String, DictionaryEntry> dictionary;
     private final BooleanExecutor booleanExecutor = new BooleanExecutor();
     private final PhraseExecutor phraseExecutor = new PhraseExecutor();
-    
+    private final PostingList universe;
+
     private final UnicodeNormalizer normalizer = new UnicodeNormalizer();
     private final CaseFolder caseFolder = new CaseFolder();
     private final PorterStemmer stemmer = new PorterStemmer();
 
-    public QueryPlanner(MemoryMappedIndex index, Map<String, DictionaryEntry> dictionary) {
+    public QueryPlanner(MemoryMappedIndex index, Map<String, DictionaryEntry> dictionary, int documentCount) {
         this.index = index;
         this.dictionary = dictionary;
+        this.universe = buildUniverse(documentCount);
+    }
+
+    /**
+     * The universe of every document in the index (document ids are assigned
+     * contiguously from 1 by the {@link com.minigoogle.indexer.IndexBuilder}),
+     * used as the domain against which NOT is evaluated.
+     */
+    private static PostingList buildUniverse(int documentCount) {
+        List<Posting> postings = new java.util.ArrayList<>(documentCount);
+        for (int docId = 1; docId <= documentCount; docId++) {
+            postings.add(new Posting(docId));
+        }
+        return new PostingList(postings);
     }
 
     public PostingList execute(QueryNode node) {
@@ -99,6 +115,10 @@ public class QueryPlanner implements QueryVisitor<PostingList> {
 
     @Override
     public PostingList visit(NotNode node) {
-        throw new UnsupportedOperationException("NOT operator requires a universe of documents, not supported directly at root level yet.");
+        // NOT x = universe \ x. Evaluated against the full document universe so
+        // that root-level NOT works (e.g. "NOT java") and nested negation
+        // ("a AND NOT b") composes through the set-algebra in intersect().
+        PostingList operand = node.operand().accept(this);
+        return booleanExecutor.difference(universe, operand);
     }
 }

@@ -19,11 +19,13 @@ import com.minigoogle.semantic.knowledge.EntityExtractor;
 import com.minigoogle.semantic.knowledge.KnowledgeGraph;
 import com.minigoogle.semantic.spell.SpellCorrector;
 import com.minigoogle.storage.metadata.Metadata;
+import com.minigoogle.storage.mmap.MemoryMappedIndex;
 import com.minigoogle.search.SearchEngine;
 import com.minigoogle.search.SearchEngineBuild;
 import com.minigoogle.search.SearchEngineBuilder;
 import com.minigoogle.search.RetrievalResult;
 import com.minigoogle.core.cache.LRUCache;
+import com.minigoogle.core.concurrent.ConcurrentIndex;
 import com.minigoogle.core.config.Configuration;
 import com.minigoogle.core.config.ConfigurationLoader;
 import com.minigoogle.core.event.EventBus;
@@ -67,24 +69,25 @@ public class MiniGoogleApp {
     private final List<ParsedDocument> allDocs = new ArrayList<>();
     private Configuration config;
 
-    private SearchEngine searchEngine;
-    private SearchEngineBuild indexBuild;
-    private TrieAutocomplete autocomplete;
-    private SpellCorrector spellCorrector;
-    private Metadata metadata;
     private final QueryAnalytics analytics = new QueryAnalytics();
 
     private Path indexPath;
     private final LRUCache<String, List<com.minigoogle.network.dto.SearchResult>> queryCache = new LRUCache<>(200);
     private final EventBus eventBus = new EventBus();
 
-    private Map<Integer, String> docUrls = new HashMap<>();
-    private KnowledgeGraph knowledgeGraph;
+    /**
+     * Ref-counted snapshot of the full index pipeline, published atomically so
+     * concurrent REST handler threads always observe either the complete
+     * previous index or the complete new index. The previous generation is
+     * closed (memory-mapped postings released, build directory removed) only
+     * once no handler still holds a lease on it, so an active search never sees
+     * a closed index and a reindex can run while other requests are in flight.
+     */
+    private final ConcurrentIndex<IndexState> currentIndex = new ConcurrentIndex<>();
+    private final Object indexLock = new Object();
 
-    private FeatureExtractor featureExtractor;
-    private LinearRankingModel rankingModel;
-    private ClickTracker clickTracker;
-    private ClickFeedbackTrainer clickFeedbackTrainer;
+    /** Monotonically increasing build counter used to name versioned build directories. */
+    private final java.util.concurrent.atomic.AtomicLong buildSeq = new java.util.concurrent.atomic.AtomicLong();
 
     public void start() throws Exception {
         printBanner();
@@ -148,14 +151,18 @@ public class MiniGoogleApp {
 
         // Autocomplete with spell correction fallback
         server.getWithContentType("/api/v1/suggest", "application/json", req -> {
-            try {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                IndexState state = lease.value();
+                if (state == null) {
+                    return "[]";
+                }
                 String prefix = req.replaceAll("^.*[?&]q=", "").replaceAll("&.*$", "");
                 prefix = java.net.URLDecoder.decode(prefix, StandardCharsets.UTF_8).trim().toLowerCase();
-                List<String> suggestions = autocomplete.autocomplete(prefix, 8);
+                List<String> suggestions = state.autocomplete().autocomplete(prefix, 8);
                 if (suggestions.isEmpty() && !prefix.isEmpty()) {
-                    String corrected = spellCorrector.correct(prefix);
+                    String corrected = state.spellCorrector().correct(prefix);
                     if (!corrected.equals(prefix)) {
-                        suggestions = autocomplete.autocomplete(corrected, 8);
+                        suggestions = state.autocomplete().autocomplete(corrected, 8);
                     }
                 }
                 StringBuilder sb = new StringBuilder("[");
@@ -172,12 +179,16 @@ public class MiniGoogleApp {
 
         // Index statistics
         server.getWithContentType("/api/v1/stats", "application/json", req -> {
-            try {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                IndexState state = lease.value();
+                if (state == null) {
+                    return "{\"documentCount\":0,\"vocabularySize\":0,\"averageDocumentLength\":0,\"version\":\"\"}";
+                }
                 return "{" +
-                    "\"documentCount\":" + metadata.documentCount() + "," +
-                    "\"vocabularySize\":" + metadata.vocabularySize() + "," +
-                    "\"averageDocumentLength\":" + metadata.averageDocumentLength() + "," +
-                    "\"version\":\"" + metadata.version() + "\"" +
+                    "\"documentCount\":" + state.metadata().documentCount() + "," +
+                    "\"vocabularySize\":" + state.metadata().vocabularySize() + "," +
+                    "\"averageDocumentLength\":" + state.metadata().averageDocumentLength() + "," +
+                    "\"version\":\"" + state.metadata().version() + "\"" +
                     "}";
             } catch (Exception e) {
                 return "{\"error\":\"" + e.getMessage() + "\"}";
@@ -207,26 +218,43 @@ public class MiniGoogleApp {
             }
         });
 
-        // Click feedback: record a user click for learning-to-rank training
+        // Click feedback: record a user click for learning-to-rank training.
+        // The frontend reports the clicked URL (no documentId), so the document
+        // is resolved from the local corpus when documentId is absent.
         server.post("/api/v1/click", body -> {
-            try {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
                 ClickRequest request = JsonSerializer.fromJson(body, ClickRequest.class);
-                if (request == null || request.query() == null || request.query().trim().isEmpty()
-                        || request.documentId() <= 0) {
-                    return "{\"success\":false,\"error\":\"Missing query or documentId\"}";
+                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                    return "{\"success\":false,\"error\":\"Missing query\"}";
+                }
+                IndexState state = lease.value();
+                if (state == null) {
+                    return "{\"success\":false,\"error\":\"No index available\"}";
+                }
+                int documentId = request.documentId();
+                String url = request.url() != null ? request.url().trim() : "";
+                if (documentId <= 0 && !url.isEmpty()) {
+                    Integer resolved = state.urlToDocId().get(url);
+                    if (resolved != null) {
+                        documentId = resolved;
+                    }
+                }
+                if (documentId <= 0) {
+                    return "{\"success\":false,\"error\":\"Click does not match a local document\"}";
+                }
+                if (url.isEmpty()) {
+                    url = state.docUrls().getOrDefault(documentId, "");
                 }
                 int position = request.position() > 0 ? request.position() : 1;
-                String url = request.url() != null && !request.url().isEmpty()
-                        ? request.url() : docUrls.getOrDefault(request.documentId(), "");
-                ClickEvent event = new ClickEvent(request.query().trim(), request.documentId(),
+                ClickEvent event = new ClickEvent(request.query().trim(), documentId,
                         url, position, null, request.sessionId());
                 int trainedPairs = 0;
-                if (clickFeedbackTrainer != null) {
-                    trainedPairs = clickFeedbackTrainer.onClick(event);
-                } else if (clickTracker != null) {
-                    clickTracker.recordClick(event);
+                if (state.clickFeedbackTrainer() != null) {
+                    trainedPairs = state.clickFeedbackTrainer().onClick(event);
+                } else if (state.clickTracker() != null) {
+                    state.clickTracker().recordClick(event);
                 }
-                return "{\"success\":true,\"documentId\":" + request.documentId()
+                return "{\"success\":true,\"documentId\":" + documentId
                         + ",\"position\":" + position + ",\"trainedPairs\":" + trainedPairs + "}";
             } catch (Exception e) {
                 return "{\"success\":false,\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
@@ -235,7 +263,8 @@ public class MiniGoogleApp {
 
         // Learning-to-rank model and click statistics
         server.getWithContentType("/api/v1/ml/stats", "application/json", req -> {
-            try {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                IndexState state = lease.value();
                 FeatureName[] names = FeatureName.values();
                 StringBuilder featuresJson = new StringBuilder("[");
                 for (int i = 0; i < names.length; i++) {
@@ -243,7 +272,7 @@ public class MiniGoogleApp {
                     featuresJson.append("\"").append(names[i].name()).append("\"");
                 }
                 featuresJson.append("]");
-                double[] weights = rankingModel != null ? rankingModel.weights() : new double[0];
+                double[] weights = state != null && state.rankingModel() != null ? state.rankingModel().weights() : new double[0];
                 StringBuilder weightsJson = new StringBuilder("[");
                 for (int i = 0; i < weights.length; i++) {
                     if (i > 0) weightsJson.append(",");
@@ -251,11 +280,11 @@ public class MiniGoogleApp {
                 }
                 weightsJson.append("]");
                 return "{" +
-                    "\"ltrEnabled\":" + (rankingModel != null) + "," +
+                    "\"ltrEnabled\":" + (state != null && state.rankingModel() != null) + "," +
                     "\"features\":" + featuresJson + "," +
                     "\"weights\":" + weightsJson + "," +
-                    "\"clicks\":" + (clickTracker != null ? clickTracker.clickCount() : 0) + "," +
-                    "\"impressions\":" + (clickTracker != null ? clickTracker.impressionCount() : 0) +
+                    "\"clicks\":" + (state != null && state.clickTracker() != null ? state.clickTracker().clickCount() : 0) + "," +
+                    "\"impressions\":" + (state != null && state.clickTracker() != null ? state.clickTracker().impressionCount() : 0) +
                     "}";
             } catch (Exception e) {
                 return "{\"error\":\"" + e.getMessage() + "\"}";
@@ -264,9 +293,11 @@ public class MiniGoogleApp {
 
         // Knowledge graph entities
         server.getWithContentType("/api/v1/entities", "application/json", req -> {
-            try {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                IndexState state = lease.value();
                 String q = req.replaceAll("^.*[?&]q=", "").replaceAll("&.*$", "");
                 q = java.net.URLDecoder.decode(q, StandardCharsets.UTF_8).trim();
+                KnowledgeGraph knowledgeGraph = state != null ? state.knowledgeGraph() : null;
                 if (knowledgeGraph == null) {
                     return "[]";
                 }
@@ -343,8 +374,10 @@ public class MiniGoogleApp {
                 }
 
                 ParsedDocument doc = parsed.get();
-                allDocs.add(doc);
-                reindex();
+                synchronized (indexLock) {
+                    allDocs.add(doc);
+                    reindex();
+                }
 
                 String title = doc.title() != null && !doc.title().isEmpty() ? doc.title() : url;
                 return "{\"success\":true,\"title\":\"" + title.replace("\"", "\\\"") + "\",\"url\":\"" + url.replace("\"", "\\\"") + "\"}";
@@ -386,6 +419,7 @@ public class MiniGoogleApp {
                         config.getDouble("ml.ltr.learningRate", 0.05))
                 : new SearchCoordinator(coordinatorUrl);
 
+        QueryAnalytics coordinatorAnalytics = new QueryAnalytics();
         RestServer server = new RestServer(port);
         String html = loadResource("/demo/index.html");
         server.getHtml("/", req -> html);
@@ -399,9 +433,11 @@ public class MiniGoogleApp {
                 int topK = config.getInt("search.topK", 20);
                 int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
                 long start = System.currentTimeMillis();
+                long timeoutMs = config.getLong("search.timeoutMs", 5000);
                 List<com.minigoogle.network.dto.SearchResult> results =
-                        searchCoordinator.search(request.query().trim(), pageSize);
+                        searchCoordinator.search(request.query().trim(), pageSize, timeoutMs);
                 long elapsed = System.currentTimeMillis() - start;
+                coordinatorAnalytics.recordQuery(request.query().trim(), results.size(), elapsed);
                 return JsonSerializer.toJson(new SearchResponse(elapsed, results.size(), results));
             } catch (Exception e) {
                 return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
@@ -417,6 +453,40 @@ public class MiniGoogleApp {
                 return "{\"error\":\"" + e.getMessage() + "\"}";
             }
         });
+
+        // The shared frontend is served from every node type, so the coordinator
+        // must register the routes the UI calls. Suggest/stats have no local
+        // index to answer from, so they reply with empty/zero payloads; analytics
+        // is tracked locally; crawl is rejected with a clear message.
+        server.getWithContentType("/api/v1/suggest", "application/json", req -> "[]");
+
+        server.getWithContentType("/api/v1/stats", "application/json", req ->
+            "{\"documentCount\":0,\"vocabularySize\":0,\"averageDocumentLength\":0,\"version\":\"\"}");
+
+        server.getWithContentType("/api/v1/analytics", "application/json", req -> {
+            try {
+                var top = coordinatorAnalytics.getTopQueries(5);
+                StringBuilder topJson = new StringBuilder("[");
+                for (int i = 0; i < top.size(); i++) {
+                    if (i > 0) topJson.append(",");
+                    topJson.append("{\"query\":\"").append(top.get(i).getKey().replace("\"", "\\\""))
+                           .append("\",\"count\":").append(top.get(i).getValue()).append("}");
+                }
+                topJson.append("]");
+                return "{" +
+                    "\"totalQueries\":" + coordinatorAnalytics.getTotalQueries() + "," +
+                    "\"averageLatencyMs\":" + coordinatorAnalytics.getAverageLatencyMs() + "," +
+                    "\"zeroResultRate\":" + coordinatorAnalytics.getZeroResultRate() + "," +
+                    "\"uniqueQueryCount\":" + coordinatorAnalytics.uniqueQueryCount() + "," +
+                    "\"topQueries\":" + topJson +
+                    "}";
+            } catch (Exception e) {
+                return "{\"error\":\"" + e.getMessage() + "\"}";
+            }
+        });
+
+        server.post("/api/v1/crawl", body ->
+            "{\"success\":false,\"error\":\"Coordinator node does not host a local index; add URLs on a standalone or SEARCH-mode node\"}");
 
         // Click feedback: the coordinator attributes the click to its served
         // impression and retrains the shared ranking model when enough new
@@ -506,60 +576,118 @@ public class MiniGoogleApp {
      * supporting structures from the current allDocs list via the shared
      * {@link SearchEngineBuilder}. The composition root only keeps what the
      * REST endpoints need; retrieval itself lives in {@link SearchEngine}.
+     *
+     * <p>Each build writes into its own versioned sub-directory, so the previous
+     * build's memory-mapped postings file is never rewritten or truncated while
+     * it may still be mapped (Windows refuses that with "a user-mapped section
+     * open"). The new state is published atomically through the ref-counted
+     * {@link ConcurrentIndex}; the previous state's mmap is closed and its build
+     * directory removed only once no handler still holds a lease. A failed build
+     * leaves the current index untouched.</p>
      */
     private void reindex() throws IOException {
-        // Release the previous memory-mapped postings file BEFORE rewriting it,
-        // otherwise Windows refuses to truncate a file with a mapped section open.
-        if (indexBuild != null && indexBuild.mmapIndex() != null) {
-            indexBuild.mmapIndex().close();
-            System.gc();
-            System.runFinalization();
-        }
+        synchronized (indexLock) {
+            Path buildDir = indexPath.resolve("builds").resolve("build-" + buildSeq.incrementAndGet());
+            Files.createDirectories(buildDir);
+            try {
+                SearchEngineBuild build = SearchEngineBuilder.build(allDocs, config, buildDir);
 
-        indexBuild = SearchEngineBuilder.build(allDocs, config, indexPath);
-        searchEngine = indexBuild.engine();
-        autocomplete = indexBuild.autocomplete();
-        spellCorrector = indexBuild.spellCorrector();
-        metadata = indexBuild.metadata();
-        docUrls = indexBuild.docUrls();
-        queryCache.clear();
+                Map<Integer, ParsedDocument> docIdToParsed = new HashMap<>();
+                for (int i = 0; i < allDocs.size(); i++) {
+                    docIdToParsed.put(i + 1, allDocs.get(i));
+                }
 
-        Map<Integer, ParsedDocument> docIdToParsed = new HashMap<>();
-        for (int i = 0; i < allDocs.size(); i++) {
-            docIdToParsed.put(i + 1, allDocs.get(i));
-        }
+                // Learning-to-rank + click feedback: feature extractor shares the same
+                // corpus data as the ranking pipeline so serve-time and train-time
+                // feature vectors are identical.
+                int ltrEpochs = config.getInt("ml.ltr.epochs", 3);
+                double ltrLearningRate = config.getDouble("ml.ltr.learningRate", 0.05);
+                int trainAfterClicks = config.getInt("ml.click.trainAfterClicks", 25);
+                FeatureExtractor featureExtractor = build.featureExtractor();
+                LinearRankingModel rankingModel = new LinearRankingModel();
+                ClickTracker clickTracker = new ClickTracker();
+                ClickFeedbackTrainer clickFeedbackTrainer = new ClickFeedbackTrainer(featureExtractor, rankingModel,
+                        clickTracker, trainAfterClicks, ltrEpochs, ltrLearningRate);
 
-        // Learning-to-rank + click feedback: feature extractor shares the same
-        // corpus data as the ranking pipeline so serve-time and train-time
-        // feature vectors are identical.
-        int ltrEpochs = config.getInt("ml.ltr.epochs", 3);
-        double ltrLearningRate = config.getDouble("ml.ltr.learningRate", 0.05);
-        int trainAfterClicks = config.getInt("ml.click.trainAfterClicks", 25);
-        featureExtractor = indexBuild.featureExtractor();
-        rankingModel = new LinearRankingModel();
-        clickTracker = new ClickTracker();
-        clickFeedbackTrainer = new ClickFeedbackTrainer(featureExtractor, rankingModel,
-                clickTracker, trainAfterClicks, ltrEpochs, ltrLearningRate);
+                boolean knowledgeEnabled = config.getBoolean("semantic.knowledge.enabled", true);
+                KnowledgeGraph knowledgeGraph;
+                if (knowledgeEnabled) {
+                    int maxEntitiesPerDoc = config.getInt("semantic.knowledge.maxEntitiesPerDoc", 10);
+                    int maxRelated = config.getInt("semantic.knowledge.maxRelated", 8);
+                    EntityExtractor extractor = new EntityExtractor(maxEntitiesPerDoc);
+                    KnowledgeGraph kg = new KnowledgeGraph(maxRelated);
+                    for (Map.Entry<Integer, ParsedDocument> e : docIdToParsed.entrySet()) {
+                        ParsedDocument parsed = e.getValue();
+                        kg.addDocument(e.getKey(), extractor.extract(parsed.title(), parsed.text()));
+                    }
+                    knowledgeGraph = kg;
+                } else {
+                    knowledgeGraph = null;
+                }
 
-        boolean knowledgeEnabled = config.getBoolean("semantic.knowledge.enabled", true);
-        if (knowledgeEnabled) {
-            int maxEntitiesPerDoc = config.getInt("semantic.knowledge.maxEntitiesPerDoc", 10);
-            int maxRelated = config.getInt("semantic.knowledge.maxRelated", 8);
-            EntityExtractor extractor = new EntityExtractor(maxEntitiesPerDoc);
-            KnowledgeGraph kg = new KnowledgeGraph(maxRelated);
-            for (Map.Entry<Integer, ParsedDocument> e : docIdToParsed.entrySet()) {
-                ParsedDocument parsed = e.getValue();
-                kg.addDocument(e.getKey(), extractor.extract(parsed.title(), parsed.text()));
+                IndexState newState = new IndexState(build, knowledgeGraph, rankingModel,
+                        clickTracker, clickFeedbackTrainer);
+
+                currentIndex.publish(ConcurrentIndex.Entry.of(newState, () -> releaseBuild(buildDir, build)));
+                queryCache.clear();
+            } catch (Exception e) {
+                // Failed build must not destroy the active index: never publish,
+                // and best-effort remove the partial build directory.
+                deleteRecursively(buildDir);
+                throw e;
             }
-            knowledgeGraph = kg;
-        } else {
-            knowledgeGraph = null;
         }
+    }
+
+    /**
+     * Closes a published build's memory-mapped index and removes its build
+     * directory. Runs exactly once, after the last reader lease on that build
+     * has been released.
+     */
+    private static void releaseBuild(Path buildDir, SearchEngineBuild build) {
+        try {
+            if (build.mmapIndex() != null) {
+                build.mmapIndex().close();
+            }
+        } finally {
+            deleteRecursively(buildDir);
+        }
+    }
+
+    /**
+     * Best-effort recursive delete. On Windows a build directory whose postings
+     * file is still mapped cannot be removed; the entry's mmap is closed first,
+     * so this succeeds in practice. Failures are ignored so they never affect
+     * serving.
+     */
+    private static void deleteRecursively(Path dir) {
+        try (java.util.stream.Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder())
+                .forEach(p -> {
+                    try {
+                        Files.deleteIfExists(p);
+                    } catch (IOException ignored) {
+                        // Best effort.
+                    }
+                });
+        } catch (IOException ignored) {
+            // Best effort.
+        }
+    }
+
+    /**
+     * Normalized query-cache key derived from the lexical token stream: words
+     * are lowercased and whitespace variants collapse, while boolean operators
+     * (AND/OR/NOT) keep their operator identity so {@code cat AND dog} (boolean
+     * AND) and {@code cat and dog} (implicit AND) never collide.
+     */
+    private static String cacheKey(String query) {
+        return com.minigoogle.query.lexer.QueryKey.canonicalize(query);
     }
 
     private SearchResponse executeSearch(String query, int pageSize) {
         // Check cache
-        List<com.minigoogle.network.dto.SearchResult> cachedResults = queryCache.get(query.toLowerCase().strip());
+        List<com.minigoogle.network.dto.SearchResult> cachedResults = queryCache.get(cacheKey(query));
         if (cachedResults != null) {
             eventBus.publish(new QueryExecutedEvent(query, cachedResults.size(), 0, true));
             return new SearchResponse(0, cachedResults.size(), cachedResults);
@@ -567,64 +695,76 @@ public class MiniGoogleApp {
 
         long start = System.currentTimeMillis();
 
-        RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
-        List<RankedDocument> ranked = retrieval.ranked();
-        String didYouMean = retrieval.didYouMean();
-
-        if (ranked.isEmpty()) {
-            eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
-            return new SearchResponse(0, 0, List.of(), didYouMean);
-        }
-
-        // Learning-to-rank re-rank: score each candidate with the shared
-        // ranking pipeline using the pre-rank position as the POSITION
-        // feature, then re-sort. Standalone and distributed execution share
-        // GlobalRankingPipeline, so the served ordering is produced by the
-        // exact same code in both modes.
-        boolean ltrEnabled = config.getBoolean("ml.ltr.enabled", true)
-                && rankingModel != null && featureExtractor != null;
-        if (ltrEnabled && !ranked.isEmpty()) {
-            List<RankedCandidate> candidates = new ArrayList<>(ranked.size());
-            for (RankedDocument doc : ranked) {
-                candidates.add(new RankedCandidate(
-                        String.valueOf(doc.documentId()), doc.url(), doc.title(), doc.snippet(),
-                        doc.bm25Score(), doc.pageRankScore(),
-                        searchEngine.rawFeatures(query, doc.documentId())));
+        // Hold a lease on the current index generation for the duration of the
+        // search so a concurrent reindex can never close the memory-mapped
+        // postings file under us.
+        try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+            IndexState state = lease.value();
+            if (state == null) {
+                eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
+                return new SearchResponse(0, 0, List.of());
             }
-            List<RankedResult> ltrResults = GlobalRankingPipeline.rank(
-                    query, candidates, searchEngine.normalizationContext(), rankingModel);
-            List<RankedDocument> ltrRanked = new ArrayList<>(ltrResults.size());
-            for (RankedResult result : ltrResults) {
-                RankedCandidate candidate = result.candidate();
-                ltrRanked.add(new RankedDocument(
-                        Integer.parseInt(candidate.documentId()), candidate.url(), candidate.title(),
-                        candidate.bm25Score(), candidate.pageRankScore(),
-                        result.score(), candidate.snippet()));
+            SearchEngine searchEngine = state.engine();
+
+            RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
+            List<RankedDocument> ranked = retrieval.ranked();
+            String didYouMean = retrieval.didYouMean();
+
+            if (ranked.isEmpty()) {
+                eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
+                return new SearchResponse(0, 0, List.of(), didYouMean);
             }
-            ranked = ltrRanked;
+
+            // Learning-to-rank re-rank: score each candidate with the shared
+            // ranking pipeline using the pre-rank position as the POSITION
+            // feature, then re-sort. Standalone and distributed execution share
+            // GlobalRankingPipeline, so the served ordering is produced by the
+            // exact same code in both modes.
+            boolean ltrEnabled = config.getBoolean("ml.ltr.enabled", true)
+                    && state.rankingModel() != null && state.featureExtractor() != null;
+            if (ltrEnabled && !ranked.isEmpty()) {
+                List<RankedCandidate> candidates = new ArrayList<>(ranked.size());
+                for (RankedDocument doc : ranked) {
+                    candidates.add(new RankedCandidate(
+                            String.valueOf(doc.documentId()), doc.url(), doc.title(), doc.snippet(),
+                            doc.bm25Score(), doc.pageRankScore(),
+                            searchEngine.rawFeatures(query, doc.documentId())));
+                }
+                List<RankedResult> ltrResults = GlobalRankingPipeline.rank(
+                        query, candidates, searchEngine.normalizationContext(), state.rankingModel());
+                List<RankedDocument> ltrRanked = new ArrayList<>(ltrResults.size());
+                for (RankedResult result : ltrResults) {
+                    RankedCandidate candidate = result.candidate();
+                    ltrRanked.add(new RankedDocument(
+                            Integer.parseInt(candidate.documentId()), candidate.url(), candidate.title(),
+                            candidate.bm25Score(), candidate.pageRankScore(),
+                            result.score(), candidate.snippet()));
+                }
+                ranked = ltrRanked;
+            }
+
+            // Record the served result order as an impression for click training.
+            if (state.clickTracker() != null && !ranked.isEmpty()) {
+                state.clickTracker().recordImpression(query, ranked.stream()
+                        .map(RankedDocument::documentId)
+                        .collect(Collectors.toList()));
+            }
+
+            // Convert to DTOs
+            List<com.minigoogle.network.dto.SearchResult> dtoResults = ranked.stream()
+                .map(r -> new com.minigoogle.network.dto.SearchResult(
+                    r.url(), r.title(), r.snippet(), r.finalScore(),
+                    r.bm25Score(), r.pageRankScore()))
+                .collect(Collectors.toList());
+
+            long elapsed = System.currentTimeMillis() - start;
+
+            // Cache and record analytics
+            queryCache.put(cacheKey(query), dtoResults);
+            eventBus.publish(new QueryExecutedEvent(query, dtoResults.size(), elapsed, false));
+
+            return new SearchResponse(elapsed, dtoResults.size(), dtoResults, didYouMean);
         }
-
-        // Record the served result order as an impression for click training.
-        if (clickTracker != null && !ranked.isEmpty()) {
-            clickTracker.recordImpression(query, ranked.stream()
-                    .map(RankedDocument::documentId)
-                    .collect(Collectors.toList()));
-        }
-
-        // Convert to DTOs
-        List<com.minigoogle.network.dto.SearchResult> dtoResults = ranked.stream()
-            .map(r -> new com.minigoogle.network.dto.SearchResult(
-                r.url(), r.title(), r.snippet(), r.finalScore(),
-                r.bm25Score(), r.pageRankScore()))
-            .collect(Collectors.toList());
-
-        long elapsed = System.currentTimeMillis() - start;
-
-        // Cache and record analytics
-        queryCache.put(query.toLowerCase().strip(), dtoResults);
-        eventBus.publish(new QueryExecutedEvent(query, dtoResults.size(), elapsed, false));
-
-        return new SearchResponse(elapsed, dtoResults.size(), dtoResults, didYouMean);
     }
 
     /**
@@ -635,25 +775,32 @@ public class MiniGoogleApp {
     private SearchResponse gatherCandidateResults(String query, int pageSize) {
         long start = System.currentTimeMillis();
 
-        RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
-        List<RankedDocument> ranked = retrieval.ranked();
+        try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+            IndexState state = lease.value();
+            if (state == null) {
+                return new SearchResponse(0, 0, List.of());
+            }
+            SearchEngine searchEngine = state.engine();
 
-        NormalizationContext context = searchEngine.normalizationContext();
+            RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
+            List<RankedDocument> ranked = retrieval.ranked();
 
-        List<com.minigoogle.network.dto.SearchResult> results =
-                new ArrayList<>(ranked.size());
-        for (RankedDocument doc : ranked) {
-            double[] raw = searchEngine.rawFeatures(query, doc.documentId()) != null
-                    ? searchEngine.rawFeatures(query, doc.documentId()).toArray()
-                    : null;
-            results.add(new com.minigoogle.network.dto.SearchResult(
-                    doc.url(), doc.title(), doc.snippet(), doc.finalScore(),
-                    doc.bm25Score(), doc.pageRankScore(), raw));
+            NormalizationContext context = searchEngine.normalizationContext();
+
+            List<com.minigoogle.network.dto.SearchResult> results =
+                    new ArrayList<>(ranked.size());
+            for (RankedDocument doc : ranked) {
+                var rawFeatures = searchEngine.rawFeatures(query, doc.documentId());
+                double[] raw = rawFeatures != null ? rawFeatures.toArray() : null;
+                results.add(new com.minigoogle.network.dto.SearchResult(
+                        doc.url(), doc.title(), doc.snippet(), doc.finalScore(),
+                        doc.bm25Score(), doc.pageRankScore(), raw));
+            }
+
+            long elapsed = System.currentTimeMillis() - start;
+            return new SearchResponse(elapsed, results.size(), results,
+                    retrieval.didYouMean(), context.maxPageRank(), context.maxDocLength());
         }
-
-        long elapsed = System.currentTimeMillis() - start;
-        return new SearchResponse(elapsed, results.size(), results,
-                retrieval.didYouMean(), context.maxPageRank(), context.maxDocLength());
     }
 
     private String loadResource(String resourcePath) throws IOException {
@@ -675,6 +822,51 @@ public class MiniGoogleApp {
         System.out.println("  Distributed Search Engine - Demo Mode");
         System.out.println("============================================================");
         System.out.println();
+    }
+
+    /**
+     * Immutable bundle of one full index build plus its app-level supporting
+     * structures. Published atomically via {@link #currentIndex}; handlers grab
+     * one reference and read a self-consistent view of a single build.
+     */
+    private record IndexState(
+            SearchEngineBuild build,
+            KnowledgeGraph knowledgeGraph,
+            LinearRankingModel rankingModel,
+            ClickTracker clickTracker,
+            ClickFeedbackTrainer clickFeedbackTrainer) {
+
+        SearchEngine engine() {
+            return build.engine();
+        }
+
+        TrieAutocomplete autocomplete() {
+            return build.autocomplete();
+        }
+
+        SpellCorrector spellCorrector() {
+            return build.spellCorrector();
+        }
+
+        Metadata metadata() {
+            return build.metadata();
+        }
+
+        Map<Integer, String> docUrls() {
+            return build.docUrls();
+        }
+
+        Map<String, Integer> urlToDocId() {
+            return build.urlToDocId();
+        }
+
+        FeatureExtractor featureExtractor() {
+            return build.featureExtractor();
+        }
+
+        MemoryMappedIndex mmapIndex() {
+            return build.mmapIndex();
+        }
     }
 
     public static void main(String[] args) throws Exception {

@@ -27,6 +27,7 @@ class ClusterIntegrationTest {
     private RestServer searchNodeB;
     private RestServer featureNodeA;
     private RestServer featureNodeB;
+    private RestServer slowNode;
     private final RestClient client = new RestClient();
     private final Gson gson = new Gson();
 
@@ -87,6 +88,7 @@ class ClusterIntegrationTest {
         if (searchNodeB != null) searchNodeB.stop();
         if (featureNodeA != null) featureNodeA.stop();
         if (featureNodeB != null) featureNodeB.stop();
+        if (slowNode != null) slowNode.stop();
         if (clusterCoordinator != null) clusterCoordinator.stop();
     }
 
@@ -129,6 +131,34 @@ class ClusterIntegrationTest {
     void testSearchWithNoRegisteredNodesReturnsEmpty() {
         SearchCoordinator coordinator = new SearchCoordinator("http://localhost:" + clusterCoordinator.getPort());
         assertTrue(coordinator.search("test", 3).isEmpty());
+    }
+
+    @Test
+    void testSlowShardDoesNotBlockPastScatterGatherTimeout() {
+        // A shard that hangs for 2s must not delay the gateway beyond the
+        // configured scatter-gather deadline; the fast shard's results still
+        // come through.
+        slowNode = new RestServer(0);
+        slowNode.post("/api/v1/search", body -> {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return JsonSerializer.toJson(new com.minigoogle.network.dto.SearchResponse(1, 0, List.of()));
+        });
+        slowNode.start();
+        registerNode("index-slow", slowNode);
+        registerNode("index-a", searchNodeA);
+
+        SearchCoordinator coordinator = new SearchCoordinator("http://localhost:" + clusterCoordinator.getPort());
+        long start = System.currentTimeMillis();
+        List<SearchResult> results = coordinator.search("test", 3, 300);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertTrue(elapsed < 1500,
+                "Scatter-gather must honor the deadline, but took " + elapsed + "ms");
+        assertEquals(2, results.size(), "The fast shard's results must still be merged");
     }
 
     @Test

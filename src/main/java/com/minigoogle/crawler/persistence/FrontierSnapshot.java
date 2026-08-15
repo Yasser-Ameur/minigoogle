@@ -53,6 +53,13 @@ public class FrontierSnapshot {
         logger.info("Frontier snapshot saved to {}", snapshotDirectory);
     }
 
+    /**
+     * Restores from the snapshot directory this instance was configured with.
+     */
+    public SnapshotResult restore(DistributedFrontier frontier) throws IOException {
+        return restore(frontier, snapshotDirectory);
+    }
+
     private void saveSnapshotData(DistributedFrontier frontier, RobotsCache robotsCache, String filePath) throws IOException {
         try (DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(filePath)))) {
             dos.writeInt(SNAPSHOT_VERSION);

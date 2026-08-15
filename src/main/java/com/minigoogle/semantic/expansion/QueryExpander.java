@@ -1,5 +1,12 @@
 package com.minigoogle.semantic.expansion;
 
+import com.minigoogle.query.ast.AndNode;
+import com.minigoogle.query.ast.NotNode;
+import com.minigoogle.query.ast.OrNode;
+import com.minigoogle.query.ast.PhraseNode;
+import com.minigoogle.query.ast.QueryNode;
+import com.minigoogle.query.ast.QueryVisitor;
+import com.minigoogle.query.ast.WordNode;
 import com.minigoogle.semantic.synonym.SynonymGraph;
 
 import java.util.ArrayList;
@@ -69,6 +76,34 @@ public class QueryExpander {
     }
 
     /**
+     * Expands a parsed query tree: each word leaf with known synonyms is
+     * replaced by an OR of the original word and up to {@code maxExpansions}
+     * synonyms. Phrase nodes and boolean structure are preserved verbatim, so
+     * quoted phrases keep their exact-match semantics and explicit AND/OR/NOT
+     * grouping is untouched. This is the correct place for expansion — the
+     * query model — instead of on a raw string, which cannot represent phrases.
+     *
+     * @param ast            The parsed query tree.
+     * @param maxExpansions  Maximum number of expansion terms to add per word.
+     * @return The expanded query tree.
+     */
+    public QueryNode expand(QueryNode ast, int maxExpansions) {
+        if (ast == null) {
+            return null;
+        }
+        return ast.accept(new ExpansionVisitor(maxExpansions));
+    }
+
+    /**
+     * Returns the synonyms for a single term, excluding the term itself.
+     */
+    public Set<String> synonymsFor(String term) {
+        Set<String> synonyms = synonymGraph.getSynonyms(term);
+        synonyms.remove(term.toLowerCase(Locale.ROOT));
+        return synonyms;
+    }
+
+    /**
      * Adds a custom synonym relationship to the expander.
      *
      * @param term     The base term.
@@ -118,5 +153,55 @@ public class QueryExpander {
         synonymGraph.addSynonym("end", "finish");
         synonymGraph.addSynonym("help", "assist");
         synonymGraph.addSynonym("help", "support");
+    }
+
+    /**
+     * Rewrites a query tree, OR-ing synonyms into each word leaf while leaving
+     * phrase nodes and operators intact.
+     */
+    private final class ExpansionVisitor implements QueryVisitor<QueryNode> {
+        private final int maxExpansions;
+
+        ExpansionVisitor(int maxExpansions) {
+            this.maxExpansions = maxExpansions;
+        }
+
+        @Override
+        public QueryNode visit(WordNode node) {
+            Set<String> synonyms = synonymsFor(node.word());
+            if (synonyms.isEmpty()) {
+                return node;
+            }
+            QueryNode result = new WordNode(node.word());
+            int added = 0;
+            for (String synonym : synonyms) {
+                if (added >= maxExpansions) {
+                    break;
+                }
+                result = new OrNode(result, new WordNode(synonym));
+                added++;
+            }
+            return result;
+        }
+
+        @Override
+        public QueryNode visit(PhraseNode node) {
+            return node;
+        }
+
+        @Override
+        public QueryNode visit(AndNode node) {
+            return new AndNode(node.left().accept(this), node.right().accept(this));
+        }
+
+        @Override
+        public QueryNode visit(OrNode node) {
+            return new OrNode(node.left().accept(this), node.right().accept(this));
+        }
+
+        @Override
+        public QueryNode visit(NotNode node) {
+            return new NotNode(node.operand().accept(this));
+        }
     }
 }
