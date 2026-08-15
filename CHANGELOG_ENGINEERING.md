@@ -5,6 +5,103 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Default query expansion off; verify BM25; clear PageRank
+
+### Problem
+
+53.3% of relevant TREC-COVID judgments were ranking beyond the returned depth
+and NDCG@10 sat at 0.3890. The ranking pipeline was the dominant remaining
+quality problem, but which part of it was unknown — BM25 itself, the PageRank
+blend, or query expansion had never been isolated.
+
+### Hypotheses and what the evidence said
+
+**BM25 is miscalibrated — REJECTED.** `BM25MathematicalVerificationTest` checks
+the implementation against values derived by hand in the comments, not against
+another implementation and not by recording what the code returns. All 9 checks
+exact: smoothed IDF, saturation and its `IDF·(k1+1)` asymptote, length
+normalization, `b=0`, term summation, absent terms. No change made.
+
+**PageRank is polluting the ranking — REJECTED.** `RankingScoreDiagnostic`
+reports `171332 entries, 1 distinct values`: BEIR documents carry no outgoing
+links, so PageRank is uniform, min-max normalizes to a constant 0.5, and adds a
+fixed 0.125 to every candidate. The on/off A/B is bit-identical (NDCG@10 0.3890
+both ways). Inert, not harmful. Deliberately **not** disabled — on a corpus with
+a real link graph the 0.25 weight would matter, and removing it because
+link-free BEIR data does not use it would be overfitting.
+
+**Query expansion helps recall — REJECTED, and it actively hurts.**
+
+### Experiment
+
+scifact, everything else identical, one variable:
+
+| metric | expansion OFF | expansion ON | change |
+|---|---|---|---|
+| NDCG@10 | 0.6015 | 0.4469 | −25.7% |
+| MRR@10 | 0.5641 | 0.3990 | −29.3% |
+| Recall@10 | 0.7360 | 0.6126 | −16.8% |
+| Recall@100 | 0.8409 | 0.8124 | −3.4% |
+| Recall@1000 | 0.9343 | 0.9333 | −0.1% |
+| mean results returned | 931.0 | 986.8 | +6.0% |
+| wall time | ~2 min | 16 min 33 s | ~8× |
+
+The shape identifies the mechanism: **Recall@1000 flat, Recall@10 down 16.8%**.
+Expansion is not failing to find relevant documents — it is adding candidates
+that outrank the ones already found. Nothing gained at depth, real damage at the
+top.
+
+### Implementation
+
+`semantic.expansion.enabled` now defaults to `false` in `SearchEngineBuilder`
+(previously `true`, so production ran with it on). One line; still enableable for
+a corpus shown to benefit.
+
+### Correctness validation
+
+Full suite: **793 tests, 0 failures**. The pre-existing
+`RaftConsensusConfigChangeTest` flake did not fire in this run; it remains
+unrelated and unfixed.
+
+### Quality impact
+
+scifact as tabled above. trec-covid **could not be measured**: the expansion run
+did not complete within a 10-minute budget at 171,332 documents, where scifact at
+5,183 took 16.5 minutes. Recorded as incomplete rather than as a metric — the
+scaling is itself evidence the PMI thesaurus build is impractical at corpus scale.
+
+### Performance impact
+
+Removing expansion from the default path removes the PMI thesaurus build from
+index construction and the per-query expansion work. Measured only as the wall
+time above (~8× on scifact), not as an isolated latency benchmark.
+
+### Cross-dataset impact
+
+Directly measured on scifact only. Accepted on that evidence plus the mechanism
+(candidates added without depth recall gained) and the failure to complete at
+scale. If a corpus is later shown to benefit, the flag restores it.
+
+### Tradeoffs
+
+- A documented feature is off by default. The project advertised corpus-derived
+  PMI expansion; it is now opt-in, with the measurement recorded next to it.
+- The trec-covid arm is missing. Concluding from one dataset is weaker than this
+  project's usual standard, and that is stated rather than papered over.
+
+### Conclusion
+
+Kept. Two hypotheses rejected with evidence and one confirmed. The remaining gap
+is now characterised precisely: BM25 relevant scores (p50 11.495, mean 12.302)
+overlap non-relevant almost entirely (p50 9.354, mean 9.930), so ranking is
+correct on average and poorly separated per document.
+
+That is a semantic gap, not a calibration one, which is why `k1`/`b` tuning was
+rejected as premature — those reshape saturation and length normalization and
+cannot make lexical overlap express topical relevance.
+
+---
+
 ## 2026-08-15 — Index document titles
 
 ### Problem

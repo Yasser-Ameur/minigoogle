@@ -627,3 +627,93 @@ ranked below 1000. Candidate recall is now 0.8357 and ranking is unambiguously
 the dominant remaining loss on trec-covid. scifact NDCG@10 of 0.6015 is close to
 the published BEIR BM25 reference of ~0.665; trec-covid at 0.3890 against ~0.656
 is not.
+
+---
+
+## QUALITY — ranking component A/Bs (2026-08-15)
+
+**Benchmark:** `RankingScoreDiagnostic` (rank distribution, recall ceilings,
+score-component distributions) and `BM25MathematicalVerificationTest`
+(implementation verification).
+
+**Environment:** Windows 11 Pro 10.0.26200, Java 21, Gradle 8.7, 8 GB heap,
+strictly sequential Gradle invocations.
+
+**Configuration held fixed across every A/B below:** `semantic.enabled=false`,
+`ranking.diversify.enabled=false`, `ranking.rerank.enabled=false`,
+`deepK=1000`, BM25 `k1`/`b` untouched. Exactly one variable changes per
+comparison.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.RankingScoreDiagnostic" \
+  -Dbeir.dir=data/beir/scifact -Dbeir.dataset=scifact -Dbeir.expansion=false
+```
+
+### A/B 1 — PageRank on vs off (trec-covid)
+
+| metric | pagerank ON | pagerank OFF |
+|---|---|---|
+| NDCG@10 | 0.3890 | 0.3890 |
+| MRR@10 | 0.6093 | 0.6093 |
+| Recall@100 | 0.0822 | 0.0822 |
+
+Bit-identical. `PageRank map: 171332 entries, 1 distinct values` — BEIR
+documents have no outgoing links, so PageRank is uniform, normalizes to a
+constant 0.5, and contributes a fixed `0.125` to every candidate. **No change
+made:** it is inert here, not harmful, and disabling it globally would overfit to
+link-free data.
+
+### A/B 2 — Query expansion on vs off (scifact)
+
+| metric | expansion OFF | expansion ON | change |
+|---|---|---|---|
+| NDCG@10 | 0.6015 | 0.4469 | −25.7% |
+| MRR@10 | 0.5641 | 0.3990 | −29.3% |
+| Recall@10 | 0.7360 | 0.6126 | −16.8% |
+| Recall@100 | 0.8409 | 0.8124 | −3.4% |
+| Recall@1000 | 0.9343 | 0.9333 | −0.1% |
+| mean results returned | 931.0 | 986.8 | +6.0% |
+| wall time | ~2 min | 16 min 33 s | ~8× |
+
+Recall@1000 flat while Recall@10 falls 16.8%: expansion adds candidates that
+outrank the documents already being found. **Accepted change:**
+`semantic.expansion.enabled` now defaults to `false`.
+
+**trec-covid: not measured.** The run did not complete within a 10-minute budget
+at 171,332 documents. Recorded as incomplete, not as a metric.
+
+### Recall ceilings — required context for these datasets
+
+| dataset | mean relevant/query | measured R@100 | ceiling R@100 | % of achievable |
+|---|---|---|---|---|
+| trec-covid | 493.5 | 0.0822 | 0.2674 | 30.7% |
+| scifact | 1.1 | 0.8409 | ~1.0 | ~84% |
+
+TREC-COVID's Recall@100 cannot exceed ~0.27 by arithmetic. Quoting 0.0822
+without the ceiling overstates the ranking failure roughly threefold. NDCG@10 is
+the meaningful metric on that dataset.
+
+### Score separation — the actual remaining problem (trec-covid)
+
+| population | n | min | p50 | p90 | p99 | max | mean |
+|---|---|---|---|---|---|---|---|
+| BM25 relevant | 7,403 | 5.877 | 11.495 | 17.463 | 23.111 | 34.396 | 12.302 |
+| BM25 non-relevant | 42,595 | 5.827 | 9.354 | 13.329 | 19.131 | 28.952 | 9.930 |
+
+Correct on average, poorly separated per document — the relevant minimum sits
+below the non-relevant median and the non-relevant maximum above the relevant
+p99.
+
+### Rejected
+
+**BM25 `k1`/`b` tuning — rejected as premature.** The implementation is verified
+correct against hand-computed values, and the failure mode is score overlap, not
+miscalibration. `k1`/`b` reshape saturation and length normalization; they cannot
+make lexical overlap express topical relevance. A sweep over 50 queries would
+fit noise.
+
+**Field weighting (title vs body) — not attempted.** It follows the same logic:
+worth testing only once the semantic path has been evaluated, since the dominant
+residual is documents with no lexical overlap at all.

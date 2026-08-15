@@ -1272,3 +1272,147 @@ configuration). It is **not** caused by this mission or by the P1 Raft work:
 verified failing 3/3 at commit `eb70915`, before the leadership no-op existed, and
 4/4 at `eab8dd4` without the title change. Recorded here rather than fixed, since
 it is unrelated to candidate recall.
+
+---
+
+# P3 — Ranking diagnosis (2026-08-15)
+
+## Finding 22 — BM25 is mathematically correct *(VERIFIED, no change)*
+
+Before touching any parameter, the implementation was checked against values
+computed by hand rather than against another implementation. `BM25MathematicalVerificationTest`
+(9 tests) derives every expected value arithmetically in the comment beside it —
+a test that records what the implementation returns would pass against a wrong
+formula.
+
+Verified: smoothed IDF `ln((N-df+0.5)/(df+0.5) + 1)`, the saturation shape,
+its asymptote at `IDF·(k1+1)`, length normalization, `b=0` disabling it, term
+summation, and absent-term handling. All exact.
+
+The convention is Lucene's smoothed IDF, not classic Robertson-Sparck Jones. The
+`+1` keeps IDF non-negative for terms in more than half the corpus; without it a
+document could be *penalised* for containing a query term. Documented so scores
+are not compared against a different convention and called wrong.
+
+One behaviour worth naming: `scoreDocument` iterates the query term list, so a
+term repeated in the query contributes twice. Lucene deduplicates by default.
+Neither is wrong; the current convention is now pinned by a test.
+
+**Status: CONFIRMED CORRECT — no change made**
+
+## Finding 23 — PageRank is provably inert on BEIR *(REJECTED as a cause)*
+
+**Evidence:** `RankingScoreDiagnostic` reports the PageRank map directly:
+
+```
+trec-covid  PageRank map: 171332 entries, 1 distinct values
+scifact     PageRank map:   5183 entries, 1 distinct values
+```
+
+BEIR documents carry `List.of()` outgoing links, so `GraphBuilder` produces a
+graph with every document as an isolated node. PageRank over a fully
+disconnected graph is uniform, `ScoreNormalizer` maps a zero-range input to a
+constant 0.5, and `ScoreFusion` then adds `0.25 × 0.5 = 0.125` to every
+candidate. A constant offset cannot reorder anything.
+
+**Controlled A/B** (`ranking.pagerank.enabled` true vs false, everything else
+identical, trec-covid):
+
+| | pagerank ON | pagerank OFF |
+|---|---|---|
+| NDCG@10 | 0.3890 | 0.3890 |
+| MRR@10 | 0.6093 | 0.6093 |
+| Recall@100 | 0.0822 | 0.0822 |
+
+Bit-identical, as predicted. PageRank neither helps nor hurts on these corpora —
+it is simply not a signal here. **No change made:** on a corpus with a real link
+graph the 0.25 weight would matter, and disabling it globally would be
+overfitting to link-free BEIR data.
+
+**Status: REJECTED as a cause of poor ranking**
+
+## Finding 24 — Query expansion degrades every quality metric *(FIXED)*
+
+The previous mission left this unmeasured. Measured now, everything else held
+identical, on BEIR scifact:
+
+| metric | expansion OFF | expansion ON | change |
+|---|---|---|---|
+| NDCG@10 | 0.6015 | 0.4469 | **−25.7%** |
+| MRR@10 | 0.5641 | 0.3990 | **−29.3%** |
+| Recall@10 | 0.7360 | 0.6126 | −16.8% |
+| Recall@100 | 0.8409 | 0.8124 | −3.4% |
+| Recall@1000 | 0.9343 | 0.9333 | −0.1% |
+| mean results returned | 931.0 | 986.8 | +6.0% |
+| wall time (300 queries + build) | ~2 min | **16 min 33 s** | ~8× |
+
+The shape of the result identifies the mechanism precisely: **Recall@1000 is
+flat** while **Recall@10 falls 16.8%**. Expansion is not failing to find relevant
+documents — it is adding candidates that outrank the ones already being found.
+It buys nothing at depth and costs a great deal at the top.
+
+**`semantic.expansion.enabled` now defaults to `false`** (it was `true`, so
+production ran with it on). Still available for a corpus shown to benefit.
+
+**TREC-COVID could not be measured.** At 171,332 documents the run did not
+complete within a 10-minute budget; scifact at 5,183 documents took 16.5 minutes.
+That is recorded as "did not complete", not as a metric. The scaling behaviour is
+itself evidence that the PMI thesaurus build is impractical at corpus scale.
+
+**Status: CONFIRMED, FIXED**
+
+## Finding 25 — Recall@100 was being read without its arithmetic ceiling
+
+TREC-COVID judges **493.5 documents relevant per query on average**. A top-100
+run therefore cannot exceed ~100/493.5 recall no matter how perfect the ranking:
+
+| | measured | ceiling | % of achievable |
+|---|---|---|---|
+| Recall@10 | 0.0121 | 0.0267 | 45.3% |
+| Recall@100 | 0.0822 | 0.2674 | 30.7% |
+
+The raw 0.0822 looks catastrophic; against the ceiling it is 30.7% of what is
+achievable. There is still a real ~3× gap, but it is a third of what the number
+suggests, and reporting Recall@100 on this dataset without the ceiling
+overstates the problem by that factor.
+
+scifact is the opposite: **1.1 relevant documents per query**, so its Recall@100
+of 0.8409 is close to a ceiling of ~1.0 and is a meaningful measure there.
+
+## Finding 26 — The real ranking problem is weak score separation
+
+`RankingScoreDiagnostic` on trec-covid, over 7,403 relevant and 42,595
+non-relevant scored documents:
+
+```
+BM25 relevant     min=5.877  p50=11.495  p90=17.463  p99=23.111  max=34.396  mean=12.302
+BM25 non-relevant min=5.827  p50= 9.354  p90=13.329  p99=19.131  max=28.952  mean= 9.930
+```
+
+Relevant documents do score higher on average (12.30 vs 9.93), but the
+distributions overlap almost completely: the relevant minimum (5.877) is below
+the non-relevant median, and the non-relevant maximum (28.95) is above the
+relevant p99. BM25 is ordering correctly *on average* and separating poorly *per
+document*.
+
+This is the honest characterisation of the remaining gap, and it is not a
+calibration problem that `k1`/`b` can fix — those reshape saturation and length
+normalization, not the fundamental fact that on TREC-COVID topical relevance is
+frequently not expressed by lexical overlap. Finding 20's TYPE_E measurement
+already showed 32.3% of missed relevant documents share no query term at all.
+
+**BM25 parameter tuning was therefore not attempted.** With the implementation
+verified correct and the failure mode identified as signal overlap rather than
+miscalibration, a `k1`/`b` sweep over 50 queries would be fitting noise.
+
+## Remaining bottleneck
+
+**Semantic gap, not candidate recall, ranking model, or execution.** In order of
+measured impact on trec-covid:
+
+1. Lexical overlap does not express relevance for a large share of judgments
+   (TYPE_E 32.3% of misses; heavy BM25 score overlap). This is what the
+   semantic/hybrid path exists for, and it has not been evaluated on BEIR.
+2. Candidate recall is 0.8357 — improved and no longer dominant.
+3. Execution (WAND, postings representation) — untouched, and now has a clean
+   quality oracle to be validated against.
