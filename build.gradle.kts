@@ -67,6 +67,18 @@ val bench by tasks.registering(Test::class) {
     filter {
         includeTestsMatching("com.minigoogle.performance.*")
     }
+    // Corpus-scale benchmarks (BEIR) need real heap and the mmap unmap hook.
+    maxHeapSize = providers.gradleProperty("bench.heap").getOrElse("8g")
+    jvmArgs("--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED")
+    // Forward -Dbeir.* so a corpus benchmark can be pointed at a dataset
+    // without editing source. Benchmarks that need a dataset disable
+    // themselves when it is absent, so the normal `bench` run is unaffected.
+    for ((key, value) in System.getProperties()) {
+        val name = key.toString()
+        if (name.startsWith("beir.")) {
+            systemProperty(name, value.toString())
+        }
+    }
     testLogging {
         events("passed", "failed")
     }
