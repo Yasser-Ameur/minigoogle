@@ -1,0 +1,433 @@
+# Engineering Changelog
+
+One entry per substantive change: problem, hypothesis, implementation, benchmark,
+result, tradeoffs, conclusion. Newest first.
+
+---
+
+## 2026-08-15 — Cut learning-to-rank feature extraction cost by 1.75x
+
+**Problem.**
+`FeatureExtractor.extractRaw` runs once per served document — 20 times per query
+at the benchmark's serving depth — and did three wasteful things per call:
+
+1. `overlapFraction` built a `LinkedHashSet` to deduplicate the document's
+   vocabulary, then **copied it into an `ArrayList`** and called `contains()` on
+   that. Every lookup became an O(n) scan of the whole document vocabulary, and
+   the ordering the list preserved was never used.
+2. The document body was lowercased **twice** — once in `bm25`, once inside
+   `tokenize` for `overlapFraction`. The body is by far the largest string
+   involved, so this doubled the dominant allocation.
+3. `tokenize` used `String.split("[^a-z0-9]+")`, which recompiles the pattern on
+   every call — `split` only skips compilation for single-character patterns.
+
+**Hypothesis.**
+Feature extraction is a meaningful share of remaining query latency, and these
+three fixes are pure waste removal that cannot change any feature value.
+
+**Measurement design.**
+`RankingStageBenchmarks.featureExtractionCostPerServedDocument` — 20 documents
+per query at 2,000-character bodies, 200 warmup calls, 200 measured iterations.
+
+**Result.**
+
+| | before | after | improvement |
+|---|---|---|---|
+| per query (20 docs) p50 | 1.706 ms | 0.975 ms | **1.75x** |
+| per document | 85.3 µs | 48.8 µs | **43% lower** |
+| p99 per query | 9.121 ms | 4.526 ms | 2.0x |
+
+**Implementation.**
+`src/main/java/com/minigoogle/ml/features/FeatureExtractor.java`. The body is
+lowercased once in `extractRaw` and the folded string passed to both consumers; a
+new `tokenizeToSet` returns a `HashSet` directly for membership tests; the
+tokenizer pattern is a `static final Pattern`.
+
+**Validation — output preservation.**
+NDCG@10 on the quality benchmark is **identical to six decimal places** before and
+after (0.747721), as is BM25-only (0.6929) and MAP (0.7877). Since every ranking
+feature feeds that metric, an unchanged NDCG across a feature-extraction rewrite
+is strong evidence the values are bit-identical. Full suite: 718 tests, 0
+failures.
+
+**Tradeoffs.**
+`overlapFraction` now uses a `HashSet` rather than a `LinkedHashSet`, so iteration
+order is no longer insertion-ordered. Nothing iterates it — it is only queried
+with `contains()` — but a future change that iterates would see a different order.
+
+**Conclusion.**
+Kept. All three were unambiguous waste, and the identical NDCG confirms nothing
+about ranking behavior moved.
+
+---
+
+## 2026-08-15 — Fix NDCG@10 (wrong ideal ranking) and add it as a guarded benchmark
+
+**Problem.**
+`RankingMetrics.ndcgAt` normalized against an ideal ranking truncated to
+`min(k, ranked.size())` — the number of documents the system *returned* — instead
+of to `k`. NDCG@k is DCG@k over the DCG of the best achievable ordering at k, and
+that ideal depends only on the judgments, never on the run being scored.
+
+The metric therefore **rewarded returning fewer results**. With ten judged
+documents of grade 3, returning a single relevant one gave DCG = 7 and IDCG = 7,
+scoring a perfect 1.0 where the correct value is 7/32.5 ≈ 0.215.
+
+**Why it survived.** The bug only affects queries returning fewer than `k`
+results. `RankingQualityExperimentTest` asserted only that scores lay in [0,1] and
+that variants ranked in the expected order — both true of the buggy metric. There
+were no unit tests for `RankingMetrics` at all.
+
+**Implementation.**
+`src/main/java/com/minigoogle/ml/eval/RankingMetrics.java`. The ideal is now the
+top-`k` judged grades regardless of served length. Negative judgments (qrel `-1`)
+are clamped to 0 so they cannot contribute a negative gain of `2^-1 - 1 = -0.5`.
+Null/empty inputs and `k <= 0` return 0 instead of dividing by zero. Added an
+`ndcgAt10` alias, and `evaluate` now passes the full ranking so the cutoff is
+applied in exactly one place.
+
+**Validation.**
+`RankingMetricsTest` — 16 tests against **hand-computed expected values written
+out in the comments**, deliberately not re-deriving the formula in the test, so a
+shared misreading cannot validate a wrong implementation. Covers perfect,
+reversed and irrelevant rankings; the K cutoff; ideal truncation at K; graded vs
+binary ordering; negative and all-zero grades; null/empty/`k<=0`; and the
+regression itself (`idcgIsIndependentOfHowManyResultsWereReturned`, which returned
+exactly 1.0 before the fix and now returns 0.215).
+
+**Result — previously published numbers were inflated.**
+
+| Variant | NDCG@10 published | corrected |
+|---|---|---|
+| BM25 lexical only | 0.7154 | 0.6929 |
+| Hybrid + default LTR | 0.7511 | 0.7477 |
+| Hybrid + click-trained LTR | 0.7591 | 0.7522 |
+
+The relative conclusion strengthens rather than weakens: hybrid over BM25 moves
+from +5.0% to +7.9% NDCG@10. `docs/resume-validation.md` was updated with the
+corrected table and an explicit supersession note, since that document is
+explicitly intended to back external claims.
+
+**Also added.** `RankingQualityBenchmarks` measures NDCG@10 on the production
+search path under `gradlew bench`, with regression floors (BM25 > 0.60, hybrid >
+0.65, hybrid must beat BM25) so a ranking regression fails the build. It asserts
+no judged query returns zero relevant documents in its top 10 — a failure mode
+averaged NDCG hides — and pins determinism: two independent index builds must
+agree to 1e-12 (measured identical at 0.747721).
+
+**Tradeoffs.**
+Corrected NDCG values are lower than the previously published ones. That is the
+point; the earlier figures were not defensible. The guard floors are set below
+measured values with margin, so they catch regressions rather than pinning exact
+numbers that would break on benign drift.
+
+**Conclusion.**
+Kept. A metric that rewards returning fewer results is worse than no metric,
+because it silently misdirects every ranking decision evaluated against it.
+
+---
+
+## 2026-08-15 — Fix two flaky tests (unsafe timing assumptions)
+
+**Problem.**
+Running the suite repeatedly under benchmark load exposed two intermittent
+failures, neither caused by any change in this investigation. A suite that fails
+roughly 1 run in 6 cannot validate anything else, so both were fixed.
+
+**`ClusterNodeIntegrationTest.testRaftEntryReplicatesAndCommitsOverHttp`** — failed
+~1 in 3 under load with `IllegalStateException: Only the leader may append to the
+Raft log`. The test called `currentLeader()` and `leader.appendEntry(...)` as
+separate statements, assuming leadership survives the gap. It does not: an
+election timeout can fire in between.
+
+Fixing only that moved the failure to `"The entry must replicate to every
+follower"`, which exposed the deeper issue: a leader that accepts an entry and
+then loses leadership before replicating it **never replicates that entry**. Raft
+explicitly permits discarding uncommitted entries on a term change, so waiting on
+that log index waits for something the protocol does not guarantee.
+
+**Implementation.** Retry the whole append-replicate-commit cycle against whoever
+is leader at the moment of the append, and abandon an attempt as soon as
+leadership is lost rather than spending the deadline on a doomed index. Both
+assertions are unchanged in strength: replication to *every* follower and commit
+on the leader are still required.
+
+**Result.** 8/8 clean runs after the fix (was ~1 failure in 3).
+
+**`DistributedQueryTest.testFullDistributedSearchPipeline`** — asserted
+`cached.executionTimeMs() <= response.executionTimeMs()` as a cache-hit check.
+Both calls complete in well under a millisecond, so at millisecond resolution
+this compared scheduling noise. Replaced with a shard-invocation counter: a cache
+hit means no shard is queried again. Deterministic, and strictly stronger than
+what it replaced.
+
+**Tradeoffs.**
+The Raft test is now longer and has a 30 s outer deadline rather than a single
+8 s wait. That is the honest cost of testing a protocol where leadership is not
+stable; the alternative (pinning leadership or extending timeouts) would test a
+less realistic system.
+
+**Conclusion.**
+Kept. Both fixes correct the test's model of the system rather than weakening
+what it checks.
+
+---
+
+## 2026-08-15 — Memoize posting-list reads within a query
+
+**Problem.**
+`SearchEngine.retrieveCandidates` resolved the same terms more than once per
+query: the boolean pass walks the expanded AST resolving every word leaf, and the
+ranking stage then resolves each leaf again to collect per-term postings.
+`QueryPlanner.visit(WordNode)` performs a full `readPostingList` — an mmap read
+plus deserialization of every `Posting` and its boxed positions — on each call.
+
+**Hypothesis.**
+Terms are read roughly twice per query; memoizing within one query would remove
+about half the posting deserialization and reduce query latency.
+
+**Measurement design.**
+Temporary counters on `QueryPlanner` recording posting-list reads and total
+postings deserialized across the 16 judged queries on the real search path, then
+an end-to-end A/B of standalone latency with alternating runs.
+
+**Result — work reduction (confirmed, larger than predicted).**
+
+| | before | after | reduction |
+|---|---|---|---|
+| posting-list reads / query | 26.8 | 6.0 | 77.6% |
+| postings deserialized / query | 8,930 | 1,995 | 77.7% |
+
+~4.5× rather than the predicted ~2×: expansion repeats synonyms across terms and
+phrase execution re-reads its words.
+
+**Result — latency (negative at small scale, positive at larger scale).**
+
+At 3,200 documents there was **no measurable improvement**. Three alternating
+pairs produced overlapping, bimodal results (a ~18 ms slow mode and a ~6 ms fast
+mode that struck both configurations at random); excluding slow-mode runs, both
+sat at ~5.9 ms p50. The hypothesis was falsified at this scale — posting lists on
+a small corpus are too short for deserialization to matter.
+
+Re-tested at 20,000 documents, five alternating pairs, filtering runs where the
+independent indexing-time control showed machine load:
+
+| config | clean p50 runs | median p50 | median p99 | throughput |
+|---|---|---|---|---|
+| without memo | 17.97, 17.48, 18.45, 18.58 ms | 18.21 ms | 38.54 ms | 50 ops/s |
+| with memo | 16.05, 16.19, 15.87 ms | 16.05 ms | 34.93 ms | 57 ops/s |
+
+The clusters do not overlap — every clean memo run beat every clean non-memo run.
+**≈12% lower p50, ≈14% higher throughput at 20k documents.**
+
+**Implementation.**
+`QueryPlanner.forQuery()` returns a short-lived planner sharing the index,
+dictionary and document universe, plus a private `HashMap` memo.
+`SearchEngine.retrieveCandidates` creates one per query and routes all three of
+its `execute` calls through it. The shared planner keeps `memo == null` and stays
+stateless, which is what keeps concurrent queries safe; the memo is confined to
+the calling thread and released with the query.
+
+Dictionary misses are cached too, so an absent term is resolved once per query
+rather than at every occurrence.
+
+**Tradeoffs.**
+- One small object plus a `HashMap` allocated per query.
+- Memoized `PostingList` instances are shared within a query. Verified safe:
+  `BooleanExecutor` and `PhraseExecutor` always return `new PostingList(result)`
+  and never mutate inputs, and no consumer sorts or appends to a planner result.
+  A future executor that mutated an input would break this — worth a comment on
+  those classes if one is ever added.
+- The benefit is scale-dependent and absent on small corpora. The code is carried
+  by all deployments; only larger ones are paid back.
+
+**Validation.** Full suite: 702 tests, 0 failures.
+
+**Conclusion.**
+Kept, with the scale qualification stated explicitly rather than quoting only the
+favorable corpus. The small-corpus null result is recorded because it is part of
+the evidence: this change would not have been justifiable on the 3,200-document
+benchmark alone.
+
+---
+
+## 2026-08-15 — Defer snippet generation until after top-K selection
+
+**Problem.**
+`RankingPipeline.rank` built a snippet for every candidate document before the
+top-K min-heap ran, then discarded all but `topK` of them. Snippet construction
+is the most expensive per-document step in the ranking stage:
+`SnippetGenerator.buildSnippet` slides a 150-character window across the body one
+character at a time, allocating a substring at every position and re-lowercasing
+every query term at every position. The result was an expensive operation
+executed a number of times proportional to the size of the matched posting union
+rather than to the number of results returned.
+
+**Hypothesis.**
+Snippet construction dominates `RankingPipeline.rank`, and ranking latency
+therefore scales with candidate count rather than with `topK`. If true, deferring
+snippet construction until after top-K selection should (a) cut ranking latency by
+roughly the candidate-to-topK ratio and (b) flatten the latency-vs-candidates
+curve.
+
+Falsifiable: if the snippet share of `rank()` were small, or if latency did not
+scale with candidate count, the diagnosis would be wrong.
+
+**Measurement design.**
+Added `RankingStageBenchmarks` with two benchmarks:
+1. `rankingLatencyScalesWithCandidateCount` — `rank()` latency at 200 / 1,000 /
+   5,000 candidates with `topK` fixed at 20, reporting per-candidate cost.
+2. `snippetGenerationShareOfRankingCost` — direct attribution: full `rank()`
+   latency vs. snippet construction for the same candidate set vs. snippet
+   construction for `topK` documents only.
+
+Deterministic seeded corpus, 2,000-character bodies, 3 query terms, 10-iteration
+warmup.
+
+**Baseline.**
+
+| candidates | `rank()` p50 | per-candidate |
+|---|---|---|
+| 200 | 98.80 ms | 494 µs |
+| 1,000 | 466.38 ms | 466 µs |
+| 5,000 | 1205.35 ms | 241 µs |
+
+Attribution at 2,000 candidates: full `rank()` 470.95 ms, of which snippets for
+all candidates accounted for 451.47 ms (**95.9%**), while snippets for the 20
+returned documents cost 5.14 ms. Both predictions confirmed.
+
+**Implementation.**
+`src/main/java/com/minigoogle/ranking/pipeline/RankingPipeline.java`.
+Candidates are now placed into the heap with an empty snippet field; after top-K
+selection and diversification, a new private `withSnippets` step rebuilds the
+surviving documents with their snippets attached.
+
+This is safe because nothing between the two points reads the snippet: the heap
+comparator orders by `finalScore`, and `DiversityFilter` reads only `url()`.
+Document ordering and every score are bit-identical to before; only where the
+snippet string is computed changed. Verified by inspection of both consumers and
+pinned by tests.
+
+**Benchmark result.**
+
+Ranking stage (`topK = 20`):
+
+| candidates | before p50 | after p50 | speedup |
+|---|---|---|---|
+| 200 | 98.80 ms | 7.96 ms | 12.4× |
+| 1,000 | 466.38 ms | 7.65 ms | 61× |
+| 5,000 | 1205.35 ms | 10.42 ms | 116× |
+
+End-to-end standalone search (3,200-doc corpus, 500 iterations after 100-iteration
+warmup, two runs per configuration, alternating):
+
+| metric | baseline | after | improvement |
+|---|---|---|---|
+| p50 | 36.26–36.60 ms | 4.98–9.59 ms | **3.8–7.3×** |
+| p99 | 62.70–63.79 ms | 14.82–32.66 ms | **1.9–4.3×** |
+| throughput | 27 ops/s | 88–165 ops/s | **3.3–6.1×** |
+
+**Tradeoffs.**
+- One extra `RankedDocument` allocation per returned document (≤ `topK`), to
+  attach the snippet to an immutable record. Negligible against the removed work.
+- `RankedDocument` instances now exist transiently with an empty snippet. They
+  never escape `rank()`, but a future change that returns early from the middle of
+  the method would leak snippet-less documents. The regression tests catch this.
+- The underlying `SnippetGenerator` inefficiency is untouched — this change
+  reduces how often it is called, not what it costs per call. See H3 in
+  `ENGINEERING_FINDINGS.md`.
+
+**Validation.**
+- `RankingPipelineSnippetTest` (new, 5 tests): every returned document carries the
+  snippet generated from its own body; snippets remain highlighted; ordering and
+  scores are unchanged and deterministic; result count is bounded by `topK`
+  regardless of candidate count.
+- Full suite: **702 tests, 0 failures**.
+
+**Conclusion.**
+Kept. The evidence supports it on both axes originally predicted: a large constant
+reduction and a change in asymptotic behavior. The expensive per-document stage is
+now bounded by `topK` instead of by the matched set, so the benefit grows with
+corpus size and query breadth.
+
+---
+
+## 2026-08-15 — Restore a compiling, green baseline
+
+**Problem.**
+Nothing in the repository could be measured. Three separate issues:
+
+1. **The working tree did not compile.** `DistributedFrontier.java:176` called
+   `workerHearts(workerId)`, which does not exist; every other call site uses
+   `workerHeartbeats.get(...)`. `compileJava` failed, so `test`, `bench` and
+   `build` all failed. The "673 tests, 0 failures" recorded in
+   `docs/audit-status.md` was not reproducible.
+2. **`ConcurrentIndexTest.concurrentReadersDuringPublishesEachSeeOneCompleteGeneration`
+   failed by construction.** The reader treated any odd generation as a torn read,
+   but the publisher published consecutive integers, so odd values were expected.
+   `ConcurrentIndex.publish` swaps a complete `Entry<T>` through a `volatile`
+   field, so a torn value read is not expressible at all — the test could never
+   pass and tested nothing.
+3. **`DistributedFrontierTest.testRegistryEvictedDownToLimit` asserted an
+   unsatisfiable invariant.** It required `registrySize() <= 5` while leaving seven
+   tasks QUEUED. `evictToLimit` deliberately never evicts active tasks, because the
+   bloom filter would prevent an evicted URL from ever being re-enqueued. It also
+   asserted *which* completed tasks were evicted, but eviction sorts by
+   `discoveredAt`; tasks enqueued in a tight loop share a timestamp, so ties
+   resolve in `ConcurrentHashMap` iteration order — arbitrary.
+
+**Diagnosis.**
+(1) is a typo in uncommitted work. (2) and (3) are test-authoring bugs. In both
+cases the production code was correct; the tests encoded impossible expectations.
+No production behavior was changed to make either test pass.
+
+**Implementation.**
+- `DistributedFrontier.java`: `workerHearts(workerId)` → `workerHeartbeats.get(workerId)`.
+- `ConcurrentIndexTest`: publish only even generations (`2 * i`) so an odd
+  observation is genuinely diagnostic of tearing; added exactly-once close
+  accounting, which is the real contract of the reference-counted retirement
+  scheme (`rounds - 1` retired generations closed exactly once).
+- `DistributedFrontierTest`: assert the documented contract — registry held at its
+  limit while completed tasks remain, all active tasks retained, and the *count*
+  of surviving completed tasks rather than their identity. Added
+  `testRegistryGrowsPastLimitWhenAllTasksAreActive` to pin the intentional
+  trade-off that a queued task is never sacrificed to the size limit.
+
+**Result.**
+696 tests / 2 failed → **702 tests / 0 failures**.
+
+**Tradeoffs.**
+The eviction test is now weaker in one respect: it no longer names which completed
+tasks are evicted. That specificity was never real — it depended on hash iteration
+order — so the previous assertion was a latent flake rather than genuine coverage.
+
+**Conclusion.**
+Kept. Prerequisite for every measurement in this changelog.
+
+---
+
+## 2026-08-15 — Benchmark task hygiene
+
+**Problem.**
+Two build issues made before/after comparison unreliable:
+
+1. `gradlew bench` was skipped as `UP-TO-DATE` when sources had not changed,
+   printing nothing and silently reporting no measurement. This was hit during the
+   A/B comparison: a repeat run produced no output at all.
+2. Benchmarks were excluded from `test` by the literal pattern
+   `**/SearchPerformanceBenchmarks*`, so a newly added benchmark class joined the
+   deterministic suite, adding machine-load-sensitive timing to CI.
+
+**Implementation.**
+`build.gradle.kts`: added `outputs.upToDateWhen { false }` to the `bench` task —
+a benchmark's output is a fresh measurement, not a cacheable artifact. Widened the
+`test` exclusion to `**/*Benchmarks*`.
+
+**Result.**
+`gradlew bench` always re-measures. `gradlew test` stays deterministic at 702
+tests. Verified: the repeat A/B runs that previously produced no output now report
+normally.
+
+**Conclusion.**
+Kept. Small, but the first issue directly corrupted a measurement during this
+investigation.
