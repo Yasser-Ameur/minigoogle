@@ -12,6 +12,7 @@ import java.net.URI;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -34,11 +35,16 @@ public class DistributedFrontier {
     private final long heartbeatTimeoutMillis;
     private final int maxRegistrySize;
 
-    private volatile long totalEnqueued;
-    private volatile long totalDuplicates;
-    private volatile long totalAssigned;
-    private volatile long totalCompleted;
-    private volatile long totalFailed;
+    // LongAdder, not volatile long: these are incremented concurrently by every
+    // crawler worker thread, and `volatile` provides visibility but NOT atomicity
+    // for a read-modify-write. Two threads could read the same value and both
+    // write back value+1, silently losing an increment -- observed as a
+    // duplicate count of 14 where 16 racing enqueues must produce 15.
+    private final LongAdder totalEnqueued = new LongAdder();
+    private final LongAdder totalDuplicates = new LongAdder();
+    private final LongAdder totalAssigned = new LongAdder();
+    private final LongAdder totalCompleted = new LongAdder();
+    private final LongAdder totalFailed = new LongAdder();
     private volatile java.util.function.Function<URI, Instant> recrawlPolicy;
 
     public DistributedFrontier(int bloomFilterExpectedElements, double bloomFilterFalsePositiveRate, long heartbeatTimeoutMillis) {
@@ -53,11 +59,6 @@ public class DistributedFrontier {
         this.assignmentLock = new ReentrantLock();
         this.heartbeatTimeoutMillis = heartbeatTimeoutMillis;
         this.maxRegistrySize = maxRegistrySize;
-        this.totalEnqueued = 0;
-        this.totalDuplicates = 0;
-        this.totalAssigned = 0;
-        this.totalCompleted = 0;
-        this.totalFailed = 0;
     }
 
     public boolean addUrl(URI url, int depth) {
@@ -65,7 +66,7 @@ public class DistributedFrontier {
         String domain = url.getHost().toLowerCase();
 
         if (bloomFilter.probablyContains(urlString)) {
-            totalDuplicates++;
+            totalDuplicates.increment();
             logger.debug("Duplicate URL rejected: {}", url);
             return false;
         }
@@ -75,17 +76,17 @@ public class DistributedFrontier {
         CrawlTask task = new CrawlTask(url, domain, depth, Instant.now());
         CrawlTask existing = taskRegistry.putIfAbsent(urlString, task);
         if (existing != null) {
-            totalDuplicates++;
+            totalDuplicates.increment();
             logger.debug("Duplicate URL rejected (concurrent enqueue): {}", url);
             return false;
         }
 
         scheduler.submitTask(task);
-        totalEnqueued++;
+        totalEnqueued.increment();
 
         evictToLimit();
 
-        logger.debug("Enqueued URL: {} (total: {}, duplicates: {})", url, totalEnqueued, totalDuplicates);
+        logger.debug("Enqueued URL: {} (total: {}, duplicates: {})", url, totalEnqueued.sum(), totalDuplicates.sum());
         return true;
     }
 
@@ -149,7 +150,7 @@ public class DistributedFrontier {
             }
 
             task.markAssigned(workerId);
-            totalAssigned++;
+            totalAssigned.increment();
 
             WorkerHeartbeat heartbeat = workerHeartbeats.get(workerId);
             if (heartbeat != null) {
@@ -170,7 +171,7 @@ public class DistributedFrontier {
             if (recrawlPolicy != null) {
                 task.setNextCrawl(recrawlPolicy.apply(task.getUrl()));
             }
-            totalCompleted++;
+            totalCompleted.increment();
 
             String workerId = task.getAssignedWorkerId();
             WorkerHeartbeat heartbeat = workerId != null ? workerHeartbeats.get(workerId) : null;
@@ -189,7 +190,7 @@ public class DistributedFrontier {
         CrawlTask task = taskRegistry.get(urlString);
         if (task != null) {
             scheduler.onTaskFailed(task);
-            totalFailed++;
+            totalFailed.increment();
 
             WorkerHeartbeat heartbeat = workerHeartbeats.get(workerId);
             if (heartbeat != null) {
@@ -310,11 +311,11 @@ public class DistributedFrontier {
 
     public Map<String, Object> getStats() {
         return Map.of(
-            "totalEnqueued", totalEnqueued,
-            "totalDuplicates", totalDuplicates,
-            "totalAssigned", totalAssigned,
-            "totalCompleted", totalCompleted,
-            "totalFailed", totalFailed,
+            "totalEnqueued", totalEnqueued.sum(),
+            "totalDuplicates", totalDuplicates.sum(),
+            "totalAssigned", totalAssigned.sum(),
+            "totalCompleted", totalCompleted.sum(),
+            "totalFailed", totalFailed.sum(),
             "pendingTasks", scheduler.getQueueSize(),
             "registeredTasks", taskRegistry.size(),
             "activeWorkers", workerHeartbeats.size(),
