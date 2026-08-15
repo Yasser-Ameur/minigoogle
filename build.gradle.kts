@@ -40,10 +40,43 @@ tasks.test {
     testLogging {
         events("passed", "skipped", "failed")
     }
+    // Machine-load-sensitive latency benchmarks belong in the dedicated `bench`
+    // task below so the normal suite (and CI) stays deterministic.
+    exclude("**/*Benchmarks*")
+    // MemoryMappedIndex forces the direct-buffer cleaner to unmap postings
+    // deterministically (no reliance on GC), which is what makes reindex able
+    // to release the old build's file on Windows. Requires the module to be open.
+    jvmArgs("--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED")
+}
+
+/**
+ * Runs the reproducible performance benchmarks in isolation. Timing guards are
+ * intentionally strict; they only stay reliable when the JVM is not competing
+ * with a full test suite, so these are excluded from `test`.
+ *
+ *   gradlew bench
+ */
+val bench by tasks.registering(Test::class) {
+    group = "verification"
+    description = "Runs the performance benchmarks in isolation (strict timing guards)"
+    useJUnitPlatform()
+    // A benchmark's output is a fresh measurement, not a build artifact. Without
+    // this, re-running with unchanged sources is skipped as UP-TO-DATE and
+    // silently reports nothing, which makes before/after comparison unreliable.
+    outputs.upToDateWhen { false }
+    filter {
+        includeTestsMatching("com.minigoogle.performance.*")
+    }
+    testLogging {
+        events("passed", "failed")
+    }
 }
 
 application {
     mainClass.set("com.minigoogle.demo.MiniGoogleApp")
+    // Deterministic unmap of the memory-mapped postings file during reindex
+    // (see MemoryMappedIndex). No GC/System.gc() dependence.
+    applicationDefaultJvmArgs = listOf("--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED")
 }
 
 tasks.jar {

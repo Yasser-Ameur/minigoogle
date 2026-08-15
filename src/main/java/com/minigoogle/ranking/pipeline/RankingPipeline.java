@@ -144,22 +144,27 @@ public class RankingPipeline {
         // 5. Fuse scores
         Map<Integer, Double> fusedScores = fusion.fuse(normBm25, normPageRank);
 
-        // 6. Build RankedDocument list and select Top-K via min-heap
+        // 6. Build RankedDocument list and select Top-K via min-heap.
+        //    Snippets are deliberately NOT built here. Snippet construction scans
+        //    the document body and is by far the most expensive per-document step,
+        //    yet neither the heap (which orders by finalScore) nor the
+        //    diversity filter (which reads only the url) inspects the snippet.
+        //    Building one per candidate would therefore do work proportional to
+        //    the size of the matched posting union and discard all but topK of
+        //    it. Snippets are filled in at step 9, for survivors only.
         PriorityQueue<RankedDocument> heap = new PriorityQueue<>(
                 Comparator.comparingDouble(RankedDocument::finalScore));
 
         for (int docId : tfByDoc.keySet()) {
             String url = docUrls.getOrDefault(docId, "");
             String title = docTitles.getOrDefault(docId, "");
-            String body = docBodies.getOrDefault(docId, "");
-            String snippet = snippetGenerator.generate(body, queryTerms);
 
             RankedDocument ranked = new RankedDocument(
                     docId, url, title,
                     rawBm25Scores.getOrDefault(docId, 0.0),
                     rawPageRankScores.getOrDefault(docId, 0.0),
                     fusedScores.getOrDefault(docId, 0.0),
-                    snippet
+                    ""
             );
 
             heap.offer(ranked);
@@ -175,9 +180,34 @@ public class RankingPipeline {
         // 8. Apply domain diversification (skippable: reorders by domain, which
         //    perturbs ranking metrics and is meaningless when every document
         //    shares one synthetic domain).
-        if (diversifyEnabled) {
-            return diversityFilter.diversify(topResults);
+        List<RankedDocument> selected = diversifyEnabled
+                ? diversityFilter.diversify(topResults)
+                : topResults;
+
+        // 9. Attach snippets to the selected documents only.
+        return withSnippets(selected, queryTerms);
+    }
+
+    /**
+     * Returns {@code selected} with each document's snippet generated from its
+     * body. Ordering and every score are preserved exactly; only the snippet
+     * field changes.
+     */
+    private List<RankedDocument> withSnippets(List<RankedDocument> selected,
+                                              List<String> queryTerms) {
+        List<RankedDocument> withSnippets = new ArrayList<>(selected.size());
+        for (RankedDocument doc : selected) {
+            String body = docBodies.getOrDefault(doc.documentId(), "");
+            withSnippets.add(new RankedDocument(
+                    doc.documentId(),
+                    doc.url(),
+                    doc.title(),
+                    doc.bm25Score(),
+                    doc.pageRankScore(),
+                    doc.finalScore(),
+                    snippetGenerator.generate(body, queryTerms)
+            ));
         }
-        return topResults;
+        return withSnippets;
     }
 }
