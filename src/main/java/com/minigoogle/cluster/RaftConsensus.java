@@ -75,6 +75,13 @@ public class RaftConsensus {
     /** Floor for the read-barrier quorum wait, independent of heartbeat cadence. */
     private static final long READ_BARRIER_MIN_TIMEOUT_MS = 500;
 
+    /**
+     * Payload of the entry a new leader appends in its own term. An empty
+     * payload is unambiguous: config frames are identified by a leading opcode
+     * byte, and every state-machine command is non-empty.
+     */
+    private static final byte[] NO_OP_PAYLOAD = new byte[0];
+
     private final String nodeId;
     private volatile RaftState state;
     private volatile String currentLeader;
@@ -610,6 +617,41 @@ public class RaftConsensus {
             matchIndex.put(peer, 0);
         }
         scheduleHeartbeats();
+
+        // Raft §5.4.2: a leader may not conclude that an entry from a previous
+        // term is committed merely because it is stored on a majority --
+        // advanceCommitIndex correctly requires log.termAt(n) == currentTerm.
+        // The consequence is that a carried-over tail can never commit on its
+        // own: followers never apply it, and a linearizable read (which waits
+        // for commitIndex to reach its read index) cannot be satisfied until a
+        // client happens to write. Committing an entry of the new term closes
+        // that window and carries every preceding entry with it.
+        //
+        // The no-op is appended only when such a tail actually exists. On a
+        // fresh election with a fully-committed log there is nothing to carry,
+        // so nothing is written and log indices keep their natural meaning.
+        if (log.lastIndex() > commitIndex) {
+            appendNoOp();
+        }
+    }
+
+    /**
+     * Appends an empty entry in the current term so the leader has something of
+     * its own to commit. Failure is non-fatal: the next client write achieves
+     * the same effect, so a transient append problem must not abort the
+     * leadership transition.
+     */
+    private void appendNoOp() {
+        try {
+            int index = log.append(currentTerm, NO_OP_PAYLOAD);
+            if (majorityThreshold() <= 1) {
+                commitIndex = index;
+                applyCommitted(index);
+            }
+            sendHeartbeats();
+        } catch (RuntimeException e) {
+            System.err.println("Node " + nodeId + " could not append its leadership no-op: " + e.getMessage());
+        }
     }
 
     /**
@@ -1077,7 +1119,12 @@ public class RaftConsensus {
      */
     private void applyEntry(int index) {
         byte[] payload = log.payloadAt(index);
-        if (payload != null && ConfigChange.isConfigFrame(payload)) {
+        if (payload == null || payload.length == 0) {
+            // A leadership no-op: it exists only to give the new leader an entry
+            // of its own term to commit, and carries no state-machine command.
+            return;
+        }
+        if (ConfigChange.isConfigFrame(payload)) {
             applyConfigChange(ConfigChange.decode(payload));
             return;
         }
