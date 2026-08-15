@@ -5,6 +5,119 @@ result, tradeoffs, conclusion. Newest first.
 
 ---
 
+## 2026-08-15 — Semantic candidate generation, and what the union proves
+
+### Problem
+
+The trained encoder was validated but unused. The open question was whether
+adding its candidates to BM25's — with the ranker untouched — improves retrieval
+quality, or only coverage.
+
+### Hypothesis
+
+Semantic retrieval contributes relevant documents BM25 cannot reach, so a
+candidate union should raise candidate recall. Whether that converts into better
+NDCG depends on whether the existing ranker can score the new candidates.
+
+### Experiment
+
+`HybridUnionDiagnostic` compares three systems under an identical ranking
+configuration, varying only which candidates exist:
+
+- **A** BM25 alone
+- **B** semantic alone (exact vector scan)
+- **C** union — BM25's ranked output, then semantic candidates it did not contain,
+  in similarity order. No scores combined.
+
+Semantic depth swept at K = 50 / 100 / 500 / 1000.
+
+### Implementation
+
+`SemanticRetriever` — a candidate generator, not a ranker. Vectors are built once
+and persisted (versioned file with a magic header, so a stale or dimension-
+mismatched store is rejected loudly rather than producing plausible nonsense).
+Search is an exact full scan, retained as the oracle for any future ANN index.
+
+### Quality impact
+
+| | scifact | trec-covid 25k |
+|---|---|---|
+| candidate recall, BM25 → union | 0.9343 → **0.9933** | 0.4789 → **0.8153** |
+| NDCG@10, BM25 → union | 0.6015 → 0.6015 | 0.1080 → 0.1080 |
+| MRR@10, BM25 → union | 0.5641 → 0.5641 | 0.3120 → 0.3120 |
+| Recall@100, BM25 → union | 0.8409 → 0.8409 | 0.2950 → 0.2950 |
+
+Coverage rose substantially — **+70% candidate recall on trec-covid**. Ranking
+quality did not move at all, at any semantic depth, on either dataset.
+
+Tracking the semantic-only relevant documents explains why:
+
+| | scifact | trec-covid 25k |
+|---|---|---|
+| found by semantic, missed by BM25 | 19 | 192 |
+| enter the union pool | 100% | 100% |
+| reach rank ≤ 100 | **0%** | **0%** |
+
+The cause is structural. `RankingPipeline.rank` builds its candidate map purely
+from query-term posting lists, so a document containing none of the query terms
+never enters scoring; `BM25Calculator` guards `tf > 0`, so its score would be
+zero even if injected. Appending is the most favourable placement the unchanged
+ranker can give, and it still puts none of them in the top 100.
+
+### Performance impact
+
+| | scifact | trec-covid 25k |
+|---|---|---|
+| BM25 p50 | 1686 ms | 674 ms |
+| semantic p50 | 127 ms | 96 ms |
+| union p50 | 1837 ms | 768 ms |
+
+Semantic search is the cheap half — 7–13× faster than the lexical path at
+deepK=1000, though the lexical figure is inflated by snippet generation for 1000
+documents, so it is not a like-for-like retrieval comparison.
+
+### Cross-dataset impact
+
+Identical conclusion on both: coverage up, ranking unchanged, zero semantic-only
+documents in the top 100.
+
+A second consistent result: **semantic-only ranking beat BM25 in every matched
+comparison** — scifact 0.6451 vs 0.6015, trec-covid 25k 0.1897 vs 0.1080. (On
+full-corpus trec-covid in P5, BM25 was ahead at 0.3890; subset and full-corpus
+figures are not comparable, so the claim is restricted to matched runs.)
+
+### Tradeoffs
+
+- **Nothing is wired into production.** With the ranker unchanged the union
+  delivers exactly zero end-to-end gain, so shipping it would add embedding cost,
+  38–263 MB of vectors and ~100 ms per query for no measurable benefit. Semantic
+  retrieval has earned its place *in the architecture*, not yet in the default
+  path.
+- **The trec-covid arm is a 25,000-document subset.** Full-corpus embedding is
+  ~5.3 hours; both sides of every comparison use the same subset so the contrast
+  is valid, but absolute values are not comparable to full-corpus figures.
+- **Document truncation is measured, not fixed.** Embeddings cover `title + text`
+  through a 256-token window, so long abstracts are truncated. Recorded as input
+  to a later representation mission.
+
+### Conclusion
+
+Kept. The union experiment did its job: it converted "semantic retrieval finds
+things BM25 misses" into the sharper and more actionable "**the ranker cannot use
+what semantic retrieval finds**".
+
+The next problem is **score fusion**, and specifically RRF — now the right tool
+for exactly the reason it was previously deferred. BM25 and cosine are on
+incompatible scales, but both produce rankings, and the semantic ranking is now
+at least as good as the lexical one. That was untrue of the feature-hash
+representation, which is why fusion was correctly rejected then and is correctly
+indicated now.
+
+Not the next problem: candidate recall (solved), semantic representation
+(validated), execution cost (semantic is the cheap half).
+
+---
+
 ## 2026-08-15 — A real semantic retrieval capability (local trained encoder)
 
 ### Problem

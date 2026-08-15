@@ -1789,3 +1789,161 @@ mission's order is quality first.
   the binding problem; the 256-token window is a known limitation to measure next.
 - **Domain adaptation / training** — not attempted, and MiniGoogle does not train
   the encoder.
+
+---
+
+# P6 — Hybrid candidate union (2026-08-15)
+
+## Architecture
+
+```
+                    query
+                      │
+        ┌─────────────┴─────────────┐
+   LexicalRetriever          SemanticRetriever
+   (BM25 via QueryPlanner)   (MiniLM + exact vector scan)
+        │                             │
+   lexical candidates          vector candidates
+        └─────────────┬─────────────┘
+                    UNION            <- candidate sets only, no scores combined
+                      │
+              existing ranker        <- unchanged: BM25 + PageRank
+                      │
+                    top-K
+```
+
+`SemanticRetriever` is deliberately a *candidate generator*, not a ranker. Vectors
+are built once and persisted (`buildVectorStore`) and loaded by a search node;
+search is an exact full scan, which stays as the oracle for any future ANN index.
+
+**How the union is ordered.** BM25's ranked output first in its own order, then
+semantic candidates it did not already contain, in similarity order. No BM25
+score is ever combined with a similarity and BM25's relative ordering is
+untouched — this is a candidate-set union, not fusion.
+
+That ordering is not arbitrary: it is *the most favourable placement the
+unchanged ranker can give a semantic-only document*. `RankingPipeline.rank`
+builds its candidate map purely from query-term posting lists, so a document
+containing none of the query terms never enters scoring at all; and
+`BM25Calculator.scoreDocument` guards `tf > 0 && df > 0`, so even if injected its
+score would be exactly 0. Appending is strictly better than what the ranker would
+do on its own.
+
+## Finding 34 — Candidate union raises coverage and changes nothing else
+
+Identical ranking configuration across all three systems; the only difference is
+which candidates exist.
+
+**scifact (5,183 documents, 300 judged queries, deepK=1000):**
+
+| system | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 | candidate recall | cands | p50 |
+|---|---|---|---|---|---|---|---|---|
+| A: BM25 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9343 | 0.9343 | 931 | 1686 ms |
+| B: semantic | **0.6451** | **0.6047** | **0.7833** | **0.9250** | **0.9933** | 0.9933 | 1000 | **127 ms** |
+| C: union semK=50 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9800 | 948 | 1837 ms |
+| C: union semK=100 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9800 | 971 | 1837 ms |
+| C: union semK=500 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9900 | 1219 | 1837 ms |
+| C: union semK=1000 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | **0.9933** | 1584 | 1837 ms |
+
+**trec-covid 25k diagnostic subset (47 judged queries, deepK=1000):**
+
+| system | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 | candidate recall | cands | p50 |
+|---|---|---|---|---|---|---|---|---|
+| A: BM25 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4789 | 0.4789 | 996 | 674 ms |
+| B: semantic | **0.1897** | **0.4220** | **0.1240** | **0.3223** | **0.7000** | 0.7000 | 1000 | **96 ms** |
+| C: union semK=50 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.5738 | 1033 | 768 ms |
+| C: union semK=100 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.6142 | 1073 | 768 ms |
+| C: union semK=500 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.7570 | 1397 | 768 ms |
+| C: union semK=1000 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | **0.8153** | 1823 | 768 ms |
+
+**Retrieval-stage coverage improved substantially. Ranking-stage quality did not
+move at all.**
+
+- candidate recall: 0.9343 → 0.9933 (scifact), **0.4789 → 0.8153** (trec-covid, +70%)
+- NDCG@10, MRR@10, Recall@10, Recall@100: **byte-identical to BM25** at every
+  semantic depth on both datasets
+- Recall@1000 moves only marginally (0.9343 → 0.9443; 0.4789 → 0.4798), and only
+  because BM25 returned fewer than 1000 documents leaving a few slots free
+
+## Finding 35 — The ranker cannot exploit the candidates it is given
+
+Tracking semantic-only relevant documents (found by semantic, missed by BM25)
+through the pipeline at semK=1000:
+
+| | scifact | trec-covid 25k |
+|---|---|---|
+| found by semantic, missed by BM25 | 19 | 192 |
+| present in the union candidate pool | 19 (100%) | 192 (100%) |
+| reach union rank ≤ 1000 | 3 (15.8%) | 1 (0.5%) |
+| reach union rank ≤ 100 | **0 (0.0%)** | **0 (0.0%)** |
+| reach union rank ≤ 10 | **0 (0.0%)** | **0 (0.0%)** |
+
+Every semantic-only relevant document enters the candidate pool. **Not one
+reaches the top 100 on either dataset.** The candidates are available and the
+ranker has no way to score them.
+
+This is the mission's Case B, and it is the answer: **the bottleneck has moved
+from retrieval coverage to score ranking.** Candidate union alone cannot help,
+because the only signal that identifies these documents as relevant is the
+semantic similarity the ranker does not consume.
+
+## Finding 36 — Semantic-only retrieval outranks BM25 on both datasets
+
+Worth separating from the union result, because it changes what the next mission
+should aim at:
+
+| | BM25 | semantic-only |
+|---|---|---|
+| scifact NDCG@10 | 0.6015 | **0.6451** |
+| scifact MRR@10 | 0.5641 | **0.6047** |
+| trec-covid 25k NDCG@10 | 0.1080 | **0.1897** |
+| trec-covid 25k MRR@10 | 0.3120 | **0.4220** |
+
+The semantic channel is not merely a recall supplement — on this evidence it is
+the stronger *ranker* on both corpora. Earlier (P5) semantic-only lost to BM25 on
+full-corpus trec-covid (0.1897 vs 0.3890); on the 25k subset BM25 falls to 0.1080
+while semantic holds at 0.1897. Subset and full-corpus numbers are not
+comparable, so the honest statement is: **on matched configurations, semantic-only
+ranking beat BM25 in every comparison run in this mission.**
+
+## Latency, observational
+
+| | scifact | trec-covid 25k |
+|---|---|---|
+| BM25 p50 | 1686 ms | 674 ms |
+| semantic p50 | **127 ms** | **96 ms** |
+| union p50 | 1837 ms | 768 ms |
+
+Semantic exact search is **7–13× faster than the lexical path** at deepK=1000.
+The lexical figure is inflated by snippet generation for 1000 documents, so this
+is not a like-for-like retrieval comparison — but it does mean the semantic
+channel is not the expensive component, and the union cost is essentially the
+BM25 cost plus ~100 ms.
+
+## Document truncation, measured not fixed (§12)
+
+Documents are embedded as `title + " " + text` through WordPiece with a
+**256-token window**; anything beyond is truncated. TREC-COVID abstracts commonly
+exceed that, so the vectors represent roughly a title plus the opening of an
+abstract rather than the whole document. Recorded as an input to a later
+representation mission; deliberately not changed here.
+
+## Conclusion — the next problem is score fusion
+
+Semantic candidate generation has earned its place: it contributes relevant
+documents BM25 cannot reach (+70% candidate recall on trec-covid) at ~100 ms.
+
+But it has **not** earned a place in the *production* path yet, because with the
+ranker unchanged it delivers exactly zero end-to-end quality improvement. Wiring
+it in now would add embedding cost, 38 MB–263 MB of vectors and ~100 ms per query
+for no measurable gain.
+
+The next mission is **score fusion** — specifically RRF, which is now the right
+tool for exactly the reason it was previously deferred: BM25 and cosine live on
+incompatible scales, but both produce *rankings*, and the evidence here is that
+the semantic ranking is at least as good as the lexical one. That was not true of
+the feature-hash representation, which is why fusion was correctly rejected then
+and is correctly indicated now.
+
+Not the next problem: candidate recall (solved), semantic representation quality
+(validated), execution cost (semantic is the cheap half).

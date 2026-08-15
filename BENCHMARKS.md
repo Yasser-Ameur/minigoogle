@@ -891,3 +891,89 @@ candidate recall 0.7242 capped vs 0.8357 full; 47 of 50 queries retain judgments
 - **ANN / HNSW** — deferred. Exact search is the oracle and must exist first.
 - **Chunking** — deferred. Truncation was not shown to be the binding problem.
 - **Domain adaptation** — not attempted.
+
+---
+
+## HYBRID — candidate union, ranker unchanged (2026-08-15)
+
+**Benchmark:** `HybridUnionDiagnostic`. Compares BM25 alone, semantic alone, and
+their candidate union under the **identical** ranking configuration.
+
+**Union definition:** BM25's ranked output first in its own order, then semantic
+candidates it did not already contain, in similarity order. No scores are
+combined — this is candidate-set union, not fusion.
+
+**Configuration (identical across A/B/C):** `semantic.enabled=false` on the
+lexical side, `ranking.rerank.enabled=false`, `ranking.diversify.enabled=false`,
+`semantic.expansion.enabled=false`, `deepK=1000`. BM25 k1/b, PageRank, topK and
+deepK untouched.
+
+**Command:**
+
+```bash
+./gradlew bench --tests "com.minigoogle.performance.HybridUnionDiagnostic" \
+  -Dbeir.dir=data/beir/scifact -Dbeir.dataset=scifact -Dbeir.threads=8
+```
+
+### scifact (5,183 docs, 300 judged queries)
+
+| system | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 | cand recall | cands | p50 |
+|---|---|---|---|---|---|---|---|---|
+| BM25 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9343 | 0.9343 | 931 | 1686 ms |
+| semantic | **0.6451** | **0.6047** | **0.7833** | **0.9250** | **0.9933** | 0.9933 | 1000 | **127 ms** |
+| union semK=50 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9800 | 948 | 1837 ms |
+| union semK=100 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9800 | 971 | 1837 ms |
+| union semK=500 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9900 | 1219 | 1837 ms |
+| union semK=1000 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | **0.9933** | 1584 | 1837 ms |
+
+### TREC-COVID 25k diagnostic subset (47 judged queries)
+
+Absolute values are **not** comparable to full-corpus TREC-COVID figures — BM25
+NDCG@10 is 0.1080 here versus 0.3890 on the full corpus. Both sides of every
+comparison use this same subset, so the A/B/C contrast is valid.
+
+| system | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 | cand recall | cands | p50 |
+|---|---|---|---|---|---|---|---|---|
+| BM25 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4789 | 0.4789 | 996 | 674 ms |
+| semantic | **0.1897** | **0.4220** | **0.1240** | **0.3223** | **0.7000** | 0.7000 | 1000 | **96 ms** |
+| union semK=50 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.5738 | 1033 | 768 ms |
+| union semK=100 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.6142 | 1073 | 768 ms |
+| union semK=500 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.7570 | 1397 | 768 ms |
+| union semK=1000 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | **0.8153** | 1823 | 768 ms |
+
+### Semantic-only relevant documents through the pipeline (semK=1000)
+
+| | scifact | trec-covid 25k |
+|---|---|---|
+| found by semantic, missed by BM25 | 19 | 192 |
+| enter the union candidate pool | 19 (100%) | 192 (100%) |
+| reach rank ≤ 1000 | 3 (15.8%) | 1 (0.5%) |
+| reach rank ≤ 100 | 0 (0.0%) | 0 (0.0%) |
+| reach rank ≤ 10 | 0 (0.0%) | 0 (0.0%) |
+
+### Interpretation
+
+**Retrieval-stage coverage improved; ranking-stage quality did not.** Candidate
+recall rises 0.4789 → 0.8153 on trec-covid (+70%) and 0.9343 → 0.9933 on scifact,
+while NDCG@10, MRR@10, Recall@10 and Recall@100 are byte-identical to BM25 at
+every semantic depth on both datasets.
+
+The cause is structural, not a tuning problem: `RankingPipeline.rank` builds its
+candidate map from query-term posting lists only, so a document with none of the
+query terms is never scored, and `BM25Calculator` guards `tf > 0` so its score
+would be zero regardless. Appending is the best placement the unchanged ranker
+can give, and it is not enough.
+
+**Semantic candidate depth beyond 100 buys candidate recall and nothing else**
+under the current ranker — worth knowing when fusion is added, since the cost is
+linear in the candidate count (931 → 1584 candidates at semK=1000 on scifact).
+
+Semantic exact search is 7–13× *faster* than the lexical path at this depth
+(96–127 ms vs 674–1686 ms), though the lexical figure is inflated by snippet
+generation for 1000 documents, so it is not a like-for-like retrieval comparison.
+
+### Not done
+
+Score fusion, RRF, ANN and chunking remain unimplemented, per the mission's
+sequencing. This experiment is what establishes that fusion is now the correct
+next step rather than a premature one.
