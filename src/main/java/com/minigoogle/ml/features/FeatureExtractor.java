@@ -6,9 +6,12 @@ import com.minigoogle.semantic.EmbeddingGenerator;
 import com.minigoogle.semantic.VectorIndex;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Extracts query-document features for the learning-to-rank model.
@@ -108,12 +111,17 @@ public class FeatureExtractor implements ClickFeatureProvider {
         String body = docBodies.getOrDefault(documentId, "");
         String title = docTitles.getOrDefault(documentId, "");
         String url = docUrls.getOrDefault(documentId, "");
+        // Lowercase the body once. Both the lexical score and the overlap
+        // fraction need the folded form, and the body is by far the largest
+        // string here, so folding it twice per document doubled the dominant
+        // allocation in this method.
+        String lowerBody = body.isEmpty() ? "" : body.toLowerCase(Locale.ROOT);
         return new RawFeatures(
-                bm25(terms, body),
+                bm25(terms, lowerBody),
                 pageRankScores.getOrDefault(documentId, 0.0),
                 matchFraction(terms, title),
                 matchFraction(terms, url),
-                overlapFraction(terms, body),
+                overlapFraction(terms, lowerBody),
                 semantic(query, documentId),
                 docLengths.getOrDefault(documentId, 1),
                 0.0);
@@ -137,11 +145,11 @@ public class FeatureExtractor implements ClickFeatureProvider {
      * TF-saturated lexical score: 1 - exp(-sum of log-scaled term frequencies).
      * Saturating keeps the feature bounded in [0, 1] without a corpus maximum.
      */
-    private double bm25(List<String> terms, String body) {
-        if (terms.isEmpty() || body == null || body.isEmpty()) {
+    private double bm25(List<String> terms, String lowerBody) {
+        if (terms.isEmpty() || lowerBody == null || lowerBody.isEmpty()) {
             return 0.0;
         }
-        String lower = body.toLowerCase(Locale.ROOT);
+        String lower = lowerBody;
         double lexical = 0.0;
         for (String term : terms) {
             int count = countOccurrences(lower, term);
@@ -166,11 +174,15 @@ public class FeatureExtractor implements ClickFeatureProvider {
         return (double) matched / terms.size();
     }
 
-    private double overlapFraction(List<String> terms, String body) {
-        if (terms.isEmpty() || body == null || body.isEmpty()) {
+    private double overlapFraction(List<String> terms, String lowerBody) {
+        if (terms.isEmpty() || lowerBody == null || lowerBody.isEmpty()) {
             return 0.0;
         }
-        List<String> bodyTerms = new ArrayList<>(new java.util.LinkedHashSet<>(tokenize(body)));
+        // Look the terms up in the set directly. The previous version built a
+        // LinkedHashSet to deduplicate and then copied it into an ArrayList,
+        // which turned every lookup into an O(n) scan of the document's whole
+        // vocabulary for no benefit — the order was never used.
+        Set<String> bodyTerms = tokenizeToSet(lowerBody);
         int present = 0;
         for (String term : terms) {
             if (bodyTerms.contains(term)) {
@@ -191,12 +203,37 @@ public class FeatureExtractor implements ClickFeatureProvider {
         return Math.max(0.0, Math.min(1.0, sim));
     }
 
+    /**
+     * Precompiled so tokenization does not recompile the pattern on every call.
+     * {@code String.split} only avoids compilation for single-character
+     * patterns, which this is not, and tokenization runs once per served
+     * document.
+     */
+    private static final Pattern NON_ALPHANUMERIC = Pattern.compile("[^a-z0-9]+");
+
     private static List<String> tokenize(String text) {
         List<String> tokens = new ArrayList<>();
         if (text == null || text.isBlank()) {
             return tokens;
         }
-        for (String token : text.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) {
+        for (String token : NON_ALPHANUMERIC.split(text.toLowerCase(Locale.ROOT))) {
+            if (!token.isEmpty()) {
+                tokens.add(token);
+            }
+        }
+        return tokens;
+    }
+
+    /**
+     * Tokenizes text that is <em>already</em> lowercased into a set, for
+     * membership tests. Avoids the intermediate list and the second fold.
+     */
+    private static Set<String> tokenizeToSet(String lowerText) {
+        Set<String> tokens = new HashSet<>();
+        if (lowerText == null || lowerText.isBlank()) {
+            return tokens;
+        }
+        for (String token : NON_ALPHANUMERIC.split(lowerText)) {
             if (!token.isEmpty()) {
                 tokens.add(token);
             }
