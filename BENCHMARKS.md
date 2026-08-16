@@ -1336,3 +1336,125 @@ No significance testing (300/47/50 queries, no per-query score retention, no
 paired test). No ANN index. No per-channel weighting. No latency optimization.
 No change to BM25, the embedding model, query expansion, PageRank, or title/body
 weighting.
+
+---
+
+## Hybrid Retrieval — fusion depth vs presentation depth (2026-08-16)
+
+**Benchmark:** `ProductionRrfDepthBenchmark`. Unlike `RrfHybridDiagnostic`, which
+computes fusion itself, this one drives the real `SearchEngine` through
+`SearchEngineBuilder` and measures whatever production actually does.
+
+### What changed
+
+`ranking.topK` meant two unrelated things: how deep each retrieval channel
+reached fusion, and how many results were returned and given snippets. Requesting
+a page of twenty therefore also narrowed the lexical channel to twenty ranks
+while the semantic channel stayed at 1000.
+
+| | before | after |
+|---|---|---|
+| lexical ranks reaching RRF | `ranking.topK` (20) | `ranking.fusion.depth` (1000) |
+| semantic ranks reaching RRF | 1000 | 1000 |
+| returned page | 20 | `ranking.topK` (20) |
+| snippets built | one per fused document | one per **returned** document |
+| diversification | applied **before** fusion, so RRF consumed a domain-shuffled lexical ranking | applied to the returned page |
+
+### Definitive before/after — TREC-COVID FULL CORPUS (171,332 docs, 50 judged queries)
+
+| configuration | NDCG@10 | MRR@10 | R@10 | candRecall |
+|---|---|---|---|---|
+| BM25, page 20 | 0.3889 | 0.6093 | 0.0120 | 0.0223 |
+| **OLD production** — lexical 20, semantic 1000, page 20 | 0.5542 | **0.8290** | 0.0156 | 0.0263 |
+| both channels 20, page 20 | 0.4628 | 0.7140 | 0.0135 | 0.0248 |
+| **NEW production** — fusion 1000, semantic 1000, page 20 | **0.5810** | 0.8037 | 0.0167 | 0.0301 |
+| diagnostic configuration — page 1000 | **0.5810** | 0.8037 | 0.0167 | 0.3804 |
+
+The OLD row is the configuration that actually shipped, measured through the
+production engine — not inferred from a diagnostic. The "both channels 20" row is
+a configuration that never shipped; it is included only to show that the loss is
+driven by the lexical channel, not by depth in general.
+
+**The production gap is closed.** NEW production at a 20-result page reproduces
+the diagnostic benchmark exactly: NDCG@10 0.5810 and MRR@10 0.8037, gap +0.0000
+on both. The two rows differ only in Recall@100/@1000 and candidate recall, which
+are bounded by page size and therefore cannot be compared across page depths.
+
+**The fix costs MRR@10.** 0.8290 → 0.8037, −3.1%, while NDCG@10 gains +4.8% and
+Recall@10 +7.1%. This is not noise: the same inversion appeared independently in
+the `RrfHybridDiagnostic` lexical-depth sweep (MRR 0.8290 at depth 20 versus
+0.8037 at depth 1000 — identical values from a separate harness). A shallow, high
+precision lexical list produces a better single top hit; a deep one produces a
+better ordering overall and much better recall. The deep configuration is kept
+because NDCG@10, Recall@10 and candidate recall all improve and only MRR@10
+regresses, but the tradeoff is real and is not hidden.
+
+### Why the non-fusion rows do not match the diagnostic exactly
+
+BM25 measures 0.3889 here against 0.3890 in `RrfHybridDiagnostic`, and OLD
+production 0.5542 against 0.5536 for the simulated equivalent. The cause is
+pre-existing and unrelated to this change: `SearchEngine` applies the boolean
+query filter **after** the ranking stage has truncated to its depth, with no
+backfill. Filtering a 1000-deep list and then taking the top 20 is therefore not
+identical to truncating to 20 and then filtering. The effect is ~0.1% and only
+appears in shallow configurations; at fusion depth 1000 the two agree exactly,
+which is why the NEW production row matches to four decimal places.
+
+### scifact (5,183 docs, 300 judged queries)
+
+| configuration | NDCG@10 | MRR@10 |
+|---|---|---|
+| BM25, page 20 | 0.6015 | 0.5641 |
+| both channels 20, page 20 | 0.6699 | 0.6300 |
+| **NEW production** — fusion 1000, page 20 | **0.6641** | **0.6270** |
+| diagnostic configuration — page 1000 | 0.6641 | 0.6270 |
+
+scifact reproduces its diagnostic figure exactly as well (0.6641 / 0.6270). Its
+depth sensitivity is negligible in both directions, consistent with the earlier
+lexical-depth sweep — the channels overlap heavily there, so a deeper lexical
+list adds little the semantic one has not already supplied.
+
+### Latency — one arm per JVM, full corpus
+
+Measured with `-Dbeir.armIndex=N` so no arm carries another's memory pressure.
+Quality figures reproduced identically to the table above in this second,
+independent set of runs.
+
+| configuration | NDCG@10 | p50 | p95 | p99 |
+|---|---|---|---|---|
+| BM25, page 20 | 0.3889 | 93.4 ms | 317.9 ms | 450.1 ms |
+| OLD production — lexical 20, semantic 1000 | 0.5542 | 251.9 ms | 396.9 ms | 511.3 ms |
+| both channels 20 | 0.4628 | 411.9 ms | 654.1 ms | 929.7 ms |
+| **NEW production** — fusion 1000, page 20 | **0.5810** | **403.4 ms** | 727.7 ms | 1148.0 ms |
+| diagnostic configuration — page 1000 | 0.5810 | 673.2 ms | 1320.8 ms | 1831.9 ms |
+
+**The claim this supports, and no more.** Two configurations produce identical
+ranking quality (0.5810 / 0.8037). Reaching it previously required page depth
+1000; it now costs page depth 20, at **1.67x lower p50 and 1.60x lower p99**.
+Separating fusion depth from presentation depth preserves benchmarked ranking
+quality while limiting snippet work to the returned page.
+
+What this is **not** evidence for: that RRF is fast. It is not. Enabling it costs
+93.4 ms → 403.4 ms at p50 on this corpus, because every query pays an encoder
+pass and an exact linear scan over 171,332 vectors. The only cheap component is
+the fusion arithmetic itself, measured separately at **0.71 ms p50** (see the
+diagnostic section above).
+
+Correctness also costs latency, and the honest comparison says so: the corrected
+configuration is 251.9 ms → 403.4 ms slower at p50 than the buggy one it
+replaces, because the lexical channel now genuinely ranks 1000 deep rather than
+20. The +4.8% NDCG@10 and +7.1% Recall@10 are bought, not free.
+
+Depth on the *semantic* channel is close to free by comparison (`both channels
+20` at 411.9 ms is within noise of `fusion 1000` at 403.4 ms), because the vector
+scan is exact and touches every document regardless of how many results are kept.
+
+### Invalidated run — recorded so it is not repeated
+
+A first attempt measured all five arms in one JVM. Nothing releases an engine's
+vector store, so the JVM accumulated five 263 MB stores alongside the
+171,332-document corpus; the run went from 6m33s to **3h25m** and produced a
+single query timed at **49.6 minutes**. The quality figures from that run were
+unaffected (they are deterministic, and reproduced exactly on re-measurement),
+but **every latency figure from it is discarded as contaminated**. Latency below
+is measured with `-Dbeir.armIndex=N`, one arm per JVM.

@@ -241,9 +241,18 @@ public class SearchEngine {
             // root is NOT, so the matched set is a complement of the term
             // postings (nothing to BM25-rank against); rank the matched
             // documents directly instead of dropping them.
-            ranked = rankedFromPostings(results);
+            ranked = rankedFromPostings(results, !semanticModeActive);
         } else {
-            ranked = ranking.rank(queryTerms, candidatePostings, documentFrequencies);
+            // Hybrid ranking fuses two rankings by position, so the lexical side
+            // must be as deep as the semantic side or the fusion is lopsided:
+            // truncating the lexical channel to the page size costs 4.7% NDCG@10
+            // and a third of candidate recall on full-corpus TREC-COVID. The
+            // deep ranking carries no snippets; present() builds those for the
+            // returned page only.
+            ranked = semanticModeActive
+                    ? ranking.rankToDepth(queryTerms, candidatePostings, documentFrequencies,
+                            config.fusionDepth())
+                    : ranking.rank(queryTerms, candidatePostings, documentFrequencies);
             // The ranking stage scores every document in the candidate term
             // posting lists; restrict its output to the documents that satisfy
             // the boolean query (AND/OR/NOT/phrase) computed above.
@@ -293,6 +302,9 @@ public class SearchEngine {
         // and before re-ranking, so all three share one code path.
         if (semanticModeActive) {
             ranked = applySemanticMode(query, ranked);
+            // Fusion ran over the full depth of both channels; now reduce to what
+            // is actually returned and build snippets for those documents only.
+            ranked = ranking.present(ranked, queryTerms, config.rankingTopK());
         }
 
         // Re-rank with cross-encoder
@@ -371,8 +383,11 @@ public class SearchEngine {
             return new RankedDocument(existing.documentId(), existing.url(), existing.title(),
                     existing.bm25Score(), existing.pageRankScore(), score, existing.snippet());
         }
+        // No snippet here: this runs once per fused document, which is the full
+        // fusion depth, while at most topK of them are ever returned. present()
+        // builds snippets for the survivors.
         return new RankedDocument(docId, docUrls.getOrDefault(docId, ""),
-                docTitles.getOrDefault(docId, ""), 0.0, 0.0, score, snippetFor(docId));
+                docTitles.getOrDefault(docId, ""), 0.0, 0.0, score, "");
     }
 
     /**
@@ -423,13 +438,19 @@ public class SearchEngine {
      * Builds ranked documents directly from a posting list when the query has
      * no individual word leaves to score (e.g. a pure phrase query).
      */
-    private List<RankedDocument> rankedFromPostings(PostingList results) {
+    private List<RankedDocument> rankedFromPostings(PostingList results, boolean withSnippets) {
         List<RankedDocument> ranked = new ArrayList<>();
         for (Posting posting : results.getPostings()) {
             int docId = posting.getDocumentId();
             String url = docUrls.getOrDefault(docId, "");
             String title = docTitles.getOrDefault(docId, "");
-            ranked.add(new RankedDocument(docId, url, title, 0.0, 0.0, 1.0, snippetFor(docId)));
+            // This branch is bounded by the matched set, not by topK, so a phrase
+            // query can reach every matching document. When the result is headed
+            // for fusion, present() builds the snippets for the returned page
+            // instead — otherwise a phrase query in a hybrid mode would generate
+            // one snippet per match and discard nearly all of them.
+            ranked.add(new RankedDocument(docId, url, title, 0.0, 0.0, 1.0,
+                    withSnippets ? snippetFor(docId) : ""));
         }
         return ranked;
     }

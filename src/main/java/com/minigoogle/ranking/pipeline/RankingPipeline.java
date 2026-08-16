@@ -100,6 +100,29 @@ public class RankingPipeline {
     public List<RankedDocument> rank(List<String> queryTerms,
                                      Map<String, PostingList> candidatePostings,
                                      Map<String, Integer> documentFrequencies) {
+        return present(rankToDepth(queryTerms, candidatePostings, documentFrequencies, topK),
+                queryTerms, topK);
+    }
+
+    /**
+     * Scores and orders the candidates, keeping the best {@code depth} of them,
+     * and attaches <b>no snippets</b>.
+     *
+     * <p>This is the seam that separates ranking depth from presentation depth.
+     * Hybrid ranking needs a deep lexical ranking to fuse against — the measured
+     * cost of fusing only 20 lexical results is 4.7% NDCG@10 and a third of
+     * candidate recall on full-corpus TREC-COVID — but the response still returns
+     * a page of twenty. Building snippets here would make the deep ranking cost
+     * proportional to {@code depth} rather than to what is actually returned, so
+     * snippet construction is deferred to {@link #present}.</p>
+     *
+     * @param depth how many ranked documents to keep; the fusion depth for
+     *              hybrid modes, and {@code topK} for the plain lexical path
+     */
+    public List<RankedDocument> rankToDepth(List<String> queryTerms,
+                                            Map<String, PostingList> candidatePostings,
+                                            Map<String, Integer> documentFrequencies,
+                                            int depth) {
 
         // 1. Accumulate per-document term frequencies in a single pass over the
         //    (docId-sorted) posting lists. Posting lists are sorted by document
@@ -151,7 +174,7 @@ public class RankingPipeline {
         //    diversity filter (which reads only the url) inspects the snippet.
         //    Building one per candidate would therefore do work proportional to
         //    the size of the matched posting union and discard all but topK of
-        //    it. Snippets are filled in at step 9, for survivors only.
+        //    it. Snippets are filled in by present(), for survivors only.
         PriorityQueue<RankedDocument> heap = new PriorityQueue<>(
                 Comparator.comparingDouble(RankedDocument::finalScore));
 
@@ -168,7 +191,7 @@ public class RankingPipeline {
             );
 
             heap.offer(ranked);
-            if (heap.size() > topK) {
+            if (heap.size() > depth) {
                 heap.poll(); // evict lowest score
             }
         }
@@ -176,15 +199,33 @@ public class RankingPipeline {
         // 7. Extract from heap into sorted list (highest first)
         List<RankedDocument> topResults = new ArrayList<>(heap);
         topResults.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
+        return topResults;
+    }
 
-        // 8. Apply domain diversification (skippable: reorders by domain, which
-        //    perturbs ranking metrics and is meaningless when every document
-        //    shares one synthetic domain).
+    /**
+     * Turns a ranking into a response: keep the best {@code topK}, diversify,
+     * then build snippets for the survivors only.
+     *
+     * <p>Called once, at the end, on whatever ranking the engine settled on —
+     * lexical alone or the output of rank fusion. Snippet construction scans a
+     * document body and is by far the most expensive per-document step, so it
+     * runs exactly {@code min(topK, ranked.size())} times regardless of how deep
+     * the ranking behind it was.</p>
+     */
+    public List<RankedDocument> present(List<RankedDocument> ranked,
+                                        List<String> queryTerms,
+                                        int topK) {
+        List<RankedDocument> bounded = ranked.size() > topK
+                ? new ArrayList<>(ranked.subList(0, topK))
+                : ranked;
+
+        // Domain diversification (skippable: reorders by domain, which perturbs
+        // ranking metrics and is meaningless when every document shares one
+        // synthetic domain). It applies to what is returned, as it always did.
         List<RankedDocument> selected = diversifyEnabled
-                ? diversityFilter.diversify(topResults)
-                : topResults;
+                ? diversityFilter.diversify(bounded)
+                : bounded;
 
-        // 9. Attach snippets to the selected documents only.
         return withSnippets(selected, queryTerms);
     }
 

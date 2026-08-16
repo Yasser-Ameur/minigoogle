@@ -2172,26 +2172,170 @@ would address.
   weighting, or any cluster/Raft/WAL code.
 - The 256-token truncation is unchanged.
 
-## Conclusion — the next problem is decoupling fusion depth from snippet count
+## Conclusion of P5 — fusion is settled
 
 Rank fusion versus score fusion is settled: positions work, magnitudes did not
 (0.6015 → 0.3611 when scores were mixed uncalibrated). Candidate recall is
 settled. The ranker's inability to use semantic candidates is settled — Finding
-39 closes it at every scale.
+39 closes it at every scale. Finding 43's deployment gap is closed by P5.1 below.
 
-Two problems are now in front, in order:
+Per-channel weighting (`w_i / (k + rank_i)`) is what Finding 40 opens, and it is
+deliberately **not** pursued: a standard k = 60 already carries full-corpus
+TREC-COVID from 0.3890 to 0.5810 with no calibration and no per-corpus tuning,
+and Finding 45 says a quarter of queries are already made worse. Any weighting
+scheme must beat that bar and survive that caveat before it is worth the
+complexity.
 
-1. **Finding 43 is the blocking one for deployment.** `ranking.topK` means both
-   "fusion depth" and "snippets to build", so the configuration that produces the
-   measured quality (1000) also generates 1000 snippets per query. Separating
-   them is a small, contained change that removes the only known gap between
-   measured and deployed behaviour.
-2. **Per-channel weighting** (`w_i / (k + rank_i)`) is what Finding 40 opens: one
-   fixed curve is applied to both channels, yet the right amount of trust in each
-   channel's top ranks demonstrably varies by corpus. It must be validated
-   against the risk that per-corpus weights are exactly the overfit that keeping
-   k = 60 avoided — and against Finding 45, which says a quarter of queries are
-   already being made worse.
+---
 
-Not next: candidate recall, semantic representation quality, rank-vs-score
-fusion, or fusion execution cost (0.71 ms at 171k documents).
+# P5.1 — Fusion depth vs presentation depth (2026-08-16)
+
+Benchmark: `ProductionRrfDepthBenchmark`, which drives the real `SearchEngine`
+rather than recomputing fusion itself. Full tables in `BENCHMARKS.md` under
+"Hybrid Retrieval — fusion depth vs presentation depth".
+
+## Finding 47 — `ranking.topK` was two settings wearing one name
+
+It meant both "how deep each channel reaches fusion" and "how many results to
+return and build snippets for". Asking for a page of twenty therefore narrowed
+the lexical channel to twenty ranks while the semantic channel stayed at 1000.
+
+Measured on the production path, full-corpus TREC-COVID:
+
+| configuration | NDCG@10 | MRR@10 | R@10 |
+|---|---|---|---|
+| BM25, page 20 | 0.3889 | 0.6093 | 0.0120 |
+| **OLD production** (lexical 20, semantic 1000) | 0.5542 | **0.8290** | 0.0156 |
+| **NEW production** (fusion 1000, semantic 1000, page 20) | **0.5810** | 0.8037 | 0.0167 |
+| diagnostic configuration (page 1000) | 0.5810 | 0.8037 | 0.0167 |
+
+The old row is the configuration that actually shipped, measured — not inferred
+from a diagnostic. `ranking.fusion.depth` now controls channel depth and
+`ranking.topK` controls only the returned page.
+
+## Finding 48 — the production path now reproduces the benchmark exactly
+
+NEW production at a 20-result page returns NDCG@10 0.5810 and MRR@10 0.8037 — the
+same four-decimal values `RrfHybridDiagnostic` measured independently at page
+depth 1000, gap +0.0000 on both. scifact likewise reproduces 0.6641 / 0.6270.
+
+The two harnesses share no fusion code: the diagnostic calls
+`ReciprocalRankFusion` directly on two rankings it assembles itself, while the
+benchmark exercises `SearchEngineBuilder` → `SearchEngine` → `applySemanticMode`.
+Agreement to four decimals across both corpora is therefore evidence that the
+deployed path computes what was published, which is the claim P5 could not make.
+
+**The non-fusion rows do not match exactly, for a pre-existing reason.** BM25
+measures 0.3889 here against 0.3890 in the diagnostic, and OLD production 0.5542
+against a simulated 0.5536. `SearchEngine` applies the boolean query filter
+*after* the ranking stage truncates, with no backfill, so filtering a 1000-deep
+list and taking 20 differs slightly from truncating to 20 and filtering. The
+effect is ~0.1%, appears only in shallow configurations, and was not introduced
+by this change.
+
+## Finding 49 — depth trades MRR@10 against NDCG@10 and recall
+
+Deepening the lexical channel from 20 to 1000 gains NDCG@10 (+4.8%) and Recall@10
+(+7.1%) and loses MRR@10 (0.8290 → 0.8037, −3.1%).
+
+This is not noise. The identical inversion, to the same four decimals, appeared
+in the `RrfHybridDiagnostic` lexical-depth sweep from a completely separate
+harness. A shallow, high-precision lexical list produces a better *single* top
+hit; a deep one produces a better overall ordering and materially better recall.
+
+Depth 1000 is kept because three metrics improve and one regresses, and because
+candidate recall — which bounds everything downstream — improves substantially.
+A deployment that optimises purely for "is the first result right" has a
+measured reason to prefer a shallower lexical channel.
+
+## Finding 50 — fusion was consuming a diversified lexical ranking
+
+A production-only defect, invisible to every benchmark. `RankingPipeline.rank`
+applied domain-diversification (`ranking.diversify.enabled`, default **true**)
+before returning, and that output's *order* became the lexical rank vector handed
+to RRF. Production was therefore fusing a domain round-robin ordering against a
+clean semantic ranking, as if the round-robin were BM25's opinion.
+
+Every published measurement ran with `diversify=false`, so no recorded number is
+affected — which is exactly why a benchmark alone could not have caught it. The
+corrected order is: true lexical ranking → RRF → truncate to `topK` →
+diversify → snippets. Pinned by
+`theDeepRankingIsNotDiversifiedEvenWhenDiversificationIsOn`, which asserts the
+ranking handed to fusion is in pure score order *while diversification is
+enabled*, and separately asserts the fixture actually exercises diversification
+so the test cannot pass vacuously.
+
+## Finding 51 — snippet work is now bounded by the page, not the ranking
+
+Three unbounded snippet paths existed on the fusion route: `RankingPipeline`
+built one per document it kept, `withFinalScore` built one per *fused* document,
+and `rankedFromPostings` built one per *matched* document on phrase queries.
+`RankingPipeline.rankToDepth` now returns snippet-free documents and `present`
+builds snippets only for the returned page.
+
+The invariant is asserted structurally rather than by timing: `rankToDepth`
+returns 1,000 documents all carrying empty snippets, and after `present(..., 20)`
+the deep list is *still* empty while exactly 20 carry real snippets. A regression
+to eager snippet construction fails that assertion instead of merely getting
+slower.
+
+## Finding 52 — a benchmark that measures five engines in one JVM measures its own memory pressure
+
+Nothing releases an engine's vector store. Measuring all five arms in a single
+JVM accumulated five 263 MB stores alongside the 171,332-document corpus; the run
+went from 6m33s to **3h25m** and reported one query at **49.6 minutes**.
+
+The quality figures from that run were unaffected — they are deterministic and
+re-measured identically — but every latency figure from it is **discarded as
+contaminated**. `-Dbeir.armIndex=N` now measures one arm per JVM. This is the
+same failure mode as the earlier concurrent-Gradle contamination: the benchmark
+harness became the thing being measured.
+
+## Production status
+
+`ranking.mode = bm25 | semantic | rrf`, **default `bm25`**, unknown values
+rejected, missing artifacts fail at construction. Depth is now two settings:
+
+```
+ranking.mode=rrf
+ranking.rrf.k=60
+ranking.fusion.depth=1000     # channel depth reaching fusion
+ranking.semantic.depth=1000   # optional per-channel override
+ranking.topK=20               # returned page size
+```
+
+`ranking.fusion.depth` and `ranking.topK` must remain conceptually independent.
+Collapsing them again reintroduces Finding 47.
+
+**Operational requirements for an RRF deployment** — none of which are free:
+
+- a ~90 MB ONNX encoder model on disk, and the ONNX runtime
+- a prebuilt vector store, 1,536 bytes per document (263 MB at 171k documents)
+- a one-time embedding build (~22 docs/s; 2h 12m for 171,332 documents)
+- an added exact vector scan per query, growing linearly with corpus size
+- `ranking.fusion.depth` and `ranking.semantic.depth` explicitly configured
+
+If `rrf` or `semantic` is selected and any artifact is absent, construction
+fails. It never falls back to BM25.
+
+## Conclusion — the architecture is complete; stop here
+
+The P5 sequence is closed: representation (MiniLM recovers documents lexical
+retrieval cannot reach) → candidate generation (semantic materially raises
+reachable relevant documents) → fusion (union did nothing; RRF promoted
+semantic-only relevant documents from 0 to 391 in the top 100) → full-corpus
+outcome (0.3890 → 0.5810 NDCG@10) → production engineering (retrieval depth
+separated from presentation depth; production reproduces the benchmark exactly).
+
+Two caveats travel with that result permanently and must not be dropped from any
+summary of it:
+
+- **RRF degrades 26% of full-corpus queries** (Finding 45). The worst falls from
+  a perfect BM25 1.0000 to 0.7100. The aggregate gain comes from a 2.7:1 win/loss
+  ratio, not from helping everywhere.
+- **Deepening the lexical channel costs MRR@10** (Finding 49).
+
+No further fusion optimization is planned. The remaining known inefficiencies —
+per-channel weighting, an ANN index for the linear vector scan, the 256-token
+truncation, and the filter-after-truncate quirk in Finding 48 — are recorded, and
+each needs an independently justified problem before it is worth opening.

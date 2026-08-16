@@ -269,6 +269,94 @@ class RrfRankingModeIntegrationTest {
         }
     }
 
+    /**
+     * The decoupling, end to end: a small {@code ranking.topK} must bound what is
+     * returned without narrowing what gets fused.
+     */
+    @Test
+    void fusionDepthIsIndependentOfTopK(@TempDir Path tmp) throws Exception {
+        assumeTrue(SentenceEncoder.isAvailable(MODEL_DIR), "encoder model not present");
+        Path vectorFile = buildVectors(tmp);
+
+        int fusionDepth = 10;
+        int pageSize = 2;
+        int k = 60;
+        // One term per document, so the lexical ranking is corpus-deep and a
+        // pageSize-truncated version of it is genuinely different.
+        String query = "purr oil yeast tomato";
+
+        Map<String, String> props = baseProps();
+        props.put("ranking.mode", "rrf");
+        props.put("ranking.semantic.vectors", vectorFile.toString());
+        props.put("ranking.semantic.modelDir", MODEL_DIR.toString());
+        props.put("ranking.rrf.k", String.valueOf(k));
+        props.put("ranking.fusion.depth", String.valueOf(fusionDepth));
+        props.put("ranking.topK", String.valueOf(pageSize));
+
+        SearchEngine production = SearchEngineBuilder.build(
+                corpus(), new Configuration(props), tmp.resolve("index-rrf")).engine();
+
+        // The lexical ranking at FUSION depth, not page depth.
+        Map<String, String> lexProps = baseProps();
+        lexProps.put("ranking.topK", String.valueOf(fusionDepth));
+        SearchEngine lexicalOnly = SearchEngineBuilder.build(
+                corpus(), new Configuration(lexProps), tmp.resolve("index-bm25")).engine();
+        List<Integer> deepLexical = ids(lexicalOnly.retrieveCandidates(query, fusionDepth).ranked());
+
+        SentenceEncoder encoder = SentenceEncoder.load(MODEL_DIR,
+                SentenceEncoder.DEFAULT_MAX_TOKENS, SentenceEncoder.MINILM_DIMENSION, 2);
+        List<Integer> semanticIds;
+        try (SemanticRetriever retriever = SemanticRetriever.load(encoder, vectorFile)) {
+            semanticIds = retriever.retrieve(query, fusionDepth).stream()
+                    .map(SemanticRetriever.Candidate::documentId).toList();
+        }
+
+        List<Integer> actual = ids(production.retrieveCandidates(query, pageSize).ranked());
+        assertEquals(pageSize, actual.size(), "topK must bound the returned page");
+
+        // Fused deeply, then truncated — NOT fused shallowly.
+        List<Integer> fusedDeep = new ReciprocalRankFusion(k).fuseToIds(deepLexical, semanticIds);
+        assertEquals(fusedDeep.subList(0, pageSize), actual,
+                "production must fuse at fusion.depth and truncate afterwards");
+
+        // Fusing only the page-sized lexical list is a different computation —
+        // the bug this setting removes. Where the two disagree on this corpus,
+        // production must be on the deep side of the disagreement.
+        List<Integer> shallowLexical = deepLexical.subList(0, Math.min(pageSize, deepLexical.size()));
+        List<Integer> fusedShallow = new ReciprocalRankFusion(k)
+                .fuseToIds(shallowLexical, semanticIds);
+        assertTrue(shallowLexical.size() < deepLexical.size(),
+                "the fixture must actually exercise a deeper lexical list");
+        if (!fusedShallow.subList(0, pageSize).equals(fusedDeep.subList(0, pageSize))) {
+            assertNotEquals(fusedShallow.subList(0, pageSize), actual,
+                    "production must not be fusing a topK-truncated lexical list");
+        }
+    }
+
+    /** Every returned document must still carry a real snippet after the split. */
+    @Test
+    void theReturnedPageStillCarriesSnippets(@TempDir Path tmp) throws Exception {
+        assumeTrue(SentenceEncoder.isAvailable(MODEL_DIR), "encoder model not present");
+        Path vectorFile = buildVectors(tmp);
+
+        Map<String, String> props = baseProps();
+        props.put("ranking.mode", "rrf");
+        props.put("ranking.semantic.vectors", vectorFile.toString());
+        props.put("ranking.semantic.modelDir", MODEL_DIR.toString());
+        props.put("ranking.fusion.depth", "10");
+        props.put("ranking.topK", "3");
+
+        SearchEngine engine = SearchEngineBuilder.build(
+                corpus(), new Configuration(props), tmp.resolve("index-rrf")).engine();
+
+        List<RankedDocument> page = engine.retrieveCandidates("engine oil", 3).ranked();
+        assertFalse(page.isEmpty(), "the query must return results");
+        for (RankedDocument doc : page) {
+            assertFalse(doc.snippet().isEmpty(),
+                    "returned document " + doc.documentId() + " must carry a snippet");
+        }
+    }
+
     @Test
     void aSemanticModeWithoutItsVectorStoreFailsLoudly(@TempDir Path tmp) {
         assumeTrue(SentenceEncoder.isAvailable(MODEL_DIR), "encoder model not present");

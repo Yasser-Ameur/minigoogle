@@ -263,6 +263,55 @@ Every stage is pluggable. The query planner uses the Visitor pattern over the AS
 
 ---
 
+## Hybrid ranking (RRF)
+
+`ranking.mode` selects how results are ordered:
+
+| mode | behaviour |
+|---|---|
+| `bm25` | lexical ranking only — **the default**, and the only mode with no extra artifacts |
+| `semantic` | semantic ranking only (useful for debugging and clean baselines) |
+| `rrf` | Reciprocal Rank Fusion of the lexical and semantic rankings |
+
+An unknown value is rejected. A mode whose artifacts are missing **fails at
+startup** rather than falling back — a node answering with a different ranking
+than it was configured for is a quality regression with no visible cause.
+
+### Depth is two independent settings
+
+```
+ranking.mode=rrf
+ranking.rrf.k=60
+ranking.fusion.depth=1000     # how much of each channel reaches fusion
+ranking.semantic.depth=1000   # optional override for the semantic channel
+ranking.topK=20               # how many results are returned and rendered
+ranking.semantic.modelDir=models/all-MiniLM-L6-v2
+ranking.semantic.vectors=models/vectors/<corpus>.bin
+```
+
+**RRF needs sufficient channel depth to reproduce its benchmarked quality, but
+the response depth is independent of it.** These were once the same setting, so
+requesting a page of twenty also narrowed fusion to twenty inputs per channel —
+worth 4.7% NDCG@10 and a third of candidate recall on full-corpus TREC-COVID.
+`ranking.topK` now bounds only what is returned, and snippets are built for the
+returned page alone.
+
+Measured on the full 171,332-document TREC-COVID corpus (see
+[BENCHMARKS.md](BENCHMARKS.md)): NDCG@10 **0.3890 → 0.5810**, MRR@10
+**0.6093 → 0.8037**.
+
+### Cost of enabling it
+
+- a ~90 MB ONNX encoder (`all-MiniLM-L6-v2`, 384 dimensions, runs in-JVM)
+- a prebuilt vector store: **1,536 bytes per document** (263 MB for 171k docs)
+- a one-time embedding build (~22 docs/s)
+- ~170 ms added per query at 171k documents, from an exact vector scan
+
+Fusion itself costs well under 1 ms. `bm25` remains the default so that a fresh
+checkout runs with no model, no vector store and no embedding step.
+
+---
+
 ## Performance Targets
 
 | Metric | Target |
