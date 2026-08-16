@@ -18,22 +18,22 @@ candidates were in the pool and the ranker had no way to score them —
 and `BM25Calculator` guards `tf > 0`, so a document sharing no term with the
 query scores zero by construction.
 
-### Hypothesis
+### Why the union was insufficient
 
-A fusion that consumes **positions rather than scores** can rank those documents,
-because a document's semantic rank exists whether or not it contains a query
-term. If true, the semantic-only relevant documents should start reaching the top
-100, and NDCG@10 should rise above *both* individual systems. If the gain came
-only from candidate recall, RRF would match the union instead.
+Appending semantic candidates behind BM25's ranked output is the most favourable
+placement an unchanged lexical ranker can give them. It is still position 1001
+for a document at semantic rank 1. Coverage without ordering is not retrieval
+quality — the union proved the candidates were reachable and simultaneously that
+nothing downstream could act on them.
 
-### Why rank fusion rather than weighted score addition
+### Why RRF rather than weighted score addition
 
 BM25 is an unbounded sum of IDF-weighted term contributions; cosine similarity is
 bounded in [-1, 1]. Their sum depends on the score *spread* inside each candidate
 set, which varies per query, so a fixed weight is not a fixed tradeoff. This
 project already measured the cost: an uncalibrated semantic score replacing the
 lexical ordering dropped scifact NDCG@10 from 0.6015 to 0.3611. RRF discards
-magnitudes entirely:
+magnitudes and keeps only order:
 
 ```
 RRF(d) = SUM over rankings i of  1 / (k + rank_i(d))
@@ -48,8 +48,7 @@ RRF(d) = SUM over rankings i of  1 / (k + rank_i(d))
 | C | 20 | 15 | 1/80 + 1/75 = 0.025833 |
 
 C leads on agreement. B — which BM25 buried at rank 400 — overtakes A, whose
-single mid-table lexical placement is all the evidence it has. This is the
-behaviour the hybrid architecture depends on, and it is asserted directly in
+single mid-table placement is all the evidence it has. Asserted directly in
 `ReciprocalRankFusionTest`.
 
 **Worked example — what k controls.** Document P holds lexical rank 1 only;
@@ -60,136 +59,89 @@ document Q holds rank 5 in both:
 | 10 | 0.090909 | 0.133333 | 1.47 |
 | 60 | 0.016393 | 0.030769 | 1.88 |
 
-Q wins either way, but by more at larger k. Small k makes a single top placement
-nearly decisive; large k flattens the curve so agreement across depth matters
-more. k is therefore a bet on how much to trust either system's top ranks.
+Small k makes a single top placement nearly decisive; large k flattens the curve
+so agreement across depth matters more. k is a bet on how much to trust either
+channel's top ranks.
 
 ### Implementation
 
 `ReciprocalRankFusion` — canonical formula, no custom normalization. A document
-absent from a ranking contributes nothing (no sentinel rank, no imputed score);
-duplicates keep their best position; ties break by first appearance so the output
-is a deterministic function of the inputs, which a reproducible benchmark
-requires. 12 unit tests assert values computed by hand from the formula rather
-than recorded from the implementation.
+absent from a ranking contributes nothing; duplicates keep their best position;
+ties break by first appearance so output is a deterministic function of inputs.
+16 unit tests assert values computed by hand from the formula rather than
+recorded from the implementation, including identical rankings, fully reversed
+rankings, single-channel degenerate cases and 200,000-deep ranks.
 
-`RrfHybridDiagnostic` evaluates four systems under one ranking configuration,
-varying only the fusion mechanism: **A** BM25, **B** semantic, **C** union,
-**D** RRF.
+`ranking.mode = bm25 | semantic | rrf` wires it into the production path, with
+`SemanticCandidateSource` exposing document ids only — no accessor for
+similarities exists, so score mixing is impossible by type rather than by
+convention.
 
-### Quality impact
+### Experiments
 
-| system | scifact NDCG@10 | MRR@10 | R@100 | trec-covid 25k NDCG@10 | MRR@10 | R@100 |
-|---|---|---|---|---|---|---|
-| A: BM25 | 0.6015 | 0.5641 | 0.8409 | 0.1080 | 0.3120 | 0.2950 |
-| B: semantic | 0.6451 | 0.6047 | 0.9250 | 0.1897 | 0.4220 | 0.3223 |
-| C: union | 0.6015 | 0.5641 | 0.8409 | 0.1080 | 0.3120 | 0.2950 |
-| **D: RRF k=60** | **0.6641** | **0.6270** | **0.9533** | **0.2099** | **0.4387** | **0.3862** |
+`RrfHybridDiagnostic`: four systems under one ranking configuration — **A** BM25,
+**B** semantic, **C** union, **D** RRF — on three corpora, with sweeps over RRF k,
+semantic depth and lexical depth, plus rank-overlap, per-query win/loss and
+semantic-only promotion tracking.
 
-RRF is the first configuration in this project to beat **both** of its own
-components on both datasets: +10.4% and +94.4% over BM25, +2.9% and +10.6% over
-semantic alone. Candidate recall is identical between C and D (0.9933 / 0.8153),
-so the gain is not extra candidates — it is the ability to order them.
+### Results
 
-The tracking counters show the mechanism directly:
-
-| semantic-only relevant documents | scifact | trec-covid 25k |
-|---|---|---|
-| found by semantic, missed by BM25 | 19 | 192 |
-| reach rank ≤ 100 under **union** | 0 | 0 |
-| reach rank ≤ 100 under **RRF** | **15** | **43** |
-| reach rank ≤ 10 under **RRF** | 0 | 3 |
-
-### The k sweep contradicts itself across datasets — which is the useful finding
-
-| k | scifact NDCG@10 | trec-covid 25k NDCG@10 |
-|---|---|---|
-| 10 | **0.6788** | 0.1837 |
-| 20 | 0.6742 | 0.1899 |
-| 40 | 0.6684 | 0.2025 |
-| 60 | 0.6641 | **0.2099** |
-| 100 | 0.6607 | 0.2093 |
-
-The optima point in **opposite directions**: scifact monotonically prefers small
-k, trec-covid prefers large. Tuning k on either dataset alone would have produced
-a confident, dataset-specific overfit. **k = 60 is kept** — it is the optimum on
-trec-covid and costs 2.2% against the best scifact setting.
-
-An interpretation consistent with the overlap measurements below, offered as a
-hypothesis and not a measured causal claim: where the two rankings largely agree
-(scifact), a small k that trusts top placements is enough; where they are nearly
-disjoint and both individually weak (trec-covid), a larger k accumulates evidence
-across depth instead of letting either system's frequently-wrong rank 1 decide.
-
-### Rank overlap explains the size of the gain
-
-| | scifact | trec-covid 25k |
-|---|---|---|
-| mean intersection@10 | 2.95 | 0.68 |
-| mean intersection@100 | 25.78 | 6.34 |
-| NDCG@10 gain from RRF | +10.4% | +94.4% |
-
-The two channels are nearly disjoint on trec-covid — fewer than one shared
-document in the top 10 — and that is precisely where fusion pays most. Fusion
-value tracks ranking *disagreement*, which is what a fusion method should exploit.
-
-### Semantic depth
-
-| semantic depth (k=60) | scifact NDCG@10 | trec-covid NDCG@10 | trec-covid R@1000 |
+| NDCG@10 | scifact | trec-covid 25k subset | **trec-covid FULL (171,332)** |
 |---|---|---|---|
-| 100 | 0.6643 | **0.2150** | 0.6082 |
-| 500 | 0.6642 | 0.2067 | 0.7352 |
-| 1000 | 0.6641 | 0.2099 | **0.7431** |
+| BM25 | 0.6015 | 0.1080 | 0.3890 |
+| semantic | 0.6451 | 0.1897 | 0.4539 |
+| union | 0.6015 | 0.1080 | 0.3890 |
+| **RRF k=60** | **0.6641** | **0.2099** | **0.5810** |
 
-Flat on scifact — unsurprising, since a rank-1000 document contributes 1/1060 and
-cannot move the top of the ranking. On trec-covid depth 100 gives slightly better
-NDCG@10 and notably better MRR@10 (0.4832 vs 0.4387) while costing 18% of deep
-recall. Default kept at 1000 for recall; the tradeoff is real and recorded rather
-than resolved.
++10.4% / +94.4% / **+49.4%** over BM25, and above semantic alone everywhere.
+MRR@10 on the full corpus: 0.6093 → **0.8037**. Candidate recall is identical
+between union and RRF, so every point of difference is ordering, not recall.
 
-### Production wiring
+Semantic-only relevant documents reaching the top 100: **0 → 391** on the full
+corpus (0 → 15 scifact, 0 → 43 subset). That single row is the mission.
 
-`ranking.mode = bm25 | semantic | rrf`, **default `bm25`**. The evidence supports
-RRF on both datasets tested, but the mode needs a 90 MB encoder model and a
-prebuilt vector store, and two BEIR datasets are not a mandate to change the
-default for every deployment. A configured semantic mode with a missing artifact
-**fails the build** rather than degrading to BM25: a node answering with a
-different ranking than it was configured for is a quality regression with no
-visible cause.
+The full corpus was the hostile test — the 25k subset handicaps BM25 (0.1080 vs
+0.3890) and was suspected of flattering fusion. It did the opposite.
 
-`SemanticCandidateSource` deliberately exposes ids only, never similarities, so
-ONNX stays out of the search package and score mixing is impossible by
-construction rather than by convention.
+### Configuration decision
+
+**k = 60, semantic depth 1000, lexical depth >= 100.**
+
+The k optima point in opposite directions by corpus (scifact prefers 10
+monotonically, both TREC-COVID arms prefer 100 monotonically), so tuning on one
+would overfit against the other. Across all six NDCG/MRR measurements k=60 never
+drops below 96.5% of that measurement's best; k=100 reaches 97.0% but contradicts
+itself inside the full corpus (wins NDCG, loses MRR). With no significance
+testing, the tiebreak is generality — 60 is the published default and was not
+chosen by reading our table.
+
+Semantic depth 1000 wins the full corpus monotonically, maximises candidate
+recall, and costs nothing: the exact scan touches every vector regardless of k.
+
+**Default remains `bm25`.** Not because the quality evidence is in doubt — RRF
+wins on all three corpora — but because RRF requires a 90 MB model and a
+1,536 bytes/document vector store, and with the fail-loud contract a default of
+`rrf` would make a fresh checkout refuse to start.
 
 ### Tradeoffs
 
-- **Cost per query.** RRF adds one encoder pass (~30 ms) plus an exact vector
-  scan. Latency was not optimized in this mission and no ANN index was added;
-  exact search remains the oracle any future approximate index is measured
-  against.
-- **Statistical significance was not tested.** 300 scifact and 50 trec-covid
-  queries, no paired significance test and no per-query score retention. The
-  BM25 → RRF gaps (+10.4%, +94.4%) are far larger than the k-sweep differences
-  (2.2%, 14%); the decision to keep k = 60 does not depend on resolving the
-  smaller ones.
-- **trec-covid remains a 25,000-document subset** (14.6% of the corpus). Both
-  sides of every comparison use the same subset so the contrast is valid, but
-  absolute values are not comparable to full-corpus figures.
-- **The 256-token window still truncates long abstracts.** Unchanged from the
-  previous mission and still the most likely representation-side improvement.
+- **RRF has real losers.** It degrades 26% of full-corpus queries; the worst
+  observed drops from a perfect BM25 1.0000 to 0.7100. Wins outnumber losses
+  2.7:1 to 4.5:1, which is why the aggregate improves — not because fusion helps
+  everywhere.
+- **Production's `ranking.topK` (default 20) caps fusion depth**, costing 4.7%
+  NDCG@10 on the full corpus and a third of candidate recall. It must be raised
+  when RRF is enabled. The parameter currently means both "fusion depth" and
+  "snippets to build"; decoupling them is the next systems change.
+- **Cost:** 2h 12m one-time embedding for 171,332 documents, 263 MB on disk,
+  +167 ms p50 per query from the exact vector scan. Fusion itself is 0.71 ms.
+- **No significance testing** (300/47/50 queries) and **no ANN index**.
 
 ### Conclusion
 
-Kept, as an opt-in mode. The union mission ended with "the ranker cannot use what
-semantic retrieval finds"; that sentence is now false. RRF is the first ranking
-change in this project to beat both of its inputs on both datasets, and the
-mechanism is directly observable — 0 semantic-only relevant documents in the top
-100 became 15 and 43.
-
-The next problem is **whether the fixed 1/(k+rank) curve should be weighted per
-channel**, now that there is evidence the right weighting is dataset-dependent.
-Not the next problem: candidate recall, or the choice between rank and score
-fusion, both settled.
+Kept as an opt-in mode, validated on a full 171,332-document corpus. The union
+mission ended with "the ranker cannot use what semantic retrieval finds"; that
+sentence is now false at every scale tested.
 
 ---
 

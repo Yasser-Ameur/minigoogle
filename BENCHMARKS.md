@@ -980,27 +980,37 @@ next step rather than a premature one.
 
 ---
 
-## FUSION — Reciprocal Rank Fusion (2026-08-15)
+## Hybrid Retrieval — Reciprocal Rank Fusion (2026-08-15)
 
 **Benchmark:** `RrfHybridDiagnostic`. Four systems under the **identical** ranking
 configuration, varying only the fusion mechanism: **A** BM25, **B** semantic,
 **C** candidate union, **D** RRF.
 
-**Fusion definition:** `RRF(d) = SUM over rankings i of 1/(k + rank_i(d))`, rank 1
-for the first result, absent documents contributing nothing. Positions only — no
-BM25 score is ever combined with a similarity.
+**Fusion definition:**
+
+```
+RRF(d) = SUM over rankings i of  1 / (k + rank_i(d))
+```
+
+`rank = 1` for the first result. A document absent from a ranking contributes
+nothing from it — no sentinel rank, no imputed score. Duplicates keep their best
+position. Ties break by first appearance, so the output is a deterministic
+function of the inputs. Positions only: no BM25 score is ever combined with a
+similarity.
 
 **Configuration (identical across A/B/C/D):** `semantic.enabled=false` on the
 lexical side, `ranking.rerank.enabled=false`, `ranking.diversify.enabled=false`,
-`semantic.expansion.enabled=false`, `deepK=1000`. BM25 k1/b, PageRank, topK and
-deepK untouched. Canonical baseline: semantic depth 1000, RRF k = 60.
+`semantic.expansion.enabled=false`, `deepK=1000`. BM25 k1/b, PageRank, title/body
+weighting, query expansion and stopword handling untouched.
 
-**Vector stores** live in `models/vectors/` (gitignored), not `build/` — they cost
-190 s (scifact) and 1603 s (trec-covid 25k) to compute and `gradlew clean` was
-destroying them between experiments.
+**Canonical baseline:** semantic depth 1000, RRF k = 60, lexical depth 1000.
 
-**Commands** (run strictly sequentially — never two Gradle processes against the
-same `build/`):
+**Model:** sentence-transformers/all-MiniLM-L6-v2, 384 dimensions, 256-token
+window, ONNX Runtime, in-JVM, no external service. **Vector stores** live in
+`models/vectors/` (gitignored), not `build/` — `gradlew clean` was destroying
+them between experiments.
+
+**Commands** (strictly sequential — never two Gradle processes against one `build/`):
 
 ```bash
 ./gradlew bench --tests "com.minigoogle.performance.RrfHybridDiagnostic" -Dbeir.dir=data/beir/scifact -Dbeir.dataset=scifact
@@ -1010,86 +1020,319 @@ same `build/`):
 ./gradlew bench --tests "com.minigoogle.performance.RrfHybridDiagnostic" -Dbeir.dir=data/beir/trec-covid -Dbeir.dataset=trec-covid -Dbeir.maxDocs=25000
 ```
 
-Judged queries as loaded by the shared pipeline: scifact 300, trec-covid 25k
-subset 47.
+```bash
+./gradlew bench --tests "com.minigoogle.performance.RrfHybridDiagnostic" -Dbeir.dir=data/beir/trec-covid -Dbeir.dataset=trec-covid
+```
 
-### scifact (5,183 docs, 300 judged queries)
+### Datasets — kept strictly separate
 
-| system | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 | cand recall |
-|---|---|---|---|---|---|---|
-| A: BM25 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9343 | 0.9343 |
-| B: semantic | 0.6451 | 0.6047 | 0.7833 | 0.9250 | 0.9933 | 0.9933 |
-| C: union semK=1000 | 0.6015 | 0.5641 | 0.7360 | 0.8409 | 0.9443 | 0.9933 |
-| **D: RRF k=60 semK=1000** | **0.6641** | **0.6270** | **0.7951** | **0.9533** | **0.9933** | 0.9933 |
+| | scifact | TREC-COVID 25k diagnostic subset | TREC-COVID full corpus |
+|---|---|---|---|
+| corpus | 5,183 (full) | 25,000 (**14.6% subset**) | 171,332 (full) |
+| judged queries evaluated | 300 | 47 | 50 |
+| vector store | 8.0 MB | 38.4 MB | 263.2 MB |
+| embedding build | 190 s (27.3 docs/s) | 1,603 s (15.6 docs/s) | 7,929 s (21.6 docs/s) |
 
-### TREC-COVID 25k diagnostic subset (47 judged queries)
+The 25k subset's absolute values are **not** comparable to the full corpus — BM25
+NDCG@10 is 0.1080 on the subset versus 0.3890 on the full 171,332 documents.
+Both sides of every comparison within a block use the same corpus, so each
+A/B/C/D contrast is internally valid.
 
-Absolute values are **not** comparable to full-corpus TREC-COVID figures. Both
-sides of every comparison use this same subset, so the contrast is valid.
+### Central table — scifact (5,183 docs, 300 judged queries)
 
-| system | NDCG@10 | MRR@10 | R@10 | R@100 | R@1000 | cand recall |
-|---|---|---|---|---|---|---|
-| A: BM25 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4789 | 0.4789 |
-| B: semantic | 0.1897 | 0.4220 | 0.1240 | 0.3223 | 0.7000 | 0.7000 |
-| C: union semK=1000 | 0.1080 | 0.3120 | 0.0986 | 0.2950 | 0.4798 | 0.8153 |
-| **D: RRF k=60 semK=1000** | **0.2099** | **0.4387** | **0.1690** | **0.3862** | **0.7431** | 0.8153 |
-
-C and D have **identical candidate recall**. The difference between them is
-ordering alone.
-
-### k sweep (semantic depth 1000)
-
-| k | scifact NDCG@10 | scifact MRR@10 | trec-covid NDCG@10 | trec-covid MRR@10 |
+| | BM25 | Semantic | Union | **RRF k=60** |
 |---|---|---|---|---|
-| 10 | **0.6788** | **0.6407** | 0.1837 | 0.4282 |
-| 20 | 0.6742 | 0.6338 | 0.1899 | 0.4224 |
-| 40 | 0.6684 | 0.6295 | 0.2025 | 0.4245 |
-| 60 | 0.6641 | 0.6270 | **0.2099** | 0.4387 |
-| 100 | 0.6607 | 0.6252 | 0.2093 | **0.4399** |
+| Candidate Recall | 0.9343 | 0.9933 | 0.9933 | 0.9933 |
+| Recall@10 | 0.7360 | 0.7833 | 0.7360 | **0.7951** |
+| Recall@100 | 0.8409 | 0.9250 | 0.8409 | **0.9533** |
+| Recall@1000 | 0.9343 | 0.9933 | 0.9443 | **0.9933** |
+| NDCG@10 | 0.6015 | 0.6451 | 0.6015 | **0.6641** |
+| MRR@10 | 0.5641 | 0.6047 | 0.5641 | **0.6270** |
+| p50 | 575.80 ms | 44.53 ms | 632.44 ms | 633.14 ms |
+| p95 | 1338.33 ms | 137.09 ms | 1406.03 ms | 1406.61 ms |
+| p99 | 1866.16 ms | 172.85 ms | 1912.96 ms | 1913.66 ms |
 
-The optima point in opposite directions. **k = 60 kept**: optimal on trec-covid,
-2.2% below the best scifact setting. Tuning per dataset would be overfitting.
+### Central table — TREC-COVID 25k diagnostic subset (47 judged queries)
+
+| | BM25 | Semantic | Union | **RRF k=60** |
+|---|---|---|---|---|
+| Candidate Recall | 0.4789 | 0.7000 | 0.8153 | 0.8153 |
+| Recall@10 | 0.0986 | 0.1240 | 0.0986 | **0.1690** |
+| Recall@100 | 0.2950 | 0.3223 | 0.2950 | **0.3862** |
+| Recall@1000 | 0.4789 | 0.7000 | 0.4798 | **0.7431** |
+| NDCG@10 | 0.1080 | 0.1897 | 0.1080 | **0.2099** |
+| MRR@10 | 0.3120 | 0.4220 | 0.3120 | **0.4387** |
+| p50 | 389.10 ms | 62.77 ms | 475.66 ms | 476.19 ms |
+| p95 | 700.99 ms | 122.94 ms | 778.15 ms | 778.74 ms |
+| p99 | 1104.97 ms | 179.02 ms | 1176.63 ms | 1177.18 ms |
+
+### Central table — TREC-COVID FULL CORPUS (171,332 docs, 50 judged queries)
+
+| | BM25 | Semantic | Union | **RRF k=60** |
+|---|---|---|---|---|
+| Candidate Recall | 0.3118 | 0.3281 | 0.4804 | 0.4804 |
+| Recall@10 | 0.0121 | 0.0128 | 0.0121 | **0.0167** |
+| Recall@100 | 0.0822 | 0.0855 | 0.0822 | **0.1016** |
+| Recall@1000 | 0.3118 | 0.3281 | 0.3118 | **0.3804** |
+| NDCG@10 | 0.3890 | 0.4539 | 0.3890 | **0.5810** |
+| MRR@10 | 0.6093 | 0.7244 | 0.6093 | **0.8037** |
+| p50 | 722.66 ms | 167.55 ms | 898.06 ms | 898.41 ms |
+| p95 | 1463.75 ms | 252.35 ms | 1685.90 ms | 1686.96 ms |
+| p99 | 1915.25 ms | 338.43 ms | 2068.98 ms | 2069.80 ms |
+
+Recall@10 is small on TREC-COVID because queries average ~490 judged-relevant
+documents; ten results cannot contain a large fraction of them. NDCG@10 and
+MRR@10 are the meaningful top-of-ranking metrics here.
+
+**The full corpus does not weaken the result — it strengthens it.** RRF beats
+BM25 by **+49.4%** NDCG@10 and **+31.9%** MRR@10 on the complete 171,332-document
+corpus, against a BM25 baseline 3.6x stronger than the subset's.
+
+**Latency caveat (do not quote as a speed comparison).** The BM25 column is
+retrieval + ranking + **snippet generation for topK=1000 documents**; the semantic
+column is query encode + exact vector scan with no snippet work. They are not
+like-for-like. The only clean figure is the fusion step itself:
+
+| fusion step alone | scifact | trec-covid 25k | trec-covid full |
+|---|---|---|---|
+| p50 | 0.49 ms | 0.54 ms | 0.71 ms |
+| p95 | 0.67 ms | 1.97 ms | 1.65 ms |
+| p99 | 1.68 ms | 3.41 ms | 6.56 ms |
+
+Fusion is under 1 ms at p50 even over 171,332 documents. The architectural cost
+of the hybrid is the encoder pass and the exact vector scan (44–168 ms p50), not
+the fusion.
+
+### k sweep — all three datasets
+
+| k | scifact NDCG@10 | scifact MRR@10 | trec-25k NDCG@10 | trec-25k MRR@10 | trec-FULL NDCG@10 | trec-FULL MRR@10 |
+|---|---|---|---|---|---|---|
+| 10 | **0.6788** | **0.6407** | 0.1837 | 0.4282 | 0.4912 | 0.7363 |
+| 20 | 0.6742 | 0.6338 | 0.1899 | 0.4224 | 0.5311 | 0.7598 |
+| 40 | 0.6684 | 0.6295 | 0.2025 | 0.4245 | 0.5649 | 0.7903 |
+| 60 | 0.6641 | 0.6270 | **0.2099** | 0.4387 | 0.5810 | **0.8037** |
+| 100 | 0.6607 | 0.6252 | 0.2093 | **0.4399** | **0.6021** | 0.7798 |
+
+The optima point in **opposite directions**: scifact prefers small k
+monotonically, both TREC-COVID arms prefer large k monotonically. Tuning k on
+either dataset alone would produce a confident, dataset-specific overfit.
+
+Each k as a percentage of that dataset's own best, across **all six** columns:
+
+| k | worst case across all 6 measurements |
+|---|---|
+| 10 | 81.6% |
+| 20 | 88.2% |
+| 40 | 93.8% |
+| **60** | **96.5%** |
+| 100 | 97.0% |
+
+**k = 60 selected.** k=60 and k=100 are statistically indistinguishable here
+(96.5% vs 97.0% worst case) and disagree *within* the full corpus — k=100 wins
+NDCG@10 (0.6021 vs 0.5810) while k=60 wins MRR@10 (0.8037 vs 0.7798). With no
+significance testing and a contradiction inside a single dataset, the tiebreak is
+generality: 60 is the published default from the original RRF paper and was not
+chosen by looking at these benchmarks, whereas selecting 100 would be a choice
+made from this table. k=10 is firmly rejected — it costs 18.4% on the full corpus.
 
 ### Semantic depth sweep (k = 60)
 
-| depth | scifact NDCG@10 | scifact R@1000 | trec-covid NDCG@10 | trec-covid MRR@10 | trec-covid R@1000 |
+| depth | scifact NDCG@10 | trec-25k NDCG@10 | trec-FULL NDCG@10 | trec-FULL MRR@10 | trec-FULL candRecall |
 |---|---|---|---|---|---|
-| 100 | 0.6643 | 0.9800 | **0.2150** | **0.4832** | 0.6082 |
-| 500 | 0.6642 | 0.9900 | 0.2067 | 0.4326 | 0.7352 |
-| 1000 | 0.6641 | **0.9933** | 0.2099 | 0.4387 | **0.7431** |
+| 100 | 0.6643 | **0.2150** | 0.5601 | 0.7863 | 0.3463 |
+| 500 | 0.6642 | 0.2067 | 0.5781 | **0.8047** | 0.4216 |
+| 1000 | 0.6641 | 0.2099 | **0.5810** | 0.8037 | **0.4804** |
+
+Effectively flat on scifact (spread 0.0002) and non-monotonic on the 47-query
+subset, but **monotonically increasing on the full corpus**, which is the
+measurement with the most documents behind it. Depth also costs nothing at query
+time: `retrieve(query, k)` scans every stored vector regardless of k, and only
+the heap size changes.
+
+**Semantic depth 1000 selected** — best full-corpus NDCG@10, best candidate
+recall (0.4804 vs 0.3463 at depth 100), and no additional query cost.
+
+### Lexical depth sweep (k = 60, semantic depth 1000)
+
+This is production's `ranking.topK`, whose default is **20**. `RankingPipeline.rank`
+truncates the lexical ranking to it before returning, so it determines how deep a
+lexical ranking RRF actually receives.
+
+| lexical depth | scifact NDCG@10 | trec-25k NDCG@10 | trec-FULL NDCG@10 | trec-FULL MRR@10 | trec-FULL candRecall |
+|---|---|---|---|---|---|
+| 20 | 0.6630 | 0.1840 | 0.5536 | **0.8290** | 0.3354 |
+| 100 | 0.6593 | 0.2015 | 0.5789 | 0.8157 | 0.3600 |
+| 1000 | **0.6641** | **0.2099** | **0.5810** | 0.8037 | **0.4804** |
+
+**This is the one place where production defaults differ materially from the
+benchmark.** Running `ranking.mode=rrf` at the default `ranking.topK=20` costs
+0.2% NDCG@10 on scifact, 12.3% on the 25k subset and 4.7% on the full corpus, and
+cuts full-corpus candidate recall from 0.4804 to 0.3354. RRF at depth 20 still
+beats BM25 comfortably (0.5536 vs 0.3890 full corpus), so this degrades the gain
+rather than inverting it. MRR@10 actually improves at depth 20 on the full corpus
+(0.8290) — a shallow, high-precision lexical list produces a better single top
+hit while losing depth everywhere below it.
+
+**`ranking.topK` must be raised (>= 100, ideally 1000) when RRF is enabled.**
+
+### Interaction — semantic depth x RRF k (NDCG@10)
+
+scifact:
+
+| semK \ k | 10 | 60 | 100 |
+|---|---|---|---|
+| 100 | **0.6806** | 0.6643 | 0.6614 |
+| 500 | 0.6788 | 0.6642 | 0.6607 |
+| 1000 | 0.6788 | 0.6641 | 0.6607 |
+
+TREC-COVID 25k subset:
+
+| semK \ k | 10 | 60 | 100 |
+|---|---|---|---|
+| 100 | 0.1865 | **0.2150** | 0.2070 |
+| 500 | 0.1870 | 0.2067 | 0.2058 |
+| 1000 | 0.1837 | 0.2099 | 0.2093 |
+
+TREC-COVID full corpus:
+
+| semK \ k | 10 | 60 | 100 |
+|---|---|---|---|
+| 100 | 0.4884 | 0.5601 | 0.5734 |
+| 500 | 0.4876 | 0.5781 | 0.6010 |
+| 1000 | 0.4912 | 0.5810 | **0.6021** |
+
+No meaningful interaction. Within each dataset the columns move together and the
+rows barely move: k dominates, semantic depth is close to inert for top-10
+quality, and the two do not trade off against each other. The chosen
+configuration (1000, 60) is within 3.5% of the best cell on every dataset.
 
 ### Semantic-only relevant documents through the pipeline
 
 Documents found by semantic retrieval and missed entirely by BM25:
 
-| | scifact | trec-covid 25k |
-|---|---|---|
-| total | 19 | 192 |
-| reach rank ≤ 1000 under union | 3 | 1 |
-| reach rank ≤ 100 under union | 0 | 0 |
-| reach rank ≤ 1000 under RRF | **19** | **152** |
-| reach rank ≤ 100 under RRF | **15** | **43** |
-| reach rank ≤ 10 under RRF | 0 | **3** |
+| | scifact | trec-25k | trec-FULL |
+|---|---|---|---|
+| total | 19 | 192 | 3,962 |
+| reach rank <= 1000 under union | 3 | 1 | 1 |
+| reach rank <= 100 under union | 0 | 0 | 0 |
+| reach rank <= 10 under union | 0 | 0 | 0 |
+| reach rank <= 1000 under RRF | **19** | **152** | **2,630** |
+| reach rank <= 100 under RRF | **15** | **43** | **391** |
+| reach rank <= 10 under RRF | 0 | **3** | **22** |
+
+This is the core mechanism result, and it is consistent at every scale: under the
+union these documents are in the candidate pool and **none** reach the top 100;
+under RRF, hundreds do.
+
+Worked examples (scifact), per document:
+
+```
+q=127  doc=3216  semRank=1    bm25=absent  unionPos=1001  rrfRank=15
+q=324  doc=371   semRank=2    bm25=absent  unionPos=320   rrfRank=13
+q=1    doc=4242  semRank=5    bm25=absent  unionPos=1003  rrfRank=18
+q=303  doc=789   semRank=413  bm25=absent  unionPos=1213  rrfRank=852
+```
+
+A document at semantic rank 1 that BM25 never retrieved sits at union position
+1001 — behind every lexical result — and at RRF rank 15. A document at semantic
+rank 413 stays deep under both, which is correct: RRF promotes on evidence, not
+on membership.
 
 ### Rank overlap between the two channels
 
-| mean intersection | scifact | trec-covid 25k |
-|---|---|---|
-| @10 | 2.95 | 0.68 |
-| @50 | 13.34 | 2.85 |
-| @100 | 25.78 | 6.34 |
+| | scifact | trec-25k | trec-FULL |
+|---|---|---|---|
+| mean intersection@10 | 2.95 | 0.68 | 0.28 |
+| mean intersection@50 | 13.34 | 2.85 | 3.72 |
+| mean intersection@100 | 25.78 | 6.34 | 9.34 |
+| mean Jaccard@10 | 0.1896 | 0.0423 | 0.0155 |
+| mean Jaccard@100 | 0.1563 | 0.0342 | 0.0521 |
+| NDCG@10 gain from RRF | +10.4% | +94.4% | +49.4% |
 
-Fusion gain is largest where the channels agree least (+94.4% on trec-covid at
-0.68 shared documents in the top 10, +10.4% on scifact at 2.95).
+The channels are genuinely complementary, and measurably more so on TREC-COVID,
+where they share roughly one document in every four top-10 lists. Fusion gain
+tracks channel *disagreement*, which is what a fusion method should exploit.
 
-### Interpretation
+### Is the gain broad or concentrated?
 
-RRF is the first configuration measured in this project to beat **both** of its
-inputs on **both** datasets. Because C and D share a candidate set, the gain is
-attributable to ordering and not to recall.
+Per-query NDCG@10, RRF versus BM25:
+
+| | scifact | trec-25k | trec-FULL |
+|---|---|---|---|
+| queries improved | 77 (25.7%) | 27 (57.4%) | 35 (70.0%) |
+| queries degraded | 23 (7.7%) | 6 (12.8%) | 13 (26.0%) |
+| queries unchanged | 200 (66.7%) | 14 (29.8%) | 2 (4.0%) |
+| improve : degrade | 3.3 : 1 | 4.5 : 1 | 2.7 : 1 |
+
+The gain is real but **not uniform**. On scifact two thirds of queries are
+untouched. On the full corpus RRF changes almost every query and degrades 13 of
+50 — the aggregate improvement comes from a favourable win/loss ratio, not from
+lifting every query.
+
+### Query-level cases (full corpus unless noted)
+
+**Case A — RRF promotes semantic-only relevant documents into the top 10** (q16,
+"how long does coronavirus remain stable on surfaces?"): BM25 NDCG@10 0.0000 with
+nothing relevant in its top 5; semantic 0.9477; RRF 0.6802 with all five top
+results relevant. A query BM25 answers with nothing becomes a good result set.
+
+**Case B — semantic finds relevant documents but RRF ranks them lower than
+semantic alone** (q36, spike protein structure): semantic 0.6906, RRF 0.6872. The
+lexical channel contributes little and slightly dilutes a strong semantic
+ranking.
+
+**Case C — RRF hurts** (q28, hydroxychloroquine): BM25 **1.0000** → RRF 0.7100.
+BM25's top 5 were all relevant; RRF displaced two of them with documents that had
+mediocre support in both channels. This is the intrinsic cost of rank fusion — a
+document with one strong placement and no corroboration can be pushed down by
+documents with two mediocre ones. On scifact q785 the same effect is starker:
+0.6309 → 0.0000.
+
+**Case D — the channels agree** (q42, Vitamin D, intersection@10 = 3): BM25
+0.7974, semantic 0.9266, RRF 0.9266. RRF matches the better input.
+
+**Case E — BM25 clearly better than semantic** (q25, biomarkers): BM25 0.7100,
+semantic 0.0000, RRF 0.6889. RRF gives up only 3% when the semantic channel is
+useless, because a document ranked by only one system still scores from that
+system.
+
+Cases C and E together define the tradeoff: RRF costs a little on queries the
+lexical channel already answers well, and gains a great deal on queries it
+answers badly.
+
+### Corpus asymmetry — the predicted pattern did not hold
+
+The expectation was that TREC-COVID's broad biomedical questions would favour
+BM25's lexical precision, with semantic retrieval mainly expanding recall.
+Measured, the opposite is true at both scales: semantic alone beats BM25 alone on
+every dataset tested, including the full 171,332-document corpus (0.4539 vs
+0.3890). The 25k subset was suspected of overstating RRF's advantage by
+handicapping BM25; the full corpus disproved that — the advantage survives
+against a 3.6x stronger BM25 baseline.
+
+The genuine asymmetry is in *magnitude*, not direction: fusion gains +10.4% where
+the channels overlap (scifact) and +49.4% where they do not (TREC-COVID full).
+
+### Resource cost
+
+| | scifact | trec-25k | trec-FULL |
+|---|---|---|---|
+| documents | 5,183 | 25,000 | 171,332 |
+| one-time embedding build | 190 s | 1,603 s | **7,929 s (2h 12m)** |
+| throughput | 27.3 docs/s | 15.6 docs/s | 21.6 docs/s |
+| vector store on disk | 8.0 MB | 38.4 MB | **263.2 MB** |
+| bytes per document | 1,536 | 1,536 | 1,536 |
+| added query cost (p50) | +44.5 ms | +62.8 ms | **+167.6 ms** |
+| fusion cost (p50) | 0.49 ms | 0.54 ms | 0.71 ms |
+
+Storage is exactly 384 x 4 bytes per document plus a fixed header. Query cost
+grows with corpus size because the vector scan is exact and linear — this is the
+component an ANN index would address, and the exact scan remains the oracle any
+future approximate index must be measured against.
 
 ### Not done
 
-No significance testing (300 / 47 queries, no per-query retention). No latency
-optimization, no ANN index, no per-channel weighting, no full-corpus TREC-COVID
-run. Default `ranking.mode` remains `bm25`.
+No significance testing (300/47/50 queries, no per-query score retention, no
+paired test). No ANN index. No per-channel weighting. No latency optimization.
+No change to BM25, the embedding model, query expansion, PageRank, or title/body
+weighting.

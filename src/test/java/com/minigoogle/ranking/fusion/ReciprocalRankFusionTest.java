@@ -175,6 +175,64 @@ class ReciprocalRankFusionTest {
     }
 
     @Test
+    void lexicalOnlyWhenTheSemanticRankingIsEmpty() {
+        ReciprocalRankFusion rrf = new ReciprocalRankFusion(60);
+
+        // Degenerate but operationally real: the semantic channel returned nothing.
+        // Fusion must reduce to the lexical ordering, unmodified.
+        assertEquals(List.of(4, 9, 1), rrf.fuseToIds(List.of(4, 9, 1), List.of()));
+    }
+
+    @Test
+    void semanticOnlyWhenTheLexicalRankingIsEmpty() {
+        ReciprocalRankFusion rrf = new ReciprocalRankFusion(60);
+
+        // The query matched no term in the index — the case BM25 cannot answer at all.
+        assertEquals(List.of(7, 2, 5), rrf.fuseToIds(List.of(), List.of(7, 2, 5)));
+    }
+
+    @Test
+    void identicalRankingsPreserveTheirOrder() {
+        ReciprocalRankFusion rrf = new ReciprocalRankFusion(60);
+
+        List<Integer> ranking = List.of(3, 1, 4, 1, 5, 9, 2, 6);
+        List<Fused> fused = rrf.fuse(ranking, ranking);
+
+        // Every document holds the same rank in both inputs, so every score is
+        // exactly doubled and the relative order is untouched.
+        assertEquals(List.of(3, 1, 4, 5, 9, 2, 6),
+                fused.stream().map(Fused::documentId).toList(),
+                "perfect agreement must not reorder anything");
+        assertEquals(2 * score(60, 1), fused.get(0).score(), EPS);
+        assertEquals(2 * score(60, 2), fused.get(1).score(), EPS);
+    }
+
+    @Test
+    void reversedRankingsProduceADeterministicBlend() {
+        ReciprocalRankFusion rrf = new ReciprocalRankFusion(60);
+
+        // Total disagreement: ranks are (1,5), (2,4), (3,3), (4,2), (5,1).
+        // Scores are symmetric about the middle document, so the outer pairs tie:
+        //   1/61 + 1/65 = 0.031778   (docs 10 and 50)
+        //   1/62 + 1/64 = 0.031754   (docs 20 and 40)
+        //   1/63 + 1/63 = 0.031746   (doc 30)
+        // The middle document is therefore LAST, not first — with no agreement to
+        // exploit, RRF favours whichever documents hold an extreme position.
+        List<Integer> forward = List.of(10, 20, 30, 40, 50);
+        List<Integer> backward = List.of(50, 40, 30, 20, 10);
+
+        List<Fused> fused = rrf.fuse(forward, backward);
+        List<Integer> ids = fused.stream().map(Fused::documentId).toList();
+
+        assertEquals(List.of(10, 50, 20, 40, 30), ids,
+                "ties resolve by first appearance, making total disagreement deterministic");
+        assertEquals(score(60, 1, 5), fused.get(0).score(), EPS);
+        assertEquals(score(60, 3, 3), fused.get(4).score(), EPS);
+        // Running it again must give byte-identical output.
+        assertEquals(ids, rrf.fuse(forward, backward).stream().map(Fused::documentId).toList());
+    }
+
+    @Test
     void rejectsNonPositiveK() {
         // k = 0 makes rank 1 contribute 1/1; negative k divides by zero at rank -k.
         assertThrows(IllegalArgumentException.class, () -> new ReciprocalRankFusion(0));
