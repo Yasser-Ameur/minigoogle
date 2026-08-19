@@ -8,6 +8,7 @@ COPY gradle/ gradle/
 COPY build.gradle.kts settings.gradle.kts ./
 COPY src/ src/
 COPY config/ config/
+COPY frontend/ frontend/
 
 RUN chmod +x gradlew && ./gradlew build -x test
 
