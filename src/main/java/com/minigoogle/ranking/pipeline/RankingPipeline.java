@@ -124,82 +124,145 @@ public class RankingPipeline {
                                             Map<String, Integer> documentFrequencies,
                                             int depth) {
 
-        // 1. Accumulate per-document term frequencies in a single pass over the
-        //    (docId-sorted) posting lists. Posting lists are sorted by document
-        //    id, so each posting contributes exactly once: O(total postings)
-        //    instead of O(candidateDocs x total postings).
-        Map<Integer, Map<String, Integer>> tfByDoc = new HashMap<>();
+        // The total number of postings bounds the number of distinct candidates,
+        // so the dense arrays below are sized once up front and never grow.
+        int postingBudget = 0;
+        for (String term : queryTerms) {
+            PostingList pl = candidatePostings.get(term);
+            if (pl != null) {
+                postingBudget += pl.getPostings().size();
+            }
+        }
+
+        if (postingBudget == 0) {
+            return List.of();
+        }
+
+        // 1. Score every candidate in a single pass over the (docId-sorted)
+        //    posting lists. Posting lists are sorted by document id, so each
+        //    posting contributes exactly once: O(total postings) instead of
+        //    O(candidateDocs x total postings).
+        //
+        //    Each candidate gets a dense slot, and every signal is one double[]
+        //    indexed by that slot. The map from document id to slot is the only
+        //    hashing left on this path: term frequencies are consumed as they
+        //    are read rather than staged in a per-document map, and the raw,
+        //    normalized and fused scores live in arrays rather than in a
+        //    succession of boxed maps discarded before returning.
+        //
+        //    Two factors are hoisted out of the inner loop. IDF depends only on
+        //    the term's document frequency, and the BM25 length normalization
+        //    only on the document, so each is computed once per term and once
+        //    per document rather than once per (document, term) pair.
+        int[] docIds = new int[postingBudget];
+        double[] lengthNorm = new double[postingBudget];
+        double[] rawBm25 = new double[postingBudget];
+        double[] rawPageRank = new double[postingBudget];
+        Map<Integer, Integer> slotOf = new HashMap<>();
+        int candidates = 0;
+
         for (String term : queryTerms) {
             PostingList pl = candidatePostings.get(term);
             if (pl == null) {
                 continue;
             }
+            int df = documentFrequencies.getOrDefault(term, 0);
+            double idf = df > 0 ? bm25Calculator.idf(df) : 0.0;
+
             for (Posting p : pl.getPostings()) {
-                tfByDoc.computeIfAbsent(p.getDocumentId(), id -> new HashMap<>())
-                        .put(term, p.getFrequency());
+                int docId = p.getDocumentId();
+                Integer known = slotOf.get(docId);
+                int slot;
+                if (known == null) {
+                    slot = candidates++;
+                    slotOf.put(docId, slot);
+                    docIds[slot] = docId;
+                    lengthNorm[slot] = bm25Calculator.lengthNormalization(
+                            docLengths.getOrDefault(docId, 1));
+                    rawPageRank[slot] = pageRankScores.getOrDefault(docId, 0.0);
+                } else {
+                    slot = known;
+                }
+
+                int tf = p.getFrequency();
+                if (tf > 0 && df > 0) {
+                    rawBm25[slot] += bm25Calculator.termScore(idf, tf, lengthNorm[slot]);
+                }
             }
         }
 
-        if (tfByDoc.isEmpty()) {
-            return List.of();
+        // 2. Normalize both signals and fuse them. The normalized values are
+        //    scratch: only the fused score is read afterwards, so it is written
+        //    over the normalized BM25 array rather than into a third one.
+        double[] fused = Arrays.copyOf(rawBm25, candidates);
+        double[] normPageRank = Arrays.copyOf(rawPageRank, candidates);
+        normalizer.normalizeInPlace(fused, candidates);
+        normalizer.normalizeInPlace(normPageRank, candidates);
+        for (int i = 0; i < candidates; i++) {
+            fused[i] = fusion.fuse(fused[i], normPageRank[i]);
         }
 
-        // 2. Compute BM25 score for each candidate
-        Map<Integer, Double> rawBm25Scores = new HashMap<>(tfByDoc.size());
-        for (Map.Entry<Integer, Map<String, Integer>> e : tfByDoc.entrySet()) {
-            int docId = e.getKey();
-            int docLength = docLengths.getOrDefault(docId, 1);
-            double score = bm25Calculator.scoreDocument(
-                    queryTerms, e.getValue(), docLength, documentFrequencies);
-            rawBm25Scores.put(docId, score);
-        }
-
-        // 3. Collect PageRank scores for candidates
-        Map<Integer, Double> rawPageRankScores = new HashMap<>(tfByDoc.size());
-        for (int docId : tfByDoc.keySet()) {
-            rawPageRankScores.put(docId, pageRankScores.getOrDefault(docId, 0.0));
-        }
-
-        // 4. Normalize both score sets
-        Map<Integer, Double> normBm25 = normalizer.normalize(rawBm25Scores);
-        Map<Integer, Double> normPageRank = normalizer.normalize(rawPageRankScores);
-
-        // 5. Fuse scores
-        Map<Integer, Double> fusedScores = fusion.fuse(normBm25, normPageRank);
-
-        // 6. Build RankedDocument list and select Top-K via min-heap.
-        //    Snippets are deliberately NOT built here. Snippet construction scans
-        //    the document body and is by far the most expensive per-document step,
-        //    yet neither the heap (which orders by finalScore) nor the
-        //    diversity filter (which reads only the url) inspects the snippet.
-        //    Building one per candidate would therefore do work proportional to
-        //    the size of the matched posting union and discard all but topK of
-        //    it. Snippets are filled in by present(), for survivors only.
+        // 3. Select the best `depth` candidates via a min-heap.
+        //
+        //    A RankedDocument is built only for a candidate that actually
+        //    enters the heap, so allocation here is bounded by `depth` rather
+        //    than by the size of the matched posting union.
+        //
+        //    Snippets are deliberately NOT built here. Snippet construction
+        //    scans the document body and is by far the most expensive
+        //    per-document step, yet neither the heap (which orders by
+        //    finalScore) nor the diversity filter (which reads only the url)
+        //    inspects the snippet. Snippets are filled in by present(), for
+        //    survivors only.
+        //
+        //    Exact ties on the fused score do occur. Breaking them by document
+        //    id costs nothing and makes a ranking reproducible; leaving them to
+        //    whatever order the candidate iteration happened to produce, as
+        //    this did before, is stable for a given build but arbitrary.
+        Comparator<RankedDocument> bestFirst =
+                Comparator.comparingDouble(RankedDocument::finalScore).reversed()
+                        .thenComparingInt(RankedDocument::documentId);
         PriorityQueue<RankedDocument> heap = new PriorityQueue<>(
-                Comparator.comparingDouble(RankedDocument::finalScore));
+                Math.max(1, Math.min(depth, candidates)), bestFirst.reversed());
 
-        for (int docId : tfByDoc.keySet()) {
-            String url = docUrls.getOrDefault(docId, "");
-            String title = docTitles.getOrDefault(docId, "");
-
-            RankedDocument ranked = new RankedDocument(
-                    docId, url, title,
-                    rawBm25Scores.getOrDefault(docId, 0.0),
-                    rawPageRankScores.getOrDefault(docId, 0.0),
-                    fusedScores.getOrDefault(docId, 0.0),
-                    ""
-            );
-
-            heap.offer(ranked);
-            if (heap.size() > depth) {
-                heap.poll(); // evict lowest score
+        for (int slot = 0; slot < candidates; slot++) {
+            if (heap.size() < depth) {
+                heap.offer(toRankedDocument(slot, docIds, rawBm25, rawPageRank, fused));
+            } else if (depth > 0) {
+                RankedDocument worst = heap.peek();
+                if (fused[slot] > worst.finalScore()
+                        || (fused[slot] == worst.finalScore()
+                                && docIds[slot] < worst.documentId())) {
+                    heap.poll(); // evict lowest score
+                    heap.offer(toRankedDocument(slot, docIds, rawBm25, rawPageRank, fused));
+                }
             }
         }
 
-        // 7. Extract from heap into sorted list (highest first)
+        // 4. Extract from heap into sorted list (highest first)
         List<RankedDocument> topResults = new ArrayList<>(heap);
-        topResults.sort(Comparator.comparingDouble(RankedDocument::finalScore).reversed());
+        topResults.sort(bestFirst);
         return topResults;
+    }
+
+    /**
+     * Builds the result record for one candidate slot, without a snippet.
+     */
+    private RankedDocument toRankedDocument(int slot,
+                                            int[] docIds,
+                                            double[] rawBm25,
+                                            double[] rawPageRank,
+                                            double[] fused) {
+        int docId = docIds[slot];
+        return new RankedDocument(
+                docId,
+                docUrls.getOrDefault(docId, ""),
+                docTitles.getOrDefault(docId, ""),
+                rawBm25[slot],
+                rawPageRank[slot],
+                fused[slot],
+                ""
+        );
     }
 
     /**

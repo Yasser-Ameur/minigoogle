@@ -43,13 +43,38 @@ public class BM25Calculator {
      * @return BM25 score contribution for this term in this document.
      */
     public double scoreTermInDocument(int tf, int docLength, int df) {
-        double idfVal = idf(df);
+        return termScore(idf(df), tf, lengthNormalization(docLength));
+    }
+
+    /**
+     * Computes the length-normalization factor k1 x (1 - b + b x |d| / avgdl).
+     *
+     * It depends only on the document, so a caller scoring one document against
+     * several query terms computes it once instead of once per term.
+     *
+     * @param docLength Length (word count) of the document.
+     * @return The length-normalization factor.
+     */
+    public double lengthNormalization(int docLength) {
         double k1 = params.k1();
         double b = params.b();
         double avgdl = params.averageDocLength();
 
-        double numerator = tf * (k1 + 1.0);
-        double denominator = tf + k1 * (1.0 - b + b * (docLength / avgdl));
+        return k1 * (1.0 - b + b * (docLength / avgdl));
+    }
+
+    /**
+     * Scores a single term within a single document, given the term's IDF and
+     * the document's length normalization already computed.
+     *
+     * @param idfVal     IDF of the term, from {@link #idf(int)}.
+     * @param tf         Term frequency within the document.
+     * @param lengthNorm The document's {@link #lengthNormalization(int)} factor.
+     * @return BM25 score contribution for this term in this document.
+     */
+    public double termScore(double idfVal, int tf, double lengthNorm) {
+        double numerator = tf * (params.k1() + 1.0);
+        double denominator = tf + lengthNorm;
 
         return idfVal * (numerator / denominator);
     }

@@ -1,9 +1,5 @@
 package com.minigoogle.ranking.fusion;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
-
 /**
  * Combines multiple normalized score signals into a single final score
  * using configurable weighted linear combination.
@@ -28,26 +24,13 @@ public class ScoreFusion {
     }
 
     /**
-     * Fuses normalized BM25 and PageRank scores for each candidate document.
+     * Fuses one document's two normalized signals.
      *
-     * @param normalizedBm25     Map of docId → normalized BM25 score.
-     * @param normalizedPageRank Map of docId → normalized PageRank score.
-     * @return Map of docId → fused final score.
+     * @param normalizedBm25     Normalized BM25 score in [0, 1].
+     * @param normalizedPageRank Normalized PageRank score in [0, 1].
+     * @return The fused final score.
      */
-    public Map<Integer, Double> fuse(Map<Integer, Double> normalizedBm25,
-                                     Map<Integer, Double> normalizedPageRank) {
-        Map<Integer, Double> fused = new HashMap<>();
-
-        // Union of all document IDs from both score maps
-        Set<Integer> allDocs = new java.util.HashSet<>(normalizedBm25.keySet());
-        allDocs.addAll(normalizedPageRank.keySet());
-
-        for (int docId : allDocs) {
-            double bm25 = normalizedBm25.getOrDefault(docId, 0.0);
-            double pageRank = normalizedPageRank.getOrDefault(docId, 0.0);
-            fused.put(docId, bm25Weight * bm25 + pageRankWeight * pageRank);
-        }
-
-        return fused;
+    public double fuse(double normalizedBm25, double normalizedPageRank) {
+        return bm25Weight * normalizedBm25 + pageRankWeight * normalizedPageRank;
     }
 }
