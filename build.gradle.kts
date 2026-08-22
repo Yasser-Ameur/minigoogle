@@ -87,6 +87,9 @@ val bench by tasks.registering(Test::class) {
     }
     testLogging {
         events("passed", "failed")
+        // A benchmark's result is the table it prints. Without this the
+        // measurements are computed and then discarded by Gradle.
+        showStandardStreams = true
     }
 }
 
