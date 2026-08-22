@@ -24,7 +24,10 @@ public class ScoreNormalizer {
         }
 
         double min = Double.MAX_VALUE;
-        double max = Double.MIN_VALUE;
+        // -Double.MAX_VALUE, not Double.MIN_VALUE: MIN_VALUE is the smallest
+        // positive double, so an all-zero signal would never update max and
+        // would fall through the identical-scores branch below.
+        double max = -Double.MAX_VALUE;
 
         for (int i = 0; i < count; i++) {
             if (scores[i] < min) min = scores[i];
