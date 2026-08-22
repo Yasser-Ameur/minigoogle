@@ -70,9 +70,25 @@ public final class BeirEvaluationMain {
             long buildMillis = (System.nanoTime() - buildStart) / 1_000_000;
             SearchEngine engine = build.engine();
 
+            // JIT warmup over exactly the queries that will be timed. An
+            // unwarmed median measures HotSpot compiling the retrieval path,
+            // not what a served query costs; results are discarded.
+            int warmed = 0;
+            for (BeirQuery q : corpus.queries()) {
+                if (qrels.getOrDefault(q.id(), Map.of()).isEmpty()) {
+                    continue;
+                }
+                if (options.maxQueries > 0 && warmed >= options.maxQueries) {
+                    break;
+                }
+                warmed++;
+                engine.retrieveCandidates(q.text(), options.topK);
+            }
+
             Map<String, double[]> perQuery = new TreeMap<>();
             int judged = 0;
             int evaluated = 0;
+            List<Long> queryNanos = new ArrayList<>();
             for (BeirQuery q : corpus.queries()) {
                 Map<Integer, Integer> rel = qrels.getOrDefault(q.id(), Map.of());
                 if (rel.isEmpty()) {
@@ -84,7 +100,9 @@ public final class BeirEvaluationMain {
                 evaluated++;
                 long t0 = System.nanoTime();
                 List<RankedDocument> rankedDocs = engine.retrieveCandidates(q.text(), options.topK).ranked();
-                long queryMillis = (System.nanoTime() - t0) / 1_000_000;
+                long elapsedNanos = System.nanoTime() - t0;
+                queryNanos.add(elapsedNanos);
+                long queryMillis = elapsedNanos / 1_000_000;
                 if (options.debugQuery != null && options.debugQuery.equals(q.id())) {
                     System.out.println("  [debug] query '" + q.id() + "' text='" + q.text()
                             + "' retrieve=" + queryMillis + " ms, ranked=" + rankedDocs.size());
@@ -126,6 +144,10 @@ public final class BeirEvaluationMain {
             System.out.println(String.format(
                     "  NDCG@10=%.4f  Recall@%d=%.4f  MRR@10=%.4f  MAP@%d=%.4f",
                     ndcg / n, options.topK, recall / n, mrr / n, options.topK, map / n));
+            System.out.println(String.format(
+                    "  retrieval latency: p50=%.2f ms  p95=%.2f ms  p99=%.2f ms  (n=%d, after warmup)",
+                    percentileMs(queryNanos, 50), percentileMs(queryNanos, 95),
+                    percentileMs(queryNanos, 99), queryNanos.size()));
         }
 
         long totalMillis = (System.nanoTime() - startNanos) / 1_000_000;
@@ -135,6 +157,22 @@ public final class BeirEvaluationMain {
 
     private static Consumer<BeirCorpusReader.Progress> progress() {
         return p -> System.out.println("  " + p);
+    }
+
+    /**
+     * Nearest-rank percentile over the measured retrieval times. Reported in
+     * milliseconds but computed from nanoseconds: a single-digit-millisecond
+     * p50 is not resolvable once each sample has been truncated to whole ms.
+     */
+    private static double percentileMs(List<Long> nanos, int percentile) {
+        if (nanos.isEmpty()) {
+            return 0.0;
+        }
+        List<Long> sorted = new ArrayList<>(nanos);
+        sorted.sort(null);
+        int rank = (int) Math.ceil(percentile / 100.0 * sorted.size());
+        int index = Math.min(sorted.size() - 1, Math.max(0, rank - 1));
+        return sorted.get(index) / 1_000_000.0;
     }
 
     private static Configuration buildConfig(Map<String, String> overrides) {
