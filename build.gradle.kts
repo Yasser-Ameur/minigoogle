@@ -209,6 +209,7 @@ val corpusIndex by tasks.registering(JavaExec::class) {
  *                      [-Pbeir.out=build/beir-index] [-Pbeir.maxDocs=25000]
  *                      [-Pbeir.split=test] [-Pbeir.topK=100]
  *                      [-Pbeir.variants=hybrid,bm25]
+ *                      [-Pbeir.runOut=build/run.txt]
  *                      [-Pbeir.config=semantic.hybrid.enabled=false]
  */
 val corpusEval by tasks.registering(JavaExec::class) {
@@ -239,6 +240,9 @@ val corpusEval by tasks.registering(JavaExec::class) {
             }
             providers.gradleProperty("beir.variants").orNull?.let {
                 add("--variants"); add(it)
+            }
+            providers.gradleProperty("beir.runOut").orNull?.let {
+                add("--runOut"); add(it)
             }
             providers.gradleProperty("beir.config").orNull?.let {
                 add("--config"); add(it)

@@ -33,7 +33,7 @@ import java.util.function.Consumer;
  *   BeirEvaluationMain --dataset trec-covid --dir data/beir/trec-covid
  *                      --out build/beir-index [--split test] [--topK 100]
  *                      [--variants hybrid,bm25] [--maxDocs 25000]
- *                      [--config ranking.topK=100] ...
+ *                      [--config ranking.topK=100] [--runOut run.txt] ...
  * </pre>
  */
 public final class BeirEvaluationMain {
@@ -51,6 +51,8 @@ public final class BeirEvaluationMain {
                 options.maxDocs, options.workDir, progress());
 
         Map<String, Map<Integer, Integer>> qrels = corpus.resolveQrels(options.split);
+        Map<Integer, String> docIdToBeirId = new HashMap<>();
+        corpus.beirIdToDocId().forEach((beirId, docId) -> docIdToBeirId.put(docId, beirId));
         System.out.println("Corpus: " + corpus.docs().size() + " docs, " + corpus.queries().size()
                 + " queries, split='" + options.split + "': " + qrels.size()
                 + " judged queries, " + corpus.resolvedRelJudgments(options.split)
@@ -89,6 +91,7 @@ public final class BeirEvaluationMain {
             int judged = 0;
             int evaluated = 0;
             List<Long> queryNanos = new ArrayList<>();
+            List<String> runLines = new ArrayList<>();
             for (BeirQuery q : corpus.queries()) {
                 Map<Integer, Integer> rel = qrels.getOrDefault(q.id(), Map.of());
                 if (rel.isEmpty()) {
@@ -116,6 +119,11 @@ public final class BeirEvaluationMain {
                                 grade == null ? "-" : grade,
                                 r.title().length() > 60 ? r.title().substring(0, 60) : r.title()));
                     }
+                }
+                for (int i = 0; i < rankedDocs.size(); i++) {
+                    RankedDocument r = rankedDocs.get(i);
+                    runLines.add(q.id() + " Q0 " + docIdToBeirId.get(r.documentId())
+                            + " " + (i + 1) + " " + r.finalScore() + " MiniGoogle");
                 }
                 List<Integer> ranked = rankedDocs.stream()
                         .map(RankedDocument::documentId)
@@ -148,6 +156,14 @@ public final class BeirEvaluationMain {
                     "  retrieval latency: p50=%.2f ms  p95=%.2f ms  p99=%.2f ms  (n=%d, after warmup)",
                     percentileMs(queryNanos, 50), percentileMs(queryNanos, 95),
                     percentileMs(queryNanos, 99), queryNanos.size()));
+            if (options.runOut != null) {
+                Path runPath = options.variants.size() == 1
+                        ? options.runOut
+                        : Path.of(options.runOut + "." + variant);
+                Files.write(runPath, runLines);
+                System.out.println("  run file         : " + runPath
+                        + " (" + runLines.size() + " lines)");
+            }
         }
 
         long totalMillis = (System.nanoTime() - startNanos) / 1_000_000;
@@ -206,6 +222,7 @@ public final class BeirEvaluationMain {
         int maxDocs = 0;
         int maxQueries = 0;
         String debugQuery;
+        Path runOut;
         List<String> variants = List.of("hybrid", "bm25");
         final Map<String, String> configOverrides = new HashMap<>();
 
@@ -222,6 +239,7 @@ public final class BeirEvaluationMain {
                     case "--maxDocs" -> o.maxDocs = Integer.parseInt(args[++i]);
                     case "--maxQueries" -> o.maxQueries = Integer.parseInt(args[++i]);
                     case "--debugQuery" -> o.debugQuery = args[++i];
+                    case "--runOut" -> o.runOut = Path.of(args[++i]);
                     case "--variants" -> o.variants = List.of(args[++i].split(","));
                     case "--config" -> {
                         String kv = args[++i];
@@ -232,7 +250,7 @@ public final class BeirEvaluationMain {
                         o.configOverrides.put(kv.substring(0, eq), kv.substring(eq + 1));
                     }
                     default -> throw new IllegalArgumentException(
-                            "Unknown argument '" + args[i] + "' (use --dataset/--dir/--out/--work/--split/--topK/--maxDocs/--debugQuery/--variants/--config)");
+                            "Unknown argument '" + args[i] + "' (use --dataset/--dir/--out/--work/--split/--topK/--maxDocs/--debugQuery/--runOut/--variants/--config)");
                 }
             }
             if (o.dir == null) {
