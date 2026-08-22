@@ -18,7 +18,7 @@ import java.util.Map;
  */
 public final class RankingMetrics {
 
-    /** NDCG@K uses 1/log2(rank+1) discount with (2^rel - 1) gain. */
+    /** NDCG@K uses 1/log2(rank+1) discount with linear gain. */
     public static final int DEFAULT_K = 10;
 
     private RankingMetrics() {
@@ -52,8 +52,10 @@ public final class RankingMetrics {
     }
 
     /**
-     * NDCG@K with the standard TREC formulation: gain {@code 2^rel - 1},
-     * discount {@code 1/log2(rank+1)}, normalized by the ideal ranking.
+     * NDCG@K with linear gain {@code rel} and discount {@code 1/log2(rank+1)},
+     * normalized by the ideal ranking. This is the formulation {@code trec_eval}'s
+     * {@code ndcg_cut} uses, so the scores are directly comparable with published
+     * runs; the exponential {@code 2^rel - 1} variant disagrees on graded qrels.
      *
      * <p>The ideal ranking (IDCG) is the best achievable ordering of the judged
      * documents truncated at {@code k}, and is deliberately <em>independent of
@@ -103,9 +105,9 @@ public final class RankingMetrics {
         return ndcgAt(ranked, relevance, DEFAULT_K);
     }
 
-    /** Exponential gain {@code 2^rel - 1}, with negative judgments treated as 0. */
+    /** Linear gain {@code rel}, with negative judgments treated as 0. */
     private static double gain(int grade) {
-        return Math.pow(2, clampGrade(grade)) - 1.0;
+        return clampGrade(grade);
     }
 
     private static int clampGrade(int grade) {

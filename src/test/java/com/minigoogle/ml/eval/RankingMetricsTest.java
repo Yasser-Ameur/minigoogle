@@ -10,8 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Verifies NDCG@K against hand-computed values from the standard TREC
- * formulation: gain {@code 2^rel - 1}, discount {@code 1/log2(rank+1)},
+ * Verifies NDCG@K against hand-computed values from the formulation {@code
+ * trec_eval} uses: linear gain {@code rel}, discount {@code 1/log2(rank+1)},
  * normalized by the ideal ranking of the judged documents truncated at K.
  *
  * <p>Expected values below are derived by hand in the comments rather than by
@@ -55,14 +55,14 @@ class RankingMetricsTest {
     void matchesHandComputedValueForKnownRanking() {
         // Judged: d1=3, d2=2, d3=1 (nothing else relevant).
         // Served order: d2, d1, d3  → grades 2, 3, 1
-        //   DCG  = (2^2-1)/log2(2) + (2^3-1)/log2(3) + (2^1-1)/log2(4)
-        //        = 3/1 + 7/1.5849625007 + 1/2
-        //   IDCG = (2^3-1)/log2(2) + (2^2-1)/log2(3) + (2^1-1)/log2(4)
-        //        = 7/1 + 3/1.5849625007 + 1/2
+        //   DCG  = 2/log2(2) + 3/log2(3) + 1/log2(4)
+        //        = 2/1 + 3/1.5849625007 + 1/2
+        //   IDCG = 3/log2(2) + 2/log2(3) + 1/log2(4)
+        //        = 3/1 + 2/1.5849625007 + 1/2
         Map<Integer, Integer> rel = judgments(1, 3, 2, 2, 3, 1);
 
-        double dcg = 3.0 / log2(2) + 7.0 / log2(3) + 1.0 / log2(4);
-        double idcg = 7.0 / log2(2) + 3.0 / log2(3) + 1.0 / log2(4);
+        double dcg = 2.0 / log2(2) + 3.0 / log2(3) + 1.0 / log2(4);
+        double idcg = 3.0 / log2(2) + 2.0 / log2(3) + 1.0 / log2(4);
 
         assertEquals(dcg / idcg, RankingMetrics.ndcgAt(List.of(2, 1, 3), rel, 10), EPS);
     }
@@ -88,12 +88,12 @@ class RankingMetricsTest {
 
         double single = RankingMetrics.ndcgAt(List.of(1), rel, 10);
 
-        // DCG = 7/log2(2) = 7. IDCG = sum over 10 ideal docs of 7/log2(i+2).
+        // DCG = 3/log2(2) = 3. IDCG = sum over 10 ideal docs of 3/log2(i+2).
         double idcg = 0.0;
         for (int i = 0; i < 10; i++) {
-            idcg += 7.0 / log2(i + 2);
+            idcg += 3.0 / log2(i + 2);
         }
-        assertEquals(7.0 / idcg, single, EPS);
+        assertEquals(3.0 / idcg, single, EPS);
         assertTrue(single < 0.25,
                 "one relevant hit out of ten judged must score far below 1.0, was " + single);
     }
