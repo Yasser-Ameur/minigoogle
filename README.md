@@ -1,346 +1,187 @@
 # MiniGoogle
 
-A from-scratch distributed search engine built in Java 21 — crawler, indexer, ranking, and query engine, wired together without any DI framework.
-
 ![Java](https://img.shields.io/badge/Java-21-blue)
-![Build](https://img.shields.io/badge/Build-Gradle%208.7-green)
-![Tests](https://img.shields.io/badge/Tests-257%20passing-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
----
+A search engine built from scratch in Java 21: crawler, inverted index, BM25 plus semantic ranking, and a REST API, with an optional multi-node cluster (Raft, gossip, consistent hashing). No framework, no ORM, one jar.
 
-## What is this?
-
-MiniGoogle is a full-stack search engine that crawls web pages, builds an inverted index, ranks results with BM25 + PageRank, and serves queries over REST. It runs as a single node, or as a multi-node cluster with Raft consensus, gossip-based membership and consistent hashing (see [Running a cluster](#running-a-cluster)).
-
-No Spring. No框架. Just Java, a handful of libraries, and ~275 source files.
-
----
-
-## Architecture
-
-```
-                          ┌──────────────┐
-                          │   Demo App   │  ← Composition root
-                          │  (REST API)  │
-                          └──────┬───────┘
-                                 │
-            ┌────────────────────┼────────────────────┐
-            │                    │                     │
-      ┌─────▼─────┐     ┌───────▼───────┐     ┌──────▼──────┐
-      │  Network   │     │  Distributed  │     │  Semantic   │
-      │  HTTP/DTO  │     │  Coordinators │     │  RAG/Rerank │
-      └─────┬─────┘     └───────┬───────┘     └──────┬──────┘
-            │                    │                     │
-            │           ┌───────▼───────┐             │
-            │           │    Cluster    │             │
-            │           │  Raft/Gossip  │             │
-            │           └───────┬───────┘             │
-            │                    │                     │
-      ┌─────▼──────────────────▼─────────────────────▼─────┐
-      │                     Core Layer                       │
-      │  Domain Model · Metrics · Events · Config · Caches  │
-      └─────┬──────────────────┬─────────────────────┬─────┘
-            │                  │                     │
-      ┌─────▼─────┐    ┌──────▼──────┐     ┌───────▼───────┐
-      │  Storage   │    │   Indexer   │     │    Query      │
-      │  Segments  │    │  Pipeline   │     │  Lexer/Parse  │
-      │  mmap/WAL  │    │  PostingW   │     │  Planner      │
-      └─────┬─────┘    └──────┬──────┘     └───────┬───────┘
-            │                  │                     │
-      ┌─────▼─────┐    ┌──────▼──────┐     ┌───────▼───────┐
-      │   Crawler  │    │   Ranking   │     │  Monitoring   │
-      │  Fetcher   │    │  BM25 + PR  │     │  Metrics/Log  │
-      └───────────┘    └─────────────┘     └───────────────┘
-```
-
-**Dependency flow** (acyclic): `core` → `storage` / `indexer` → `query` / `ranking` → `semantic` → `network` → `distributed` → `demo`
-
----
-
-## Features
-
-| Area | What |
-|------|------|
-| **Crawler** | Politeness-aware multi-threaded fetcher, robots.txt, BFS/DFS crawl strategies, URL frontier with priority |
-| **Indexer** | Unicode normalization, Porter stemming, stop-word filtering, gap-encoded posting lists, positional index |
-| **Storage** | Memory-mapped segments, binary posting/dictionary files, WAL, compaction, shard replication |
-| **Query** | Lexer → Parser (AST) → Query Planner (boolean, phrase, NOT), wildcard expansion |
-| **Ranking** | BM25 scoring, PageRank (iterative), popularity boosting, cross-encoder neural re-ranking |
-| **Semantic** | HNSW vector index, embedding generation, hybrid lexical + semantic retrieval, RAG pipeline |
-| **Cluster** | Raft leader election + log replication, gossip membership, consistent hashing — all reachable via `NODE_TYPE=CLUSTER`. Shard rebalancing is implemented and unit-tested but **not yet wired into the running application**. |
-| **Network** | Lightweight REST server (JDK HttpServer), REST client, request routing, error handling |
-| **Monitoring** | Metric registry, structured logging, health checks, distributed tracing spans |
-| **Demo** | Google-style UI, live autocomplete, spell correction, query expansion, analytics dashboard |
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- **Java 21** (JDK)
-- **Docker** (optional, for containerized deployment)
-
-### Build and Run
+## Quickstart
 
 ```bash
-# Clone
-git clone https://github.com/your-org/minigoogle.git
-cd minigoogle
-
-# Build
-./gradlew build -x test
-
-# Run
-java -jar build/libs/mini-google.jar
+docker volume create minigoogle-data
+docker run -d --name minigoogle \
+  -p 8080:8080 \
+  -v minigoogle-data:/data \
+  -e MINIGOGLE_API_KEY=change-me \
+  ghcr.io/yasser-ameur/minigoogle:latest
 ```
 
-Open **http://localhost:8080** — you'll get a Google-style search UI with autocomplete, spell correction, and analytics.
+The volume on `/data` is where crawled documents and (in cluster mode) Raft
+state live, so they survive a container restart. `MINIGOGLE_API_KEY` protects
+the crawl endpoint; without it, `/api/v1/crawl` is open to anyone who can
+reach the port.
 
-### Run Tests
-
-```bash
-./gradlew test          # 257 tests
-```
-
----
-
-## API
-
-Base URL: `http://localhost:8080`
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/v1/search` | Execute a search query |
-| `GET` | `/api/v1/suggest?q=...` | Autocomplete suggestions |
-| `GET` | `/api/v1/stats` | Index statistics |
-| `GET` | `/api/v1/health` | Health check |
-| `GET` | `/api/v1/analytics` | Query analytics |
-| `POST` | `/api/v1/crawl` | Trigger a crawl + reindex |
-
-### Search Example
+Check it is up and try it:
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/search \
+curl localhost:8080/api/v1/health
+curl localhost:8080/api/v1/health/ready
+curl localhost:8080/api/v1/version
+
+curl -X POST localhost:8080/api/v1/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "distributed systems", "page": 1, "pageSize": 10}'
+  -d '{"query": "distributed systems"}'
+
+curl -X POST localhost:8080/api/v1/crawl \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: change-me" \
+  -d '{"url": "https://example.com"}'
 ```
+
+Open [http://localhost:8080](http://localhost:8080) for the web UI.
+
+## Configuration
+
+Every variable below is read by `ConfigurationLoader`, in order of precedence
+environment, then `config/application.yaml`, then the built-in default. The
+full, commented list (including the unprefixed aliases some orchestrators
+expect, like `NODE_TYPE` or `CLUSTER_PEERS`) lives in `.env.example`.
+
+| Env var | yaml key | Default | Meaning |
+|---|---|---|---|
+| `MINIGOGLE_API_KEY` | `security.apiKey` | (empty, open) | Key required on protected routes |
+| `MINIGOGLE_NODE_TYPE` | `node.type` | `STANDALONE` | `STANDALONE`, `SEARCH`, `COORDINATOR`, or `CLUSTER` |
+| `MINIGOGLE_NODE_PORT` | `server.port` | `8080` | REST API port |
+| `MINIGOGLE_NODE_HOST` | `server.host` | `0.0.0.0` | REST API bind address |
+| `MINIGOGLE_INDEX_DIR` | `indexing.indexDir` | `demo-index` | Where the index (and Raft state, in `CLUSTER` mode) is persisted |
+| `MINIGOGLE_NODE_ID` | `cluster.nodeId` | (derived) | Stable id of this cluster member |
+| `MINIGOGLE_CLUSTER_PEERS` | `cluster.peers` | (none) | `nodeId=http://host:port` pairs, comma-separated |
+| `MINIGOGLE_CLUSTER_PORT` | `cluster.port` | `8081` | Internal RPC port (gossip, Raft, coordinator registry) |
+| `MINIGOGLE_CLUSTER_COORDINATOR_URL` | `cluster.coordinatorUrl` | `http://localhost:<cluster.port>` | Where a `SEARCH` node registers |
+| `MINIGOGLE_REPLICATION_FACTOR` | `cluster.replicationFactor` | `3` | Copies kept per shard/key |
+| `MINIGOGLE_CLUSTER_SECRET` | `cluster.secret` | (none) | Shared secret peers must present to each other |
+| `MINIGOGLE_ADVERTISED_HOST` | `cluster.advertisedHost` | `localhost` | Hostname this node advertises to peers |
+| `MINIGOGLE_LOG_LEVEL` | `logging.level` | `INFO` | Root logger level |
+
+`server.maxThreads`, `maxBodyBytes`, `requestTimeoutMs`, `shutdownGraceMs`,
+`rateLimit.perSecond/burst`, and `cors.origins` harden the HTTP server (bounded
+thread pool, a 1 MiB request body cap, a 10 s handler timeout, graceful
+shutdown, an optional per-client token-bucket rate limit, and optional CORS).
+They are set only in `config/application.yaml`; there is no environment
+variable for them.
+
+## Endpoints
+
+Full detail, request/response shapes, and error codes: `API.md` and
+`docs/openapi.yaml`. A `STANDALONE`, `SEARCH`, or `CLUSTER` node serves:
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/` | Web UI |
+| GET | `/api/v1/health` | Liveness, always 200 |
+| GET | `/api/v1/health/ready` | 200 once the index is loaded, else 503 |
+| GET | `/api/v1/version` | `{"version":"1.0.0"}` |
+| GET | `/metrics` | Prometheus text format |
+| POST | `/api/v1/search` | `{"query": "..."}` |
+| GET | `/api/v1/suggest?q=` | Autocomplete |
+| GET | `/api/v1/stats` | Index size |
+| GET | `/api/v1/analytics` | Query stats |
+| POST | `/api/v1/click` | Click feedback for learning-to-rank |
+| GET | `/api/v1/ml/stats` | Ranking model weights |
+| GET | `/api/v1/entities?q=` | Knowledge graph lookup |
+| POST | `/api/v1/crawl` | Protected, see Authentication below |
+| GET/POST | `/api/v1/cluster/status`, `/api/v1/cluster/kv` | `CLUSTER` node only |
+
+A `COORDINATOR` node (no local index) serves a smaller surface and answers
+`GET /api/v1/cluster/state` instead; see `API.md` for the exact difference.
+
+Every response carries an `X-Request-Id` header. Errors share one shape:
 
 ```json
-{
-  "executionTimeMs": 37,
-  "totalResults": 2431,
-  "results": [
-    {
-      "url": "https://example.com/dist-systems",
-      "title": "Distributed Systems 101",
-      "snippet": "An introduction to distributed systems...",
-      "score": 0.95,
-      "bm25Score": 0.88,
-      "pageRankScore": 0.07
-    }
-  ]
-}
+{"error":{"code":"RATE_LIMITED","message":"Rate limit exceeded"},"requestId":"..."}
 ```
 
-Full API docs: [`API.md`](API.md) · [`docs/openapi.yaml`](docs/openapi.yaml)
+`401` (bad or missing key), `405` (wrong method), `413` (body too large),
+`429` (rate limited, only when configured), `504` (handler timeout), and `500`
+(unhandled) all use it.
 
----
+## Authentication
 
-## Project Structure
+`POST /api/v1/crawl` is the only protected route. Set `MINIGOGLE_API_KEY`
+(or `security.apiKey`) and send it as either header:
 
 ```
-src/main/java/com/minigoogle/
-├── core/            Domain model, metrics, events, config, caches
-├── cluster/         Raft consensus, gossip protocol, consistent hashing
-├── crawler/         Fetcher, HTML parser, URL frontier, robots.txt
-├── storage/         Segments, mmap index, WAL, compaction, replication
-├── indexer/          Tokenizer, stemmer, inverted index, posting writers
-├── query/           Lexer, parser, AST, query planner (visitor pattern)
-├── ranking/         BM25, PageRank, snippet generation
-├── semantic/        Embeddings, HNSW vector index, RAG, re-ranking
-├── network/         HTTP server/client, DTOs, serialization, retry
-├── distributed/     Coordinators, node registry, sharding, replication
-├── monitoring/      Metrics, tracing, health checks, analytics
-├── performance/     Profiler, variable-byte encoding, skip lists
-└── demo/            MiniGoogleApp (composition root), demo documents
+X-API-Key: <key>
+Authorization: Bearer <key>
 ```
 
-**218 source files · 57 test files · 13 packages · 0 external frameworks**
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|------------|
-| Language | Java 21 (records, text blocks, virtual threads ready) |
-| Build | Gradle 8.7 (Kotlin DSL) |
-| HTTP | JDK `com.sun.net.httpserver` (server), `java.net.http.HttpClient` (client) |
-| Serialization | Jackson 2.16 (JSON), Gson 2.10, custom binary format |
-| HTML | JSoup 1.17 |
-| Logging | SLF4J 2.0 + Logback 1.4 |
-| Testing | JUnit 5.10, Mockito 5.10 |
-| Container | Docker, Docker Compose |
-| Orchestration | Kubernetes (11 manifests) |
-
----
+Leave it unset and the route stays open, which is fine for a laptop demo and
+wrong for anything reachable from a network.
 
 ## Running a cluster
 
-`NODE_TYPE=CLUSTER` starts the full consensus stack — gossip membership, Raft
-(leader election + log replication), the consistent-hash ring and the internal
-RPC server — alongside that node's local index and REST API. Peers are addressed
-through `CLUSTER_PEERS`; every node must share `MINIGOGLE_CLUSTER_SECRET` or
-peers reject each other's RPCs.
+`docker-compose.yml` brings up a real three-node cluster (gossip membership,
+Raft consensus, a consistent-hash ring) with each node's data on its own
+volume:
 
 ```bash
 docker compose up --build
-```
-
-Three nodes: REST on 8080/8081/8082, internal Raft/gossip RPC on 9080/9081/9082.
-
-```bash
-# Who is the leader?
 curl localhost:8080/api/v1/cluster/status
-
-# A linearizable write, committed by a majority before it returns
-curl -X POST localhost:8080/api/v1/cluster/kv -d '{"key":"k","value":"v"}'
-
-# Read it back from a different node
-curl 'localhost:8081/api/v1/cluster/kv?key=k'
-
-# Kill the leader and watch a survivor take over
-docker compose stop minigoogle-1
-curl localhost:8081/api/v1/cluster/status
 ```
 
-Raft state (term, vote, log, snapshot, committed configuration) persists per node
-under `$INDEX_DIR/raft`, on a named volume, so a restarted node recovers rather
-than rejoining empty.
+Killing the leader (`docker compose stop minigoogle-1`) and re-querying
+`/api/v1/cluster/status` on a survivor shows a new leader elected. Kubernetes
+manifests for a coordinator/search-node/crawler split, or for a `CLUSTER`
+`StatefulSet` with per-pod persistent volumes and stable DNS, are under `k8s/`.
 
-**Verified by** `DeployedClusterIntegrationTest` (startup → election → replicated
-write → leader kill → re-election → continued service → restart → convergence)
-and measured by `ClusterFailoverBenchmarks`.
+## Observability
 
----
+`/metrics` exposes Prometheus text format 0.0.4:
 
-## Kubernetes
+| Metric | Type | What |
+|---|---|---|
+| `minigoogle_build_info{version}` | gauge | Running version |
+| `process_uptime_seconds` | gauge | Process uptime |
+| `jvm_memory_used_bytes{area}` | gauge | Heap usage |
+| `jvm_threads_current` | gauge | Live thread count |
+| `minigoogle_http_requests_total{method,route,status}` | counter | Request counts |
+| `minigoogle_http_request_duration_seconds{method,route}` | histogram | Request latency |
+| `minigoogle_search_duration_seconds` | histogram | Search latency |
+| `minigoogle_search_queries_total` | counter | Search queries executed |
+| `minigoogle_search_zero_result_queries_total` | counter | Queries with no results |
+| `minigoogle_index_documents` | gauge | Documents in the index |
+
+Point Prometheus at `/metrics` on any node. `/api/v1/health` answers whether
+the process is alive; `/api/v1/health/ready` answers whether it can actually
+serve a query, which is the one to wire into a load balancer or a Kubernetes
+readiness probe.
+
+## Running from source
+
+Needs JDK 21 and Node 20 (Node builds the React frontend into
+`src/main/resources/demo/index.html`; without it the last checked-in build is
+used).
 
 ```bash
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl -n minigoogle create secret generic minigoogle-cluster-secret   --from-literal=secret="$(openssl rand -hex 32)"
-kubectl apply -f k8s/statefulset-cluster.yaml
+git clone https://github.com/Yasser-Ameur/minigoogle.git
+cd minigoogle
+./gradlew build -x test
+java -jar build/libs/mini-google.jar
 ```
 
-The cluster runs as a **StatefulSet** with a headless Service: Raft needs stable
-per-pod DNS names and durable per-pod volumes, neither of which a Deployment
-provides.
+`./gradlew test` runs the suite, `./gradlew bench` runs the isolated
+performance benchmarks (see `BENCHMARKS.md`).
 
-```bash
-kubectl -n minigoogle get endpoints minigoogle-cluster   # must be non-empty
-kubectl -n minigoogle exec minigoogle-cluster-0 --   curl -s localhost:8080/api/v1/cluster/status
-```
+## Relevance
 
-The single-node manifests (`deployment-*.yaml`, `service-*.yaml`) remain for the
-standalone/coordinator topology. `DeploymentTopologyTest` pins that every Service
-selector matches real pod labels and that compose sets only variables the
-application actually reads — both were silently broken before.
+Measured on BEIR scifact and TREC-COVID, 2026-08-15 (`BENCHMARKS.md`), topK=100,
+hybrid lexical+semantic retrieval versus a lexical-only baseline:
 
----
-
-## Search Pipeline
-
-```
-Query → Spell Correction → Query Expansion → Lexer → Parser (AST)
-  → Query Planner (boolean/phrase/NOT) → BM25 + PageRank scoring
-  → Cross-encoder re-ranking → Snippet generation → Cache → Response
-```
-
-Every stage is pluggable. The query planner uses the Visitor pattern over the AST, supporting `Word`, `Phrase`, `AND`, `OR`, and `NOT` nodes.
-
----
-
-## Hybrid ranking (RRF)
-
-`ranking.mode` selects how results are ordered:
-
-| mode | behaviour |
-|---|---|
-| `bm25` | lexical ranking only — **the default**, and the only mode with no extra artifacts |
-| `semantic` | semantic ranking only (useful for debugging and clean baselines) |
-| `rrf` | Reciprocal Rank Fusion of the lexical and semantic rankings |
-
-An unknown value is rejected. A mode whose artifacts are missing **fails at
-startup** rather than falling back — a node answering with a different ranking
-than it was configured for is a quality regression with no visible cause.
-
-### Depth is two independent settings
-
-```
-ranking.mode=rrf
-ranking.rrf.k=60
-ranking.fusion.depth=1000     # how much of each channel reaches fusion
-ranking.semantic.depth=1000   # optional override for the semantic channel
-ranking.topK=20               # how many results are returned and rendered
-ranking.semantic.modelDir=models/all-MiniLM-L6-v2
-ranking.semantic.vectors=models/vectors/<corpus>.bin
-```
-
-**RRF needs sufficient channel depth to reproduce its benchmarked quality, but
-the response depth is independent of it.** These were once the same setting, so
-requesting a page of twenty also narrowed fusion to twenty inputs per channel —
-worth 4.7% NDCG@10 and a third of candidate recall on full-corpus TREC-COVID.
-`ranking.topK` now bounds only what is returned, and snippets are built for the
-returned page alone.
-
-Measured on the full 171,332-document TREC-COVID corpus (see
-[BENCHMARKS.md](BENCHMARKS.md)): NDCG@10 **0.3890 → 0.5810**, MRR@10
-**0.6093 → 0.8037**.
-
-### Cost of enabling it
-
-- a ~90 MB ONNX encoder (`all-MiniLM-L6-v2`, 384 dimensions, runs in-JVM)
-- a prebuilt vector store: **1,536 bytes per document** (263 MB for 171k docs)
-- a one-time embedding build (~22 docs/s)
-- ~170 ms added per query at 171k documents, from an exact vector scan
-
-Fusion itself costs well under 1 ms. `bm25` remains the default so that a fresh
-checkout runs with no model, no vector store and no embedding step.
-
----
-
-## Performance Targets
-
-| Metric | Target |
-|--------|--------|
-| Query latency (p50) | < 50 ms |
-| Query latency (p99) | < 200 ms |
-| Index build (100k pages) | < 10 min |
-| Crawler throughput | 100+ pages/sec |
-| Memory usage | < 1 GB |
-| Index size | < 40% of corpus |
-
-Run benchmarks: `./gradlew test --tests "com.minigoogle.performance.*"`
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Full architecture spec (18k+ lines, 17 chapters) |
-| [`API.md`](API.md) | REST API reference |
-| [`Benchmark.md`](Benchmark.md) | Performance benchmarks |
-| [`QuickStart.md`](QuickStart.md) | Getting started guide |
-| [`Roadmap.md`](Roadmap.md) | Feature roadmap |
-| [`REPOSITORY_AUDIT.md`](REPOSITORY_AUDIT.md) | Codebase audit (282 files) |
-| [`docs/openapi.yaml`](docs/openapi.yaml) | OpenAPI 3.0 spec |
-
----
+| Dataset | Metric | Baseline | Hybrid |
+|---|---|---|---|
+| scifact | NDCG@10 | 0.2647 | 0.5938 |
+| TREC-COVID | NDCG@10 | 0.0000 | 0.4027 |
 
 ## License
 
-MIT
+MIT, see `LICENSE`.
