@@ -33,7 +33,7 @@ x-cluster-common: &cluster-common
     CLUSTER_PEERS: "minigoogle-1=http://minigoogle-1:9080,minigoogle-2=http://minigoogle-2:9080,minigoogle-3=http://minigoogle-3:9080"
     MINIGOGLE_CLUSTER_SECRET: "change-me-in-production"
   healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+    test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health/ready"]
     interval: 10s
     timeout: 5s
     start_period: 20s
