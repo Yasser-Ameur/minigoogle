@@ -1,55 +1,155 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import SearchBox from './components/SearchBox';
-import { analytics, click, crawl, search, stats } from './api';
-import { formatScore, highlightSnippet } from './format.jsx';
+import { analytics, click, crawl, search, setApiKey, stats } from './api';
+import { formatScore, highlightSnippet, monogram, parseUrl } from './format.jsx';
+
+const PAGE_SIZE = 50;
+const PER_PAGE = 10;
+
+function readLocation() {
+  const params = new URLSearchParams(window.location.search);
+  const q = params.get('q') || '';
+  const page = Math.max(1, parseInt(params.get('page') || '1', 10) || 1);
+  return { q, page };
+}
+
+function isTypingTarget(el) {
+  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+}
+
+function suggestReformulations(query) {
+  const words = query.trim().split(/\s+/).filter(Boolean);
+  const out = [];
+  if (words.length > 1) {
+    out.push(words.slice(0, -1).join(' '));
+    out.push(words[words.length - 1]);
+    out.push(words[0]);
+  }
+  return [...new Set(out)].filter((w) => w && w.toLowerCase() !== query.trim().toLowerCase()).slice(0, 3);
+}
 
 function Logo({ size = 'home', onClick }) {
   const cls = size === 'sm' ? 'mini-logo mini-logo--sm' : 'mini-logo mini-logo--home';
+  if (size === 'sm') {
+    return (
+      <button type="button" className={cls} onClick={onClick} aria-label="MiniGoogle home">
+        MiniG<em>oo</em>gle
+      </button>
+    );
+  }
   return (
-    <span className={cls} onClick={onClick}>
-      <span className="m">M</span><span className="i">i</span><span className="n">n</span>
-      <span className="g">i</span><span className="o">G</span><span className="g2">o</span>
-      <span className="l">o</span><span className="e">g</span><span className="m">l</span>
-      <span className="i">e</span>
+    <span className={cls}>
+      MiniG<em>oo</em>gle
     </span>
+  );
+}
+
+function ThemeToggle({ theme, onChange }) {
+  const options = [
+    { value: 'system', label: 'System' },
+    { value: 'light', label: 'Light' },
+    { value: 'dark', label: 'Dark' },
+  ];
+  return (
+    <div className="theme-toggle" role="radiogroup" aria-label="Theme">
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          role="radio"
+          aria-checked={theme === opt.value}
+          className={'theme-toggle__btn' + (theme === opt.value ? ' is-active' : '')}
+          onClick={() => onChange(opt.value)}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
   );
 }
 
 function AddUrl({ onAdded }) {
   const [url, setUrl] = useState('');
   const [status, setStatus] = useState(null);
+  const [needsKey, setNeedsKey] = useState(false);
+  const [keyInput, setKeyInput] = useState('');
 
-  const submit = async () => {
-    const value = url.trim();
-    if (!value) return;
-    setStatus({ text: 'Crawling...', color: '#70757a' });
+  const attempt = async (value) => {
+    setStatus({ text: 'Crawling…', tone: 'muted' });
     try {
       const data = await crawl(value);
       if (data.success) {
-        setStatus({ text: 'Added: ' + (data.title || value), color: '#34a853' });
+        setStatus({ text: 'Added: ' + (data.title || value), tone: 'good' });
         setUrl('');
+        setNeedsKey(false);
         onAdded();
       } else {
-        setStatus({ text: 'Error: ' + (data.error || 'failed'), color: '#ea4335' });
+        setStatus({ text: 'Error: ' + (data.error || 'failed'), tone: 'bad' });
       }
     } catch (e) {
-      setStatus({ text: 'Error: ' + e.message, color: '#ea4335' });
+      if (e.status === 401) {
+        setNeedsKey(true);
+        setStatus({ text: 'This needs an API key.', tone: 'bad' });
+      } else {
+        setStatus({
+          text: e.message + (e.requestId ? ' · ' + e.requestId : ''),
+          tone: 'bad',
+        });
+      }
     }
+  };
+
+  const submit = () => {
+    const value = url.trim();
+    if (!value) return;
+    attempt(value);
+  };
+
+  const saveKeyAndRetry = () => {
+    const key = keyInput.trim();
+    if (!key) return;
+    setApiKey(key);
+    setKeyInput('');
+    setNeedsKey(false);
+    attempt(url.trim());
   };
 
   return (
     <div className="add-url">
-      <input
-        type="url"
-        placeholder="Add a URL to the index (e.g. https://example.com/page)"
-        value={url}
-        onChange={(e) => setUrl(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') submit();
-        }}
-      />
-      <button onClick={submit}>Add</button>
-      {status && <span className="status" style={{ color: status.color }}>{status.text}</span>}
+      <div className="add-url__row">
+        <label htmlFor="add-url-input" className="visually-hidden">URL to add to the index</label>
+        <input
+          id="add-url-input"
+          type="url"
+          inputMode="url"
+          autoComplete="off"
+          placeholder="Add a URL to the index (e.g. https://example.com/page)…"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') submit();
+          }}
+        />
+        <button type="button" onClick={submit}>Add</button>
+      </div>
+      {status && <p className={'add-url__status add-url__status--' + status.tone}>{status.text}</p>}
+      {needsKey && (
+        <div className="add-url__key" role="group" aria-label="API key">
+          <label htmlFor="add-url-key" className="visually-hidden">API key</label>
+          <input
+            id="add-url-key"
+            type="password"
+            autoComplete="off"
+            placeholder="API key…"
+            value={keyInput}
+            onChange={(e) => setKeyInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') saveKeyAndRetry();
+            }}
+          />
+          <button type="button" onClick={saveKeyAndRetry}>Save &amp; retry</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -60,19 +160,14 @@ function IndexStats({ data }) {
     <div className="index-stats">
       <div className="stat"><div className="stat-val">{data.documentCount}</div>Documents</div>
       <div className="stat"><div className="stat-val">{data.vocabularySize}</div>Terms</div>
-      <div className="stat"><div className="stat-val">{data.averageDocumentLength}</div>Avg Words</div>
+      <div className="stat"><div className="stat-val">{data.averageDocumentLength}</div>Avg words</div>
     </div>
   );
 }
 
-function ResultCard({ query, position, result }) {
-  const scores = [];
-  if (result.bm25Score > 0) scores.push('BM25: ' + formatScore(result.bm25Score));
-  if (result.pageRankScore > 0) scores.push('PageRank: ' + formatScore(result.pageRankScore));
-  scores.push('Score: ' + formatScore(result.score));
+function ResultCard({ query, position, result, linkRef }) {
+  const { host, path } = parseUrl(result.url);
 
-  // Report the click to the backend for learning-to-rank training. Fire and
-  // forget so the click never blocks navigation, and never fail the UI.
   const onClick = () => {
     if (query) {
       click(query, result.url, position).catch(() => {});
@@ -80,150 +175,336 @@ function ResultCard({ query, position, result }) {
   };
 
   return (
-    <div className="result">
-      <div className="url">{result.url}</div>
-      <div className="title">
-        <a href={result.url} target="_blank" rel="noreferrer" onClick={onClick}>{result.title}</a>
+    <li className="result">
+      <div className="result__domain">
+        <span className="result__badge" aria-hidden="true">{monogram(host)}</span>
+        <span className="result__host">{host}</span>
+        {path && <span className="result__path">{path}</span>}
       </div>
-      <div className="snippet">{highlightSnippet(result.snippet)}</div>
-      <div className="score">{scores.join(' \u00b7 ')}</div>
+      <h3 className="result__title">
+        <a ref={linkRef} href={result.url} target="_blank" rel="noreferrer" onClick={onClick}>
+          {result.title}
+        </a>
+      </h3>
+      <p className="result__snippet">{highlightSnippet(result.snippet)}</p>
+      <details className="result__why">
+        <summary>Why this result</summary>
+        <ul>
+          {result.bm25Score > 0 && <li>Term match (BM25): {formatScore(result.bm25Score)}</li>}
+          {result.pageRankScore > 0 && <li>Link authority (PageRank): {formatScore(result.pageRankScore)}</li>}
+          <li>Combined score: {formatScore(result.score)}</li>
+        </ul>
+      </details>
+    </li>
+  );
+}
+
+function Skeleton() {
+  return (
+    <ul className="skeleton-list" aria-hidden="true">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <li className="skeleton-card" key={i}>
+          <div className="skeleton-line skeleton-line--domain" />
+          <div className="skeleton-line skeleton-line--title" />
+          <div className="skeleton-line skeleton-line--snippet" />
+          <div className="skeleton-line skeleton-line--snippet2" />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ErrorBlock({ error, onRetry }) {
+  return (
+    <div className="state-block state-block--error" role="alert">
+      <p className="state-block__title">Something went wrong.</p>
+      <p>{error.message}</p>
+      {error.requestId && <p className="state-block__meta">Request ID: {error.requestId}</p>}
+      <button type="button" onClick={onRetry}>Try again</button>
     </div>
   );
 }
 
-function ResultsPage({ query, onLogoClick, onSearch, onData, data }) {
-  const [loading, setLoading] = useState(false);
-  const [analyticsData, setAnalyticsData] = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    (async () => {
-      try {
-        const result = await search(query);
-        if (!cancelled) onData(result);
-      } catch {
-        if (!cancelled) onData({ results: [], totalResults: 0, executionTimeMs: 0 });
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [query, onData]);
-
-  useEffect(() => {
-    if (data && data.results && data.results.length > 0) {
-      analytics().then(setAnalyticsData).catch(() => {});
-    }
-  }, [data]);
-
-  const results = data ? data.results : [];
-  const total = data ? data.totalResults : 0;
-  const ms = data ? data.executionTimeMs : 0;
-  const didYouMean = data ? data.didYouMean : null;
-
+function ZeroResults({ query, didYouMean, onSearch }) {
+  const reformulations = suggestReformulations(query);
   return (
-    <div className="results-page">
-      <div className="top-bar">
-        <Logo size="sm" onClick={onLogoClick} />
-        <div className="search-box">
-          <SearchBox initialQuery={query} size="sm" onSubmit={onSearch} />
-        </div>
-      </div>
-
-      {loading && <div className="loading"><span className="spinner" />Searching...</div>}
-
-      {!loading && data && results.length === 0 && (
-        <div className="no-results">
-          Your search did not match any documents.
-          <br />
-          Try different keywords or check spelling.
-          {didYouMean && (
-            <div className="did-you-mean" onClick={() => onSearch(didYouMean)}>
-              Did you mean: <b>{didYouMean}</b>
-            </div>
-          )}
-        </div>
+    <div className="state-block state-block--empty">
+      <p className="state-block__title">No results for &ldquo;{query}&rdquo;.</p>
+      <p>Try different keywords or check your spelling.</p>
+      {didYouMean && (
+        <button type="button" className="did-you-mean" onClick={() => onSearch(didYouMean)}>
+          Did you mean <strong>{didYouMean}</strong>?
+        </button>
       )}
-
-      {!loading && data && results.length > 0 && (
-        <>
-          <div className="results-stats">About {total} results ({ms} ms)</div>
-          {didYouMean && (
-            <div className="did-you-mean" onClick={() => onSearch(didYouMean)}>
-              Did you mean: <b>{didYouMean}</b>
-            </div>
-          )}
-          {results.map((r, i) => <ResultCard key={r.url} query={query} position={i + 1} result={r} />)}
-          {analyticsData && analyticsData.totalQueries > 0 && (
-            <div className="analytics-bar">
-              <div>Queries: <span>{analyticsData.totalQueries}</span></div>
-              <div>Avg latency: <span>{analyticsData.averageLatencyMs.toFixed(1)} ms</span></div>
-              <div>Zero-result rate: <span>{(analyticsData.zeroResultRate * 100).toFixed(0)}%</span></div>
-            </div>
-          )}
-        </>
+      {reformulations.length > 0 && (
+        <div className="reformulations">
+          <span>Try instead:</span>
+          {reformulations.map((r) => (
+            <button type="button" key={r} onClick={() => onSearch(r)}>{r}</button>
+          ))}
+        </div>
       )}
     </div>
+  );
+}
+
+function Pager({ page, pageCount, onGo }) {
+  if (pageCount <= 1) return null;
+  const nums = [];
+  const start = Math.max(1, page - 2);
+  const end = Math.min(pageCount, start + 4);
+  for (let n = Math.max(1, end - 4); n <= end; n++) nums.push(n);
+
+  return (
+    <nav className="pager" aria-label="Search results pages">
+      <button type="button" disabled={page <= 1} onClick={() => onGo(page - 1)}>Previous</button>
+      {nums[0] > 1 && <span className="pager__ellipsis">…</span>}
+      {nums.map((n) => (
+        <button
+          key={n}
+          type="button"
+          className={n === page ? 'is-current' : ''}
+          aria-current={n === page ? 'page' : undefined}
+          onClick={() => onGo(n)}
+        >
+          {n}
+        </button>
+      ))}
+      {nums[nums.length - 1] < pageCount && <span className="pager__ellipsis">…</span>}
+      <button type="button" disabled={page >= pageCount} onClick={() => onGo(page + 1)}>Next</button>
+    </nav>
   );
 }
 
 export default function App() {
-  const [view, setView] = useState('home');
-  const [query, setQuery] = useState('');
+  const initial = readLocation();
+  const [view, setView] = useState(initial.q ? 'results' : 'home');
+  const [query, setQuery] = useState(initial.q);
+  const [page, setPage] = useState(initial.page);
   const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
   const [statsData, setStatsData] = useState(null);
+  const [analyticsData, setAnalyticsData] = useState(null);
+  const [theme, setTheme] = useState(() => {
+    try {
+      return window.localStorage.getItem('minigoogle-theme') || 'system';
+    } catch {
+      return 'system';
+    }
+  });
+
+  const searchBoxRef = useRef(null);
+  const resultRefs = useRef([]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+    try {
+      window.localStorage.setItem('minigoogle-theme', theme);
+    } catch {
+      // localStorage unavailable; the choice just won't persist.
+    }
+  }, [theme]);
 
   const refreshStats = useCallback(() => {
     stats().then(setStatsData).catch(() => {});
   }, []);
 
   useEffect(() => {
-    refreshStats();
-  }, [refreshStats]);
+    if (view === 'home') refreshStats();
+  }, [view, refreshStats]);
 
-  const onSearch = useCallback((text) => {
-    if (!text || !text.trim()) return;
-    setQuery(text.trim());
-    setData(null);
+  const runSearch = useCallback((q) => {
+    setLoading(true);
+    setError(null);
+    setAnalyticsData(null);
+    search(q, PAGE_SIZE)
+      .then((result) => {
+        setData(result);
+        if (result.results && result.results.length > 0) {
+          analytics().then(setAnalyticsData).catch(() => {});
+        }
+      })
+      .catch((e) => setError(e))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (view === 'results' && query) {
+      setData(null);
+      runSearch(query);
+    }
+    // Intentionally scoped to query: changing page never re-fetches.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view === 'results' ? query : null]);
+
+  useEffect(() => {
+    document.title = query ? `${query} — MiniGoogle` : 'MiniGoogle';
+  }, [query]);
+
+  useEffect(() => {
+    function onPop() {
+      const loc = readLocation();
+      if (loc.q) {
+        setView('results');
+        setQuery(loc.q);
+        setPage(loc.page);
+      } else {
+        setView('home');
+        setQuery('');
+        setPage(1);
+        setData(null);
+      }
+    }
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  const navigateSearch = useCallback((q, p = 1) => {
+    const trimmed = (q || '').trim();
+    if (!trimmed) return;
+    const params = new URLSearchParams();
+    params.set('q', trimmed);
+    if (p > 1) params.set('page', String(p));
+    window.history.pushState(null, '', '/?' + params.toString());
     setView('results');
+    setQuery(trimmed);
+    setPage(p);
   }, []);
 
-  const onData = useCallback((result) => {
-    setData(result);
-  }, []);
+  const goToPage = useCallback(
+    (p) => {
+      const params = new URLSearchParams();
+      params.set('q', query);
+      if (p > 1) params.set('page', String(p));
+      window.history.pushState(null, '', '/?' + params.toString());
+      setPage(p);
+      window.scrollTo({ top: 0 });
+    },
+    [query]
+  );
 
   const goHome = useCallback(() => {
+    window.history.pushState(null, '', '/');
     setView('home');
-    setData(null);
     setQuery('');
+    setPage(1);
+    setData(null);
+    setError(null);
     refreshStats();
   }, [refreshStats]);
+
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (e.key === '/' && !isTypingTarget(document.activeElement)) {
+        e.preventDefault();
+        searchBoxRef.current && searchBoxRef.current.focus();
+        return;
+      }
+      if (isTypingTarget(document.activeElement)) return;
+      const links = resultRefs.current.filter(Boolean);
+      if (links.length === 0) return;
+      const idx = links.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown' || e.key === 'j') {
+        e.preventDefault();
+        links[idx < 0 ? 0 : Math.min(idx + 1, links.length - 1)].focus();
+      } else if (e.key === 'ArrowUp' || e.key === 'k') {
+        e.preventDefault();
+        links[idx <= 0 ? 0 : idx - 1].focus();
+      } else if (e.key === 'Escape') {
+        searchBoxRef.current && searchBoxRef.current.focus();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [data, page]);
+
+  const results = data && data.results ? data.results : [];
+  const pageCount = Math.max(1, Math.ceil(results.length / PER_PAGE));
+  const safePage = Math.min(page, pageCount);
+  const pageResults = results.slice((safePage - 1) * PER_PAGE, safePage * PER_PAGE);
+  const didYouMean = data ? data.didYouMean : null;
+
+  resultRefs.current = [];
 
   return (
     <>
-      {view === 'home' ? (
-        <div className="center home">
-          <Logo size="home" />
-          <div className="search-box">
-            <SearchBox onSubmit={onSearch} autoFocus />
+      <a className="skip-link" href="#main">Skip to results</a>
+      <header className={view === 'home' ? 'site-header site-header--home' : 'site-header'}>
+        {view === 'results' && (
+          <>
+            <Logo size="sm" onClick={goHome} />
+            <div className="search-box">
+              <SearchBox
+                ref={searchBoxRef}
+                initialQuery={query}
+                size="sm"
+                onSubmit={(q) => navigateSearch(q, 1)}
+              />
+            </div>
+          </>
+        )}
+        <ThemeToggle theme={theme} onChange={setTheme} />
+      </header>
+
+      <main id="main">
+        {view === 'home' ? (
+          <div className="home">
+            <Logo size="home" />
+            <div className="search-box">
+              <SearchBox ref={searchBoxRef} onSubmit={(q) => navigateSearch(q, 1)} autoFocus />
+            </div>
+            <AddUrl onAdded={refreshStats} />
+            <IndexStats data={statsData} />
           </div>
-          <AddUrl onAdded={refreshStats} />
-          <IndexStats data={statsData} />
-        </div>
-      ) : (
-        <ResultsPage
-          key={query}
-          query={query}
-          onLogoClick={goHome}
-          onSearch={onSearch}
-          onData={onData}
-          data={data}
-        />
-      )}
-      <div className="footer">MiniGoogle &mdash; A distributed search engine built from scratch</div>
+        ) : (
+          <div className="results-page">
+            {loading && <Skeleton />}
+
+            {!loading && error && <ErrorBlock error={error} onRetry={() => runSearch(query)} />}
+
+            {!loading && !error && data && results.length === 0 && (
+              <ZeroResults query={query} didYouMean={didYouMean} onSearch={(q) => navigateSearch(q, 1)} />
+            )}
+
+            {!loading && !error && data && results.length > 0 && (
+              <>
+                <p className="results-stats">
+                  About {data.totalResults} results ({data.executionTimeMs} ms)
+                </p>
+                {didYouMean && (
+                  <button type="button" className="did-you-mean" onClick={() => navigateSearch(didYouMean, 1)}>
+                    Did you mean <strong>{didYouMean}</strong>?
+                  </button>
+                )}
+                <ul className="result-list">
+                  {pageResults.map((r, i) => (
+                    <ResultCard
+                      key={r.url}
+                      query={query}
+                      position={(safePage - 1) * PER_PAGE + i + 1}
+                      result={r}
+                      linkRef={(el) => (resultRefs.current[i] = el)}
+                    />
+                  ))}
+                </ul>
+                <Pager page={safePage} pageCount={pageCount} onGo={goToPage} />
+                {analyticsData && analyticsData.totalQueries > 0 && (
+                  <div className="analytics-bar">
+                    <div>Queries: <span>{analyticsData.totalQueries}</span></div>
+                    <div>Avg latency: <span>{analyticsData.averageLatencyMs.toFixed(1)} ms</span></div>
+                    <div>Zero-result rate: <span>{(analyticsData.zeroResultRate * 100).toFixed(0)}%</span></div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </main>
+
+      <footer className="site-footer">MiniGoogle — a search engine built from scratch</footer>
     </>
   );
 }
