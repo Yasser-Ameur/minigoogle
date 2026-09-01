@@ -20,6 +20,7 @@ import com.minigoogle.semantic.autocomplete.TrieAutocomplete;
 import com.minigoogle.semantic.knowledge.EntityExtractor;
 import com.minigoogle.semantic.knowledge.KnowledgeGraph;
 import com.minigoogle.semantic.spell.SpellCorrector;
+import com.minigoogle.storage.documents.CrawledDocumentStore;
 import com.minigoogle.storage.metadata.Metadata;
 import com.minigoogle.storage.mmap.MemoryMappedIndex;
 import com.minigoogle.search.SearchEngine;
@@ -86,6 +87,7 @@ public class MiniGoogleApp {
     private final PrometheusRegistry metrics = new PrometheusRegistry();
 
     private Path indexPath;
+    private CrawledDocumentStore crawledDocumentStore;
     private final LRUCache<String, List<com.minigoogle.network.dto.SearchResult>> queryCache = new LRUCache<>(200);
     private final EventBus eventBus = new EventBus();
 
@@ -132,6 +134,17 @@ public class MiniGoogleApp {
         // Phase 1: Index demo documents
         System.out.print("Indexing documents... ");
         allDocs.addAll(DemoDocuments.all());
+        // Documents added through /api/v1/crawl are replayed from the store so
+        // they survive a restart; the demo corpus is the seed, not the state.
+        crawledDocumentStore = CrawledDocumentStore.open(indexPath.resolve("crawled-documents.jsonl"));
+        allDocs.addAll(crawledDocumentStore.readAll());
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                crawledDocumentStore.close();
+            } catch (IOException e) {
+                System.err.println("Failed to close crawled document store: " + e.getMessage());
+            }
+        }, "crawled-store-close"));
         reindex();
         System.out.println("done (" + allDocs.size() + " documents)");
 
@@ -416,6 +429,7 @@ public class MiniGoogleApp {
 
                 ParsedDocument doc = parsed.get();
                 synchronized (indexLock) {
+                    crawledDocumentStore.append(doc);
                     allDocs.add(doc);
                     reindex();
                 }
