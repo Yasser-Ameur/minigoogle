@@ -536,6 +536,13 @@ the lexical-only fallback is not.
 scifact is close to reference; trec-covid is not, and its remaining gap is
 primarily candidate recall (0.7508), not ranking.
 
+**Re-measured 2026-09-02** (query-time stop-word filtering, implicit OR, title
+indexed with body and the shared query tokenizer all landed after the table
+above): pure BM25 on scifact, `corpusEval -Pbeir.variants=bm25
+-Pbeir.config=semantic.enabled=false`, gives NDCG@10 0.6746, Recall@100 0.9042,
+MRR@10 0.6432, MAP@100 0.6355, above the published 0.665. The 0.5938 figure
+above is historical. trec-covid was not re-run.
+
 ### Rejected
 
 **BM25 parameter tuning was not attempted.** The measurement showed the dominant
