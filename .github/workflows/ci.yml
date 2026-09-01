@@ -17,6 +17,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
@@ -29,15 +34,16 @@ jobs:
       - name: Build and test
         run: ./gradlew build
 
+      - name: Fail if the checked-in UI artifact is stale
+        run: git diff --exit-code src/main/resources/demo/index.html
+
       - name: Performance benchmarks (isolated)
         run: ./gradlew bench
 
   docker:
     needs: build
     runs-on: ubuntu-latest
-    # Keep publishing the development image even when an unrelated flaky
-    # integration test fails. The build job remains red and visible.
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
