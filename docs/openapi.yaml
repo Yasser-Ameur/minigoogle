@@ -1,285 +1,423 @@
-openapi: "3.0.3"
-
+openapi: 3.0.3
 info:
-  title: MiniGoogle Search API
-  description: REST API for the MiniGoogle distributed search engine.
+  title: MiniGoogle API
   version: "1.0.0"
-  contact:
-    name: MiniGoogle Team
-
+  description: >
+    REST API served by com.minigoogle.demo.MiniGoogleApp. Routes below are
+    those a STANDALONE (the default docker image), SEARCH, or CLUSTER node
+    registers. A COORDINATOR node (node.type=COORDINATOR) serves a reduced
+    surface: it has no local index, so it lacks /api/v1/health/ready and
+    /api/v1/entities, /api/v1/suggest and /api/v1/stats answer with empty
+    payloads, and POST /api/v1/crawl always returns
+    {"success":false,"error":"..."} without attempting to fetch anything. It
+    additionally serves GET /api/v1/cluster/state instead of the cluster
+    routes below. A CLUSTER node additionally serves the two /api/v1/cluster/*
+    routes documented here.
 servers:
   - url: http://localhost:8080
-    description: Local development server
+
+security:
+  - {}
 
 paths:
-  /api/v1/search:
-    post:
-      summary: Execute a search query
-      description: >
-        Runs a query against the search index and returns ranked results with
-        pagination support.
-      operationId: search
-      tags:
-        - Search
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SearchRequest"
-            example:
-              query: "distributed systems"
-              page: 1
-              pageSize: 10
+  /:
+    get:
+      summary: Web UI
+      description: Serves the built single-page frontend.
       responses:
         "200":
-          description: Successful search response
+          description: HTML page
           content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SearchResponse"
-              example:
-                executionTimeMs: 42
-                totalResults: 1580
-                results:
-                  - url: "https://example.com/dist-systems"
-                    title: "Distributed Systems 101"
-                    snippet: "An introduction to distributed systems concepts..."
-                    score: 0.95
-        "400":
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "500":
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+            text/html: {}
 
   /api/v1/health:
     get:
-      summary: Health check
-      description: Returns the health status of the service.
-      operationId: healthCheck
-      tags:
-        - Cluster
+      summary: Liveness
+      description: Always answers 200 while the process is up; does not check the index.
       responses:
         "200":
-          description: Service is healthy
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthReport"
+
+  /api/v1/health/ready:
+    get:
+      summary: Readiness
+      description: >
+        200 once the index is loaded and can serve search, 503 while it is
+        still building or after it fails to load. Not served by a COORDINATOR
+        node, which has no local index.
+      responses:
+        "200":
+          description: Ready to serve
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthReport"
+        "503":
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/version:
+    get:
+      summary: Build version
+      responses:
+        "200":
+          description: Running version
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  status:
+                  version:
                     type: string
-                    enum:
-                      - ok
-              example:
-                status: "ok"
+                    example: "1.0.0"
 
-  /api/v1/entities:
+  /metrics:
     get:
-      summary: Query the knowledge graph
+      summary: Prometheus metrics
       description: >
-        Returns named entities extracted from the corpus. Without a query
-        parameter the top entities by document count are returned; with `q`,
-        entities matching the substring are returned along with their related
-        entities (ordered by co-occurrence weight).
-      operationId: getEntities
-      tags:
-        - Knowledge Graph
+        Prometheus text exposition format 0.0.4. Includes
+        minigoogle_build_info, process_uptime_seconds, jvm_memory_used_bytes,
+        jvm_threads_current, minigoogle_http_requests_total,
+        minigoogle_http_request_duration_seconds,
+        minigoogle_search_duration_seconds, minigoogle_search_queries_total,
+        minigoogle_search_zero_result_queries_total, and
+        minigoogle_index_documents.
+      responses:
+        "200":
+          description: Metrics snapshot
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/v1/search:
+    post:
+      summary: Search the index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                pageSize:
+                  type: integer
+              required: [query]
+      responses:
+        "200":
+          description: Ranked results (empty list for a blank query)
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/suggest:
+    get:
+      summary: Autocomplete
+      description: Falls back to spell-corrected suggestions when the raw prefix has none.
       parameters:
         - name: q
           in: query
-          required: false
-          description: Entity name substring to match (case-insensitive)
           schema:
             type: string
-          example: "Java"
       responses:
         "200":
-          description: List of matching entities
+          description: Up to 8 suggestions
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/EntityResult"
-              example:
-                - entity: "Java Programming Language"
-                  count: 1
-                  related:
-                    - entity: "James Gosling"
-                      score: 1
-                    - entity: "Sun Microsystems"
-                      score: 1
+                  type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
 
-  /api/v1/cluster/nodes:
+  /api/v1/stats:
     get:
-      summary: List cluster nodes
-      description: Returns information about all registered nodes in the cluster.
-      operationId: listClusterNodes
-      tags:
-        - Cluster
+      summary: Index statistics
       responses:
         "200":
-          description: List of cluster nodes
+          description: Document count, vocabulary size, average document length, index version
           content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/NodeInfo"
-              example:
-                - nodeId: "node-1"
-                  host: "192.168.1.10"
-                  port: 9001
-                  role: "INDEX"
-                  status: "ALIVE"
-                  lastHeartbeat: 1721750000000
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/analytics:
+    get:
+      summary: Query analytics
+      responses:
+        "200":
+          description: Total queries, average latency, zero-result rate, top queries
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/click:
+    post:
+      summary: Record a result click for learning-to-rank feedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                documentId:
+                  type: integer
+                url:
+                  type: string
+                position:
+                  type: integer
+                sessionId:
+                  type: string
+              required: [query]
+      responses:
+        "200":
+          description: "{success, documentId, position, trainedPairs} or {success:false, error}"
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/ml/stats:
+    get:
+      summary: Learning-to-rank model and click statistics
+      responses:
+        "200":
+          description: Feature names, model weights, click and impression counts
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/entities:
+    get:
+      summary: Knowledge graph entities
+      description: Not served by a COORDINATOR node.
+      parameters:
+        - name: q
+          in: query
+          description: Substring filter; empty returns the top 20 entities by document count
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Matching entities with their related entities
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/crawl:
+    post:
+      summary: Fetch a URL, parse it, and add it to the index
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+              required: [url]
+      responses:
+        "200":
+          description: "{success:true, title, url} or {success:false, error}"
+          content:
+            application/json: {}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/cluster/status:
+    get:
+      summary: Raft/gossip state of this cluster member (CLUSTER node only)
+      responses:
+        "200":
+          description: nodeId, Raft state, term, leader, commit index, members, live nodes
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+
+  /api/v1/cluster/kv:
+    get:
+      summary: Read a replicated key (CLUSTER node only)
+      parameters:
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "{found, key, value} or {found:false, error}"
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
+    post:
+      summary: Write a key through Raft (CLUSTER node only)
+      description: Returns only once a majority of the cluster has committed and applied the entry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key:
+                  type: string
+                value:
+                  type: string
+              required: [key]
+      responses:
+        "200":
+          description: "{success:true, key} or {success:false, error, leader}"
+          content:
+            application/json: {}
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
 
 components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        The API key configured via MINIGOGLE_API_KEY / security.apiKey. An
+        "Authorization: Bearer <key>" header is accepted in place of
+        X-API-Key. When no key is configured, protected routes are open.
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    MethodNotAllowed:
+      description: Wrong HTTP method for this route
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body exceeded server.maxBodyBytes
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Client exceeded server.rateLimit.perSecond (only returned when a rate limit is configured)
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    HandlerTimeout:
+      description: Handler exceeded server.requestTimeoutMs
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
   schemas:
-    SearchRequest:
-      type: object
-      required:
-        - query
-      properties:
-        query:
-          type: string
-          description: The search query string
-          example: "distributed systems"
-        page:
-          type: integer
-          minimum: 1
-          default: 1
-          description: Page number (1-indexed)
-          example: 1
-        pageSize:
-          type: integer
-          minimum: 1
-          maximum: 100
-          default: 10
-          description: Number of results per page
-          example: 10
-
-    SearchResponse:
-      type: object
-      properties:
-        executionTimeMs:
-          type: integer
-          format: int64
-          description: Total time taken to execute the query in milliseconds
-          example: 42
-        totalResults:
-          type: integer
-          description: Estimated total number of matching documents
-          example: 1580
-        results:
-          type: array
-          items:
-            $ref: "#/components/schemas/SearchResult"
-
-    SearchResult:
-      type: object
-      properties:
-        url:
-          type: string
-          description: URL of the matching document
-          example: "https://example.com/dist-systems"
-        title:
-          type: string
-          description: Title of the document
-          example: "Distributed Systems 101"
-        snippet:
-          type: string
-          description: Relevant text excerpt from the document
-          example: "An introduction to distributed systems concepts..."
-        score:
-          type: number
-          format: double
-          description: Relevance score (0.0 to 1.0)
-          example: 0.95
-
-    ErrorResponse:
+    Error:
       type: object
       properties:
         error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+          required: [code, message]
+        requestId:
           type: string
-          description: High-level error code
-          example: "INVALID_QUERY"
-        message:
-          type: string
-          description: Human-readable error description
-          example: "Query cannot be empty"
-
-    EntityResult:
+      required: [error, requestId]
+    HealthReport:
       type: object
       properties:
-        entity:
-          type: string
-          description: Extracted entity name
-          example: "Java Programming Language"
-        count:
-          type: integer
-          description: Number of documents mentioning the entity
-          example: 3
-        related:
-          type: array
-          description: Related entities sorted by co-occurrence weight
-          items:
-            $ref: "#/components/schemas/RelatedEntity"
-
-    RelatedEntity:
-      type: object
-      properties:
-        entity:
-          type: string
-          description: Related entity name
-          example: "James Gosling"
-        score:
-          type: integer
-          description: Number of documents in which both entities co-occur
-          example: 2
-
-    NodeInfo:
-      type: object
-      properties:
-        nodeId:
-          type: string
-          description: Unique identifier of the node
-          example: "node-1"
-        host:
-          type: string
-          description: Hostname or IP address of the node
-          example: "192.168.1.10"
-        port:
-          type: integer
-          description: Port the node listens on
-          example: 9001
-        role:
-          type: string
-          enum:
-            - COORDINATOR
-            - CRAWLER
-            - INDEX
-            - QUERY
-          description: Role of the node in the cluster
-          example: "INDEX"
         status:
           type: string
-          enum:
-            - ALIVE
-            - SUSPECT
-            - DEAD
-          description: Current status of the node
-          example: "ALIVE"
-        lastHeartbeat:
+          enum: [ok, degraded, unhealthy]
+        version:
+          type: string
+        uptimeSeconds:
           type: integer
-          format: int64
-          description: Timestamp of the last heartbeat in milliseconds since epoch
-          example: 1721750000000
+        checks:
+          type: object
+      required: [status, version, uptimeSeconds, checks]
