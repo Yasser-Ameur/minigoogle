@@ -1,0 +1,275 @@
+package com.minigoogle.network.http;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/** Behaviour contract tests for the hardened {@link RestServer}. */
+class RestServerTest {
+
+    private RestServer server;
+    private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+
+    @AfterEach
+    void tearDown() {
+        if (server != null) {
+            server.stop();
+        }
+    }
+
+    private String base() {
+        return "http://localhost:" + server.getPort();
+    }
+
+    @Test
+    void errorResponsesAreUniformJson() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.get("/ok", body -> "{\"ok\":true}");
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/ok")).POST(HttpRequest.BodyPublishers.noBody()).build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(405, resp.statusCode());
+        assertTrue(resp.body().contains("\"code\":\"METHOD_NOT_ALLOWED\""));
+        assertTrue(resp.body().contains("\"requestId\""));
+    }
+
+    @Test
+    void handlerThrowingHttpErrorRendersItsStatusAndCode() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.get("/bad", body -> {
+            throw new HttpError(400, "BAD_REQUEST", "nope");
+        });
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/bad")).GET().build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(400, resp.statusCode());
+        assertTrue(resp.body().contains("\"code\":\"BAD_REQUEST\""));
+        assertTrue(resp.body().contains("nope"));
+    }
+
+    @Test
+    void unexpectedExceptionYields500WithoutLeakingMessage() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.get("/boom", body -> {
+            throw new RuntimeException("super secret internal detail");
+        });
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/boom")).GET().build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(500, resp.statusCode());
+        assertTrue(resp.body().contains("\"code\":\"INTERNAL\""));
+        assertFalse(resp.body().contains("super secret internal detail"));
+    }
+
+    @Test
+    void requestIdIsEchoedWhenValidAndGeneratedOtherwise() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.get("/ok", body -> "{}");
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/ok"))
+                .header("X-Request-Id", "abc-123_XYZ")
+                .GET().build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertEquals("abc-123_XYZ", resp.headers().firstValue("X-Request-Id").orElse(null));
+
+        HttpRequest req2 = HttpRequest.newBuilder(URI.create(base() + "/ok"))
+                .header("X-Request-Id", "not valid!!")
+                .GET().build();
+        HttpResponse<String> resp2 = client.send(req2, HttpResponse.BodyHandlers.ofString());
+        String generated = resp2.headers().firstValue("X-Request-Id").orElse(null);
+        assertNotNull(generated);
+        assertNotEquals("not valid!!", generated);
+    }
+
+    @Test
+    void postBodyOverCapIsRejectedWith413() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 8, 10_000, 0, 0, "", null, 1000);
+        server = new RestServer(0, opts);
+        server.post("/echo", body -> body);
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/echo"))
+                .POST(HttpRequest.BodyPublishers.ofString("this body is way over the cap"))
+                .build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(413, resp.statusCode());
+        assertTrue(resp.body().contains("PAYLOAD_TOO_LARGE"));
+    }
+
+    @Test
+    void slowHandlerTimesOutWith504() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 200, 0, 0, "", null, 1000);
+        server = new RestServer(0, opts);
+        server.get("/slow", body -> {
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return "{}";
+        });
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/slow")).GET().build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(504, resp.statusCode());
+        assertTrue(resp.body().contains("TIMEOUT"));
+    }
+
+    @Test
+    void rateLimitReturns429WithRetryAfter() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 10_000, 2.0, 1, "", null, 1000);
+        server = new RestServer(0, opts);
+        server.get("/limited", body -> "{}");
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/limited")).GET().build();
+        HttpResponse<String> first = client.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> second = client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(200, first.statusCode());
+        assertEquals(429, second.statusCode());
+        assertTrue(second.headers().firstValue("Retry-After").isPresent());
+        assertTrue(second.body().contains("RATE_LIMITED"));
+    }
+
+    @Test
+    void protectedRouteRequires401WithoutKeyAndAcceptsBearerOrHeader() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 10_000, 0, 0, "", "secret-key", 1000);
+        server = new RestServer(0, opts);
+        server.getProtected("/admin", "application/json", body -> "{\"ok\":true}");
+        server.start();
+
+        HttpRequest noAuth = HttpRequest.newBuilder(URI.create(base() + "/admin")).GET().build();
+        HttpResponse<String> respNoAuth = client.send(noAuth, HttpResponse.BodyHandlers.ofString());
+        assertEquals(401, respNoAuth.statusCode());
+        assertEquals("Bearer", respNoAuth.headers().firstValue("WWW-Authenticate").orElse(null));
+
+        HttpRequest bearer = HttpRequest.newBuilder(URI.create(base() + "/admin"))
+                .header("Authorization", "Bearer secret-key").GET().build();
+        HttpResponse<String> respBearer = client.send(bearer, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, respBearer.statusCode());
+
+        HttpRequest apiKeyHeader = HttpRequest.newBuilder(URI.create(base() + "/admin"))
+                .header("X-API-Key", "secret-key").GET().build();
+        HttpResponse<String> respApiKey = client.send(apiKeyHeader, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, respApiKey.statusCode());
+
+        HttpRequest wrongKey = HttpRequest.newBuilder(URI.create(base() + "/admin"))
+                .header("X-API-Key", "wrong").GET().build();
+        HttpResponse<String> respWrong = client.send(wrongKey, HttpResponse.BodyHandlers.ofString());
+        assertEquals(401, respWrong.statusCode());
+    }
+
+    @Test
+    void blankApiKeyLeavesProtectedRoutesOpen() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.postProtected("/open-admin", body -> "{\"ok\":true}");
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/open-admin"))
+                .POST(HttpRequest.BodyPublishers.ofString("{}")).build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, resp.statusCode());
+    }
+
+    @Test
+    void corsPreflightAndActualResponsesCarryHeaders() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 10_000, 0, 0, "https://allowed.example", null, 1000);
+        server = new RestServer(0, opts);
+        server.get("/cors", body -> "{}");
+        server.start();
+
+        HttpRequest preflight = HttpRequest.newBuilder(URI.create(base() + "/cors"))
+                .method("OPTIONS", HttpRequest.BodyPublishers.noBody())
+                .header("Origin", "https://allowed.example")
+                .build();
+        HttpResponse<String> preflightResp = client.send(preflight, HttpResponse.BodyHandlers.ofString());
+        assertEquals(204, preflightResp.statusCode());
+        assertEquals("https://allowed.example", preflightResp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+        assertEquals("GET, POST, OPTIONS", preflightResp.headers().firstValue("Access-Control-Allow-Methods").orElse(null));
+
+        HttpRequest actual = HttpRequest.newBuilder(URI.create(base() + "/cors"))
+                .header("Origin", "https://other.example")
+                .GET().build();
+        HttpResponse<String> actualResp = client.send(actual, HttpResponse.BodyHandlers.ofString());
+        assertEquals("*", actualResp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+    }
+
+    @Test
+    void noCorsHeadersWhenOriginsBlank() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.get("/nocors", body -> "{}");
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/nocors")).GET().build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertTrue(resp.headers().firstValue("Access-Control-Allow-Origin").isEmpty());
+    }
+
+    @Test
+    void requestObserverIsCalledWithRoutePattern() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.get("/observed", body -> "{}");
+        List<String> routes = new ArrayList<>();
+        AtomicInteger statuses = new AtomicInteger();
+        server.setRequestObserver((route, method, status, durationNanos) -> {
+            routes.add(route);
+            statuses.set(status);
+        });
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/observed?x=1")).GET().build();
+        client.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(List.of("/observed"), routes);
+        assertEquals(200, statuses.get());
+    }
+
+    @Test
+    void stopWaitsForInFlightHandlerToComplete() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 10_000, 0, 0, "", null, 2000);
+        server = new RestServer(0, opts);
+        server.get("/slow-graceful", body -> {
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return "{\"done\":true}";
+        });
+        server.start();
+        int port = server.getPort();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/slow-graceful")).GET().build();
+        CompletableFuture<HttpResponse<String>> future = client.sendAsync(req, HttpResponse.BodyHandlers.ofString());
+
+        Thread.sleep(50);
+        server.stop();
+
+        HttpResponse<String> resp = future.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(200, resp.statusCode());
+        assertTrue(resp.body().contains("done"));
+        server = null;
+    }
+}
