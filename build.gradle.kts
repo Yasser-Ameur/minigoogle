@@ -1,6 +1,8 @@
 import java.nio.file.Files
 import java.nio.file.Path
 
+version = "1.0.0"
+
 plugins {
     java
     application
@@ -104,6 +106,7 @@ tasks.jar {
     archiveFileName.set("mini-google.jar")
     manifest {
         attributes["Main-Class"] = "com.minigoogle.demo.MiniGoogleApp"
+        attributes["Implementation-Version"] = project.version
     }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     // Bundle runtime dependencies so `java -jar mini-google.jar` works standalone.
