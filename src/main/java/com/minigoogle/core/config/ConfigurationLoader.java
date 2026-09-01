@@ -47,6 +47,7 @@ public final class ConfigurationLoader {
         putIfEnv(props, "MINIGOGLE_REPLICATION_FACTOR", "cluster.replicationFactor");
         putIfEnv(props, "MINIGOGLE_LOG_LEVEL", "logging.level");
         putIfEnv(props, "MINIGOGLE_CLUSTER_SECRET", "cluster.secret");
+        putIfEnv(props, "MINIGOGLE_API_KEY", "security.apiKey");
         putIfEnv(props, "MINIGOGLE_ADVERTISED_HOST", "cluster.advertisedHost");
         // Unprefixed aliases. Container orchestrators set plain names, and
         // docker-compose already did so for CLUSTER_PEERS while only the

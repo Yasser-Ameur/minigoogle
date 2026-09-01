@@ -5,7 +5,9 @@ import com.minigoogle.crawler.model.DownloadedPage;
 import com.minigoogle.crawler.model.ParsedDocument;
 import com.minigoogle.crawler.model.UrlTask;
 import com.minigoogle.crawler.parser.JSoupHtmlParser;
+import com.minigoogle.network.http.HttpError;
 import com.minigoogle.network.http.RestServer;
+import com.minigoogle.network.http.ServerOptions;
 import com.minigoogle.indexer.model.IndexedDocument;
 import com.minigoogle.network.dto.SearchRequest;
 import com.minigoogle.network.dto.SearchResponse;
@@ -26,6 +28,7 @@ import com.minigoogle.search.SearchEngineBuilder;
 import com.minigoogle.search.RetrievalResult;
 import com.minigoogle.core.cache.LRUCache;
 import com.minigoogle.core.concurrent.ConcurrentIndex;
+import com.minigoogle.core.Version;
 import com.minigoogle.core.config.Configuration;
 import com.minigoogle.core.config.ConfigurationLoader;
 import com.minigoogle.core.event.EventBus;
@@ -51,6 +54,9 @@ import com.minigoogle.ml.features.FeatureName;
 import com.minigoogle.ml.features.NormalizationContext;
 import com.minigoogle.ml.ltr.LinearRankingModel;
 import com.minigoogle.monitoring.analytics.QueryAnalytics;
+import com.minigoogle.monitoring.health.HealthReport;
+import com.minigoogle.monitoring.health.HealthStatus;
+import com.minigoogle.monitoring.metrics.PrometheusRegistry;
 import com.minigoogle.network.dto.ClickRequest;
 import com.minigoogle.network.http.RestClient;
 
@@ -77,6 +83,7 @@ public class MiniGoogleApp {
     private Configuration config;
 
     private final QueryAnalytics analytics = new QueryAnalytics();
+    private final PrometheusRegistry metrics = new PrometheusRegistry();
 
     private Path indexPath;
     private final LRUCache<String, List<com.minigoogle.network.dto.SearchResult>> queryCache = new LRUCache<>(200);
@@ -132,7 +139,14 @@ public class MiniGoogleApp {
         System.out.println("Starting server on http://localhost:" + port);
         System.out.println("============================================================");
 
-        RestServer server = new RestServer(port);
+        RestServer server = new RestServer(port, serverOptions());
+        server.setRequestObserver(metrics::observeHttp);
+        metrics.gauge("minigoogle_index_documents", () -> {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                IndexState state = lease.value();
+                return state == null ? 0 : state.metadata().documentCount();
+            }
+        });
 
         String html = loadResource("/demo/index.html");
         server.getHtml("/", req -> html);
@@ -149,9 +163,11 @@ public class MiniGoogleApp {
                 // A SEARCH-mode node returns its candidate set with raw
                 // features for coordinator-side global ranking; a standalone
                 // node returns fully ranked results.
+                long startNanos = System.nanoTime();
                 SearchResponse response = "SEARCH".equals(nodeType)
                         ? gatherCandidateResults(request.query().trim(), pageSize)
                         : executeSearch(request.query().trim(), pageSize);
+                metrics.observeSearch(System.nanoTime() - startNanos, response.results().size());
                 long elapsed = System.currentTimeMillis() - start;
                 return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(),
                         response.results(), response.didYouMean(),
@@ -161,7 +177,18 @@ public class MiniGoogleApp {
             }
         });
 
-        server.getWithContentType("/api/v1/health", "application/json", req -> "{\"status\":\"ok\"}");
+        server.getWithContentType("/api/v1/health", "application/json", req -> healthJson(true));
+        server.getWithContentType("/api/v1/health/ready", "application/json", req -> {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                if (lease.value() == null) {
+                    throw new HttpError(503, "NOT_READY", "index not loaded");
+                }
+            }
+            return healthJson(true);
+        });
+        server.getWithContentType("/api/v1/version", "application/json",
+            req -> JsonSerializer.toJson(Map.of("version", Version.current())));
+        server.getWithContentType("/metrics", "text/plain; version=0.0.4; charset=utf-8", req -> metrics.scrape());
 
         // Autocomplete with spell correction fallback
         server.getWithContentType("/api/v1/suggest", "application/json", req -> {
@@ -362,7 +389,7 @@ public class MiniGoogleApp {
         });
 
         // Crawl endpoint: fetch a URL and add to index
-        server.post("/api/v1/crawl", body -> {
+        server.postProtected("/api/v1/crawl", body -> {
             try {
                 var req = JsonSerializer.fromJson(body, Map.class);
                 String url = req != null ? (String) req.get("url") : null;
@@ -401,6 +428,7 @@ public class MiniGoogleApp {
         });
 
         server.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "rest-server-stop"));
 
         if ("SEARCH".equals(nodeType)) {
             registerWithCluster(port);
@@ -603,7 +631,8 @@ public class MiniGoogleApp {
                 : new SearchCoordinator(coordinatorUrl);
 
         QueryAnalytics coordinatorAnalytics = new QueryAnalytics();
-        RestServer server = new RestServer(port);
+        RestServer server = new RestServer(port, serverOptions());
+        server.setRequestObserver(metrics::observeHttp);
         String html = loadResource("/demo/index.html");
         server.getHtml("/", req -> html);
 
@@ -627,7 +656,10 @@ public class MiniGoogleApp {
             }
         });
 
-        server.getWithContentType("/api/v1/health", "application/json", req -> "{\"status\":\"ok\"}");
+        server.getWithContentType("/api/v1/health", "application/json", req -> healthJson(false));
+        server.getWithContentType("/api/v1/version", "application/json",
+            req -> JsonSerializer.toJson(Map.of("version", Version.current())));
+        server.getWithContentType("/metrics", "text/plain; version=0.0.4; charset=utf-8", req -> metrics.scrape());
 
         server.getWithContentType("/api/v1/cluster/state", "application/json", req -> {
             try {
@@ -668,7 +700,7 @@ public class MiniGoogleApp {
             }
         });
 
-        server.post("/api/v1/crawl", body ->
+        server.postProtected("/api/v1/crawl", body ->
             "{\"success\":false,\"error\":\"Coordinator node does not host a local index; add URLs on a standalone or SEARCH-mode node\"}");
 
         // Click feedback: the coordinator attributes the click to its served
@@ -723,6 +755,7 @@ public class MiniGoogleApp {
         });
 
         server.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "rest-server-stop"));
         System.out.println("Cluster registry listening on http://localhost:" + clusterCoordinator.getPort());
         System.out.println("Coordinator gateway on http://localhost:" + port);
     }
@@ -991,6 +1024,39 @@ public class MiniGoogleApp {
             if (is == null) throw new IOException("Resource not found: " + resourcePath);
             return new String(is.readAllBytes(), StandardCharsets.UTF_8);
         }
+    }
+
+    /**
+     * Liveness report: the process is up, so this is always served with 200.
+     * The index check is informational here; readiness is a separate route.
+     */
+    private String healthJson(boolean includeIndex) {
+        HealthReport.Builder report = HealthReport.builder(Version.current());
+        if (includeIndex) {
+            try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
+                IndexState state = lease.value();
+                report.check("index",
+                    state == null ? HealthStatus.Status.UNHEALTHY : HealthStatus.Status.HEALTHY,
+                    Map.of("documents", state == null ? 0 : state.metadata().documentCount()));
+            }
+        }
+        return report.build().toJson();
+    }
+
+    private ServerOptions serverOptions() {
+        String apiKey = config.get("security.apiKey", "").trim();
+        if (apiKey.isEmpty()) {
+            System.out.println("WARNING: security.apiKey is unset; admin routes such as POST /api/v1/crawl are open. Set MINIGOGLE_API_KEY.");
+        }
+        return new ServerOptions(
+            config.getInt("server.maxThreads", 64),
+            config.getLong("server.maxBodyBytes", 1_048_576L),
+            config.getLong("server.requestTimeoutMs", 10_000L),
+            config.getDouble("server.rateLimit.perSecond", 0),
+            config.getInt("server.rateLimit.burst", 0),
+            config.get("server.cors.origins", ""),
+            apiKey.isEmpty() ? null : apiKey,
+            config.getLong("server.shutdownGraceMs", 10_000L));
     }
 
     private void printBanner() {

@@ -8,6 +8,18 @@ node:
 server:
   port: 8080
   host: 0.0.0.0
+  maxThreads: 64          # request handler pool; requests beyond it queue
+  maxBodyBytes: 1048576   # POST bodies above this are rejected with 413
+  requestTimeoutMs: 10000 # a handler slower than this answers 504
+  shutdownGraceMs: 10000  # SIGTERM waits this long for in-flight requests
+  rateLimit:
+    perSecond: 0          # per client address; 0 disables
+    burst: 0              # 0 = ceil(perSecond)
+  cors:
+    origins: ""           # "" disables CORS; "*" or a comma-separated list enables it
+
+security:
+  apiKey: ""              # "" leaves admin routes open; set it or MINIGOGLE_API_KEY in production
 
 cluster:
   replicationFactor: 3
