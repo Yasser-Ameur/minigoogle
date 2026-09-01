@@ -1,13 +1,65 @@
-async function request(url, options) {
-  const resp = await fetch(url, options);
-  return resp.json();
+const API_KEY_STORAGE = 'minigoogle-api-key';
+
+export function getApiKey() {
+  try {
+    return window.localStorage.getItem(API_KEY_STORAGE) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setApiKey(key) {
+  try {
+    if (key) window.localStorage.setItem(API_KEY_STORAGE, key);
+    else window.localStorage.removeItem(API_KEY_STORAGE);
+  } catch {
+    // localStorage unavailable; the key just won't persist across reloads.
+  }
+}
+
+export class ApiError extends Error {
+  constructor(message, { status, code, requestId } = {}) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+async function request(url, options = {}) {
+  const apiKey = getApiKey();
+  const headers = { ...(options.headers || {}) };
+  if (apiKey) headers['X-API-Key'] = apiKey;
+
+  let resp;
+  try {
+    resp = await fetch(url, { ...options, headers });
+  } catch (e) {
+    throw new ApiError('Could not reach the server. Check your connection.', {});
+  }
+
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch {
+    body = null;
+  }
+
+  if (!resp.ok) {
+    const err = body && body.error;
+    throw new ApiError(
+      (err && err.message) || `Request failed (${resp.status})`,
+      { status: resp.status, code: err && err.code, requestId: body && body.requestId }
+    );
+  }
+  return body;
 }
 
 export function suggest(q) {
   return request('/api/v1/suggest?q=' + encodeURIComponent(q));
 }
 
-export function search(query, pageSize = 20) {
+export function search(query, pageSize = 50) {
   return request('/api/v1/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
