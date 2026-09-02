@@ -324,3 +324,32 @@ R15. Full suite on the tree at d184e7a: 921 test cases, 0 failures, 0 errors, 23
 | 51 | Defaults 30000 and 90000 | `ConfigurationLoader.java` defaults, `config/application.yaml` |
 | 52 | Suite 921 tests, 0 failures, 23 skipped | R15 |
 | 53 | The published `latest` image is the 1.0.0 revision `dba39a4`; the cluster features reach it on the next push | R1 (`docker image inspect` label); `git log dba39a4..HEAD` lists the cluster commits; `docker-compose.yml` uses `build: .` |
+
+## Google look (added after commit f32fc1e)
+
+`path:line` below cites the tree with the UI restyle applied on 2026-09-02.
+
+R16. Assets regenerated with `assets/seed.sh` (stats after seeding: `{"documentCount":43,"vocabularySize":7155,"averageDocumentLength":4532,"version":"1.0"}`), `assets/capture.cjs` in the Playwright container and `assets/make-gif.py`, then measured with Pillow:
+```
+assets/hero-dark.png      (1280, 800)   110424 bytes
+assets/hero-dark@2x.png   (2560, 1600)  272320 bytes
+assets/hero-light.png     (1280, 800)   107300 bytes
+assets/hero-light@2x.png  (2560, 1600)  266113 bytes
+assets/scenes/1-home.png .. 6-why-this-result.png  (1280, 800) each
+assets/demo.gif           (960, 600)    222235 bytes  6 frames  18.0 s
+```
+
+R17. `gh repo view Yasser-Ameur/minigoogle --json description,homepageUrl,repositoryTopics` before any About box was set:
+```
+{"description":"","homepageUrl":"","repositoryTopics":null}
+```
+
+| # | Claim | Evidence |
+|---|---|---|
+| 68 | The layout and colours are google.com's own: Arial, a white or `#202124` ground, blue titles, grey snippets, a pill search box, the four brand colours only in the wordmark | `frontend/src/styles.css:5,32,73,140-143,258,262` (`--bg: #ffffff`, dark `--bg: #202124`, `font: 400 14px/1.58 var(--font)` with `--font: arial, sans-serif`, `.l-b/.l-r/.l-y/.l-g` on the wordmark, `.result__title a { color: var(--link) }` with `--link: #1a0dab`, `.result__snippet { color: var(--text-2) }`); `frontend/src/components/SearchBox.css:5-9` (`height: 46px; border-radius: 24px`); hero-dark and hero-light in R16 |
+| 12 (revised) | UI has System/Light/Dark theme switch | `App.jsx:56` `ThemeToggle`; visible in hero-dark and hero-light (R16) |
+| 10, 11 (re-measured) | Hero and GIF as described | R16 replaces R11; `capture.cjs` and `make-gif.py` unchanged |
+| 69 | About box description | README line 3, the first sentence cut before its cluster clause: `A search engine you run yourself: crawl pages into it, query them over HTTP or in the bundled web UI`; no repo name, no trailing period |
+| 70 | About box website | `https://github.com/Yasser-Ameur/minigoogle/pkgs/container/minigoogle`, the image the try-it names; R1 (HTTP 200). No docs site exists in the tree |
+| 71 | About box topics | `java` (`build.gradle.kts:41-42` toolchain 21, row 1), `gradle` (`gradlew`), `search-engine` and `information-retrieval` (rows 2, 14; `corpusEval` BEIR harness, R10), `inverted-index` (`src/main/java/com/minigoogle/indexer`), `bm25` and `pagerank` (`bm25Score`, `pageRankScore` in R4), `raft` (row 3, `RaftConsensus.java`), `gossip-protocol` (`getGossip()` in `ClusterNodeSnapshotIntegrationTest.java`), `consistent-hashing` (row 3, `ClusterTest.testConsistentHashRingGetNodes`), `react` (`frontend/package.json` react 18), `docker` (`Dockerfile`, row 8). 12 topics, all lowercase with hyphens, under 50 characters |
+| 72 | The About box is unset until the user runs the command in the final report | R17 |

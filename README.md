@@ -83,7 +83,7 @@ The walkthrough above, one still per step: the home page with the index count; a
 
 ## What the demo opened
 
-The page at `/` is a React 18 single-file build served by the Java process (`src/main/resources/demo/index.html`). It has a search box with suggestions from `/api/v1/suggest`, a results list where every hit can expand a "Why this result" panel with its BM25, PageRank and combined score, an "Add a URL to the index" box that asks for the API key on a 401 and remembers it, and a System / Light / Dark theme switch. The hero above is the same page in dark and light.
+The page at `/` is a React 18 single-file build served by the Java process (`src/main/resources/demo/index.html`). It has a search box with suggestions from `/api/v1/suggest`, a results list where every hit can expand a "Why this result" panel with its BM25, PageRank and combined score, an "Add a URL to the index" box that asks for the API key on a 401 and remembers it, and a System / Light / Dark theme switch. The layout and colours are google.com's own: Arial, a white or `#202124` ground, blue titles, grey snippets, a pill search box, and the four brand colours only in the wordmark (`frontend/src/styles.css`). The hero above is the same page in dark and light.
 
 ## How it works
 
