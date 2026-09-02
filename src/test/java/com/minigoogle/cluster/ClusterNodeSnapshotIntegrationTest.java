@@ -140,8 +140,11 @@ class ClusterNodeSnapshotIntegrationTest {
             List<ClusterNode> cluster = List.of(node1, node2, node3);
             assertTrue(waitUntil(() -> allLiveSetsConverged(cluster), CONVERGENCE_DEADLINE_MS),
                     "Gossip did not converge");
+            // stableLeaderAmong() returns once one node has led alone for
+            // 800 ms; sampling the leader count again right after it can
+            // land inside a term change (4 of 5 half-CPU runs did) and says
+            // nothing the poll has not already said.
             stableLeaderAmong(cluster, 800);
-            assertTrue(exactlyOneLeader(cluster), "Leadership must be stable before any write");
 
             // A leader that has held for 800 ms can still lose its term during
             // the burst: on a loaded runner a heartbeat arrives after a
@@ -321,12 +324,6 @@ class ClusterNodeSnapshotIntegrationTest {
         return true;
     }
 
-    private boolean exactlyOneLeader(List<ClusterNode> nodes) {
-        return nodes.stream()
-                .filter(n -> n.getRaft().getState() == RaftConsensus.RaftState.LEADER)
-                .count() == 1;
-    }
-
     private ClusterNode leaderAmong(List<ClusterNode> nodes) {
         for (ClusterNode node : nodes) {
             if (node.getRaft().getState() == RaftConsensus.RaftState.LEADER) {
@@ -362,9 +359,11 @@ class ClusterNodeSnapshotIntegrationTest {
     /**
      * Writes through whichever node is currently leader, retrying across
      * leadership changes until the write commits or the deadline passes.
+     * One attempt can itself block for ClusterNode's 10 s operation timeout,
+     * so the budget is the longer catch-up deadline, not the convergence one.
      */
     private void putThroughLeader(List<ClusterNode> nodes, String key, byte[] value) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + CONVERGENCE_DEADLINE_MS;
+        long deadline = System.currentTimeMillis() + CATCH_UP_DEADLINE_MS;
         while (System.currentTimeMillis() < deadline) {
             ClusterNode leader = leaderAmong(nodes);
             if (leader != null) {
