@@ -21,8 +21,15 @@ public record SearchResponse(
         List<SearchResult> results,
         String didYouMean,
         double maxPageRank,
-        double maxDocLength
+        double maxDocLength,
+        int page,
+        int pageSize
 ) {
+    public SearchResponse(long executionTimeMs, int totalResults, List<SearchResult> results,
+                           String didYouMean, double maxPageRank, double maxDocLength) {
+        this(executionTimeMs, totalResults, results, didYouMean, maxPageRank, maxDocLength, 1, results.size());
+    }
+
     public SearchResponse(long executionTimeMs, int totalResults, List<SearchResult> results, String didYouMean) {
         this(executionTimeMs, totalResults, results, didYouMean, 0.0, 0.0);
     }

@@ -138,13 +138,6 @@ public class MiniGoogleApp {
         // they survive a restart; the demo corpus is the seed, not the state.
         crawledDocumentStore = CrawledDocumentStore.open(indexPath.resolve("crawled-documents.jsonl"));
         allDocs.addAll(crawledDocumentStore.readAll());
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                crawledDocumentStore.close();
-            } catch (IOException e) {
-                System.err.println("Failed to close crawled document store: " + e.getMessage());
-            }
-        }, "crawled-store-close"));
         reindex();
         System.out.println("done (" + allDocs.size() + " documents)");
 
@@ -165,29 +158,31 @@ public class MiniGoogleApp {
         server.getHtml("/", req -> html);
 
         server.post("/api/v1/search", body -> {
+            SearchRequest request;
             try {
-                SearchRequest request = JsonSerializer.fromJson(body, SearchRequest.class);
-                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
-                    return JsonSerializer.toJson(new SearchResponse(0, 0, List.of()));
-                }
-                long start = System.currentTimeMillis();
-                int topK = config.getInt("search.topK", 20);
-                int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
-                // A SEARCH-mode node returns its candidate set with raw
-                // features for coordinator-side global ranking; a standalone
-                // node returns fully ranked results.
-                long startNanos = System.nanoTime();
-                SearchResponse response = "SEARCH".equals(nodeType)
-                        ? gatherCandidateResults(request.query().trim(), pageSize)
-                        : executeSearch(request.query().trim(), pageSize);
-                metrics.observeSearch(System.nanoTime() - startNanos, response.results().size());
-                long elapsed = System.currentTimeMillis() - start;
-                return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(),
-                        response.results(), response.didYouMean(),
-                        response.maxPageRank(), response.maxDocLength()));
+                request = JsonSerializer.fromJson(body, SearchRequest.class);
             } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+                throw new HttpError(400, "BAD_REQUEST", "Malformed JSON body");
             }
+            if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                return JsonSerializer.toJson(new SearchResponse(0, 0, List.of()));
+            }
+            long start = System.currentTimeMillis();
+            int topK = config.getInt("search.topK", 20);
+            int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
+            int page = request.page() > 0 ? request.page() : 1;
+            // A SEARCH-mode node returns its candidate set with raw
+            // features for coordinator-side global ranking; a standalone
+            // node returns fully ranked results.
+            long startNanos = System.nanoTime();
+            SearchResponse response = "SEARCH".equals(nodeType)
+                    ? gatherCandidateResults(request.query().trim(), pageSize)
+                    : executeSearch(request.query().trim(), page, pageSize);
+            metrics.observeSearch(System.nanoTime() - startNanos, response.results().size());
+            long elapsed = System.currentTimeMillis() - start;
+            return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(),
+                    response.results(), response.didYouMean(),
+                    response.maxPageRank(), response.maxDocLength(), response.page(), response.pageSize()));
         });
 
         server.getWithContentType("/api/v1/health", "application/json", req -> healthJson(true));
@@ -201,7 +196,7 @@ public class MiniGoogleApp {
         });
         server.getWithContentType("/api/v1/version", "application/json",
             req -> JsonSerializer.toJson(Map.of("version", Version.current())));
-        server.getWithContentType("/metrics", "text/plain; version=0.0.4; charset=utf-8", req -> metrics.scrape());
+        server.getProtected("/metrics", "text/plain; version=0.0.4; charset=utf-8", req -> metrics.scrape());
 
         // Autocomplete with spell correction fallback
         server.getWithContentType("/api/v1/suggest", "application/json", req -> {
@@ -226,8 +221,6 @@ public class MiniGoogleApp {
                 }
                 sb.append("]");
                 return sb.toString();
-            } catch (Exception e) {
-                return "[]";
             }
         });
 
@@ -244,46 +237,45 @@ public class MiniGoogleApp {
                     "\"averageDocumentLength\":" + state.metadata().averageDocumentLength() + "," +
                     "\"version\":\"" + state.metadata().version() + "\"" +
                     "}";
-            } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage() + "\"}";
             }
         });
 
         // Query analytics
         server.getWithContentType("/api/v1/analytics", "application/json", req -> {
-            try {
-                var top = analytics.getTopQueries(5);
-                StringBuilder topJson = new StringBuilder("[");
-                for (int i = 0; i < top.size(); i++) {
-                    if (i > 0) topJson.append(",");
-                    topJson.append("{\"query\":\"").append(top.get(i).getKey().replace("\"", "\\\""))
-                           .append("\",\"count\":").append(top.get(i).getValue()).append("}");
-                }
-                topJson.append("]");
-                return "{" +
-                    "\"totalQueries\":" + analytics.getTotalQueries() + "," +
-                    "\"averageLatencyMs\":" + analytics.getAverageLatencyMs() + "," +
-                    "\"zeroResultRate\":" + analytics.getZeroResultRate() + "," +
-                    "\"uniqueQueryCount\":" + analytics.uniqueQueryCount() + "," +
-                    "\"topQueries\":" + topJson +
-                    "}";
-            } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage() + "\"}";
+            var top = analytics.getTopQueries(5);
+            StringBuilder topJson = new StringBuilder("[");
+            for (int i = 0; i < top.size(); i++) {
+                if (i > 0) topJson.append(",");
+                topJson.append("{\"query\":\"").append(top.get(i).getKey().replace("\"", "\\\""))
+                       .append("\",\"count\":").append(top.get(i).getValue()).append("}");
             }
+            topJson.append("]");
+            return "{" +
+                "\"totalQueries\":" + analytics.getTotalQueries() + "," +
+                "\"averageLatencyMs\":" + analytics.getAverageLatencyMs() + "," +
+                "\"zeroResultRate\":" + analytics.getZeroResultRate() + "," +
+                "\"uniqueQueryCount\":" + analytics.uniqueQueryCount() + "," +
+                "\"topQueries\":" + topJson +
+                "}";
         });
 
         // Click feedback: record a user click for learning-to-rank training.
         // The frontend reports the clicked URL (no documentId), so the document
         // is resolved from the local corpus when documentId is absent.
         server.post("/api/v1/click", body -> {
+            ClickRequest request;
+            try {
+                request = JsonSerializer.fromJson(body, ClickRequest.class);
+            } catch (Exception e) {
+                throw new HttpError(400, "BAD_REQUEST", "Malformed JSON body");
+            }
+            if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                throw new HttpError(400, "BAD_REQUEST", "Missing query");
+            }
             try (ConcurrentIndex.Lease<IndexState> lease = currentIndex.lease()) {
-                ClickRequest request = JsonSerializer.fromJson(body, ClickRequest.class);
-                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
-                    return "{\"success\":false,\"error\":\"Missing query\"}";
-                }
                 IndexState state = lease.value();
                 if (state == null) {
-                    return "{\"success\":false,\"error\":\"No index available\"}";
+                    throw new HttpError(503, "NOT_READY", "No index available");
                 }
                 int documentId = request.documentId();
                 String url = request.url() != null ? request.url().trim() : "";
@@ -294,7 +286,7 @@ public class MiniGoogleApp {
                     }
                 }
                 if (documentId <= 0) {
-                    return "{\"success\":false,\"error\":\"Click does not match a local document\"}";
+                    throw new HttpError(400, "BAD_REQUEST", "Click does not match a local document");
                 }
                 if (url.isEmpty()) {
                     url = state.docUrls().getOrDefault(documentId, "");
@@ -310,8 +302,6 @@ public class MiniGoogleApp {
                 }
                 return "{\"success\":true,\"documentId\":" + documentId
                         + ",\"position\":" + position + ",\"trainedPairs\":" + trainedPairs + "}";
-            } catch (Exception e) {
-                return "{\"success\":false,\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
             }
         });
 
@@ -340,8 +330,6 @@ public class MiniGoogleApp {
                     "\"clicks\":" + (state != null && state.clickTracker() != null ? state.clickTracker().clickCount() : 0) + "," +
                     "\"impressions\":" + (state != null && state.clickTracker() != null ? state.clickTracker().impressionCount() : 0) +
                     "}";
-            } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage() + "\"}";
             }
         });
 
@@ -396,53 +384,62 @@ public class MiniGoogleApp {
                 }
                 sb.append("]");
                 return sb.toString();
-            } catch (Exception e) {
-                return "[]";
             }
         });
 
         // Crawl endpoint: fetch a URL and add to index
         server.postProtected("/api/v1/crawl", body -> {
+            Map req;
             try {
-                var req = JsonSerializer.fromJson(body, Map.class);
-                String url = req != null ? (String) req.get("url") : null;
-                if (url == null || url.trim().isEmpty()) {
-                    return "{\"success\":false,\"error\":\"Missing URL\"}";
-                }
-                url = url.trim();
-                if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                    url = "https://" + url;
-                }
+                req = JsonSerializer.fromJson(body, Map.class);
+            } catch (Exception e) {
+                throw new HttpError(400, "BAD_REQUEST", "Malformed JSON body");
+            }
+            String url = req != null ? (String) req.get("url") : null;
+            if (url == null || url.trim().isEmpty()) {
+                throw new HttpError(400, "BAD_REQUEST", "Missing URL");
+            }
+            url = url.trim();
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                url = "https://" + url;
+            }
 
-                HttpDownloader downloader = new HttpDownloader();
-                JSoupHtmlParser parser = new JSoupHtmlParser();
-                UrlTask task = new UrlTask(url, URI.create(url).getHost(), 0, java.time.Instant.now());
-                DownloadedPage page = downloader.download(task);
-                if (page == null) {
-                    return "{\"success\":false,\"error\":\"Failed to fetch URL\"}";
-                }
+            URI uri;
+            try {
+                uri = URI.create(url);
+            } catch (IllegalArgumentException e) {
+                throw new HttpError(400, "BAD_REQUEST", "Malformed URL");
+            }
 
-                Optional<ParsedDocument> parsed = parser.parse(page);
-                if (parsed.isEmpty()) {
-                    return "{\"success\":false,\"error\":\"Failed to parse page\"}";
-                }
+            HttpDownloader downloader = new HttpDownloader();
+            JSoupHtmlParser parser = new JSoupHtmlParser();
+            UrlTask task = new UrlTask(url, uri.getHost(), 0, java.time.Instant.now());
+            DownloadedPage page = downloader.download(task);
+            if (page == null) {
+                throw new HttpError(502, "FETCH_FAILED", "Failed to fetch URL");
+            }
 
-                ParsedDocument doc = parsed.get();
-                synchronized (indexLock) {
+            Optional<ParsedDocument> parsed = parser.parse(page);
+            if (parsed.isEmpty()) {
+                throw new HttpError(422, "PARSE_FAILED", "Failed to parse page");
+            }
+
+            ParsedDocument doc = parsed.get();
+            synchronized (indexLock) {
+                try {
                     crawledDocumentStore.append(doc);
                     allDocs.add(doc);
                     reindex();
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to persist crawled document", e);
                 }
-
-                String title = doc.title() != null && !doc.title().isEmpty() ? doc.title() : url;
-                return "{\"success\":true,\"title\":\"" + title.replace("\"", "\\\"") + "\",\"url\":\"" + url.replace("\"", "\\\"") + "\"}";
-            } catch (Exception e) {
-                return "{\"success\":false,\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
             }
+
+            String title = doc.title() != null && !doc.title().isEmpty() ? doc.title() : url;
+            return "{\"success\":true,\"title\":\"" + title.replace("\"", "\\\"") + "\",\"url\":\"" + url.replace("\"", "\\\"") + "\"}";
         });
 
         server.start();
-        Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "rest-server-stop"));
 
         if ("SEARCH".equals(nodeType)) {
             registerWithCluster(port);
@@ -451,6 +448,27 @@ public class MiniGoogleApp {
         if ("CLUSTER".equals(nodeType)) {
             startClusterRuntime(server);
         }
+
+        // A single hook, in a fixed order: stop taking new requests and drain
+        // in-flight ones first, then close the state those requests could
+        // still be writing to. Two separate hooks race in unspecified order,
+        // so a crawl in flight when the JVM exits could write to an
+        // already-closed store; this can't.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            server.stop();
+            try {
+                crawledDocumentStore.close();
+            } catch (IOException e) {
+                System.err.println("Failed to close crawled document store: " + e.getMessage());
+            }
+            if (clusterNode != null) {
+                try {
+                    clusterNode.stop();
+                } catch (RuntimeException e) {
+                    System.err.println("Cluster node shutdown failed: " + e.getMessage());
+                }
+            }
+        }, "minigoogle-shutdown"));
 
         Thread.currentThread().join();
     }
@@ -534,13 +552,8 @@ public class MiniGoogleApp {
 
         registerClusterEndpoints(server);
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                clusterNode.stop();
-            } catch (RuntimeException e) {
-                System.err.println("Cluster node shutdown failed: " + e.getMessage());
-            }
-        }, "cluster-shutdown"));
+        // Shutdown for the cluster runtime is handled by the single combined
+        // hook registered in start(), once this.clusterNode is set.
 
         System.out.println("Cluster node " + nodeId + " participating on port " + clusterPort
                 + " with peers " + directory.nodeIds());
@@ -651,37 +664,40 @@ public class MiniGoogleApp {
         server.getHtml("/", req -> html);
 
         server.post("/api/v1/search", body -> {
+            SearchRequest request;
             try {
-                SearchRequest request = JsonSerializer.fromJson(body, SearchRequest.class);
-                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
-                    return JsonSerializer.toJson(new SearchResponse(0, 0, List.of()));
-                }
-                int topK = config.getInt("search.topK", 20);
-                int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
-                long start = System.currentTimeMillis();
-                long timeoutMs = config.getLong("search.timeoutMs", 5000);
-                List<com.minigoogle.network.dto.SearchResult> results =
-                        searchCoordinator.search(request.query().trim(), pageSize, timeoutMs);
-                long elapsed = System.currentTimeMillis() - start;
-                coordinatorAnalytics.recordQuery(request.query().trim(), results.size(), elapsed);
-                return JsonSerializer.toJson(new SearchResponse(elapsed, results.size(), results));
+                request = JsonSerializer.fromJson(body, SearchRequest.class);
             } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+                throw new HttpError(400, "BAD_REQUEST", "Malformed JSON body");
             }
+            if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                return JsonSerializer.toJson(new SearchResponse(0, 0, List.of()));
+            }
+            int topK = config.getInt("search.topK", 20);
+            int pageSize = request.pageSize() > 0 ? request.pageSize() : topK;
+            int page = request.page() > 0 ? request.page() : 1;
+            long start = System.currentTimeMillis();
+            long timeoutMs = config.getLong("search.timeoutMs", 5000);
+            // The coordinator's shared SearchCoordinator only accepts a page
+            // size, not an offset, so a page beyond 1 cannot be served here
+            // without changing that (out-of-scope, distributed package) API;
+            // the requested page/pageSize are still echoed on the response.
+            List<com.minigoogle.network.dto.SearchResult> results =
+                    searchCoordinator.search(request.query().trim(), pageSize, timeoutMs);
+            long elapsed = System.currentTimeMillis() - start;
+            coordinatorAnalytics.recordQuery(request.query().trim(), results.size(), elapsed);
+            return JsonSerializer.toJson(new SearchResponse(elapsed, results.size(), results,
+                    null, 0.0, 0.0, page, pageSize));
         });
 
         server.getWithContentType("/api/v1/health", "application/json", req -> healthJson(false));
+        server.getWithContentType("/api/v1/health/ready", "application/json", req -> healthJson(false));
         server.getWithContentType("/api/v1/version", "application/json",
             req -> JsonSerializer.toJson(Map.of("version", Version.current())));
-        server.getWithContentType("/metrics", "text/plain; version=0.0.4; charset=utf-8", req -> metrics.scrape());
+        server.getProtected("/metrics", "text/plain; version=0.0.4; charset=utf-8", req -> metrics.scrape());
 
-        server.getWithContentType("/api/v1/cluster/state", "application/json", req -> {
-            try {
-                return JsonSerializer.toJson(clusterCoordinator.getState());
-            } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage() + "\"}";
-            }
-        });
+        server.getWithContentType("/api/v1/cluster/state", "application/json", req ->
+                JsonSerializer.toJson(clusterCoordinator.getState()));
 
         // The shared frontend is served from every node type, so the coordinator
         // must register the routes the UI calls. Suggest/stats have no local
@@ -693,79 +709,74 @@ public class MiniGoogleApp {
             "{\"documentCount\":0,\"vocabularySize\":0,\"averageDocumentLength\":0,\"version\":\"\"}");
 
         server.getWithContentType("/api/v1/analytics", "application/json", req -> {
-            try {
-                var top = coordinatorAnalytics.getTopQueries(5);
-                StringBuilder topJson = new StringBuilder("[");
-                for (int i = 0; i < top.size(); i++) {
-                    if (i > 0) topJson.append(",");
-                    topJson.append("{\"query\":\"").append(top.get(i).getKey().replace("\"", "\\\""))
-                           .append("\",\"count\":").append(top.get(i).getValue()).append("}");
-                }
-                topJson.append("]");
-                return "{" +
-                    "\"totalQueries\":" + coordinatorAnalytics.getTotalQueries() + "," +
-                    "\"averageLatencyMs\":" + coordinatorAnalytics.getAverageLatencyMs() + "," +
-                    "\"zeroResultRate\":" + coordinatorAnalytics.getZeroResultRate() + "," +
-                    "\"uniqueQueryCount\":" + coordinatorAnalytics.uniqueQueryCount() + "," +
-                    "\"topQueries\":" + topJson +
-                    "}";
-            } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage() + "\"}";
+            var top = coordinatorAnalytics.getTopQueries(5);
+            StringBuilder topJson = new StringBuilder("[");
+            for (int i = 0; i < top.size(); i++) {
+                if (i > 0) topJson.append(",");
+                topJson.append("{\"query\":\"").append(top.get(i).getKey().replace("\"", "\\\""))
+                       .append("\",\"count\":").append(top.get(i).getValue()).append("}");
             }
+            topJson.append("]");
+            return "{" +
+                "\"totalQueries\":" + coordinatorAnalytics.getTotalQueries() + "," +
+                "\"averageLatencyMs\":" + coordinatorAnalytics.getAverageLatencyMs() + "," +
+                "\"zeroResultRate\":" + coordinatorAnalytics.getZeroResultRate() + "," +
+                "\"uniqueQueryCount\":" + coordinatorAnalytics.uniqueQueryCount() + "," +
+                "\"topQueries\":" + topJson +
+                "}";
         });
 
-        server.postProtected("/api/v1/crawl", body ->
-            "{\"success\":false,\"error\":\"Coordinator node does not host a local index; add URLs on a standalone or SEARCH-mode node\"}");
+        server.postProtected("/api/v1/crawl", body -> {
+            throw new HttpError(501, "NOT_SUPPORTED",
+                    "Coordinator node does not host a local index; add URLs on a standalone or SEARCH-mode node");
+        });
 
         // Click feedback: the coordinator attributes the click to its served
         // impression and retrains the shared ranking model when enough new
         // clicks have accumulated.
         server.post("/api/v1/click", body -> {
+            ClickRequest request;
             try {
-                ClickRequest request = JsonSerializer.fromJson(body, ClickRequest.class);
-                if (request == null || request.query() == null || request.query().trim().isEmpty()) {
-                    return "{\"success\":false,\"error\":\"Missing query\"}";
-                }
-                String url = request.url() != null && !request.url().isEmpty()
-                        ? request.url() : null;
-                int position = request.position() > 0 ? request.position() : 1;
-                int trainedPairs = searchCoordinator.recordClick(
-                        request.query().trim(), url, position, request.sessionId());
-                int docId = searchCoordinator.resolveDocId(url);
-                return "{\"success\":true,\"documentId\":" + docId
-                        + ",\"position\":" + position + ",\"trainedPairs\":" + trainedPairs + "}";
+                request = JsonSerializer.fromJson(body, ClickRequest.class);
             } catch (Exception e) {
-                return "{\"success\":false,\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+                throw new HttpError(400, "BAD_REQUEST", "Malformed JSON body");
             }
+            if (request == null || request.query() == null || request.query().trim().isEmpty()) {
+                throw new HttpError(400, "BAD_REQUEST", "Missing query");
+            }
+            String url = request.url() != null && !request.url().isEmpty()
+                    ? request.url() : null;
+            int position = request.position() > 0 ? request.position() : 1;
+            int trainedPairs = searchCoordinator.recordClick(
+                    request.query().trim(), url, position, request.sessionId());
+            int docId = searchCoordinator.resolveDocId(url);
+            return "{\"success\":true,\"documentId\":" + docId
+                    + ",\"position\":" + position + ",\"trainedPairs\":" + trainedPairs + "}";
         });
 
         // Learning-to-rank model and click statistics for the coordinator.
         server.getWithContentType("/api/v1/ml/stats", "application/json", req -> {
-            try {
-                FeatureName[] names = FeatureName.values();
-                StringBuilder featuresJson = new StringBuilder("[");
-                for (int i = 0; i < names.length; i++) {
-                    if (i > 0) featuresJson.append(",");
-                    featuresJson.append("\"").append(names[i].name()).append("\"");
-                }
-                featuresJson.append("]");
-                double[] weights = searchCoordinator.modelWeights();
-                StringBuilder weightsJson = new StringBuilder("[");
-                for (int i = 0; i < weights.length; i++) {
-                    if (i > 0) weightsJson.append(",");
-                    weightsJson.append(weights[i]);
-                }
-                weightsJson.append("]");
-                return "{" +
-                    "\"ltrEnabled\":" + clickEnabled + "," +
-                    "\"features\":" + featuresJson + "," +
-                    "\"weights\":" + weightsJson + "," +
-                    "\"clicks\":" + searchCoordinator.clickCount() + "," +
-                    "\"impressions\":" + searchCoordinator.impressionCount() +
-                    "}";
-            } catch (Exception e) {
-                return "{\"error\":\"" + e.getMessage() + "\"}";
+            FeatureName[] names = FeatureName.values();
+            StringBuilder featuresJson = new StringBuilder("[");
+            for (int i = 0; i < names.length; i++) {
+                if (i > 0) featuresJson.append(",");
+                featuresJson.append("\"").append(names[i].name()).append("\"");
             }
+            featuresJson.append("]");
+            double[] weights = searchCoordinator.modelWeights();
+            StringBuilder weightsJson = new StringBuilder("[");
+            for (int i = 0; i < weights.length; i++) {
+                if (i > 0) weightsJson.append(",");
+                weightsJson.append(weights[i]);
+            }
+            weightsJson.append("]");
+            return "{" +
+                "\"ltrEnabled\":" + clickEnabled + "," +
+                "\"features\":" + featuresJson + "," +
+                "\"weights\":" + weightsJson + "," +
+                "\"clicks\":" + searchCoordinator.clickCount() + "," +
+                "\"impressions\":" + searchCoordinator.impressionCount() +
+                "}";
         });
 
         server.start();
@@ -915,12 +926,32 @@ public class MiniGoogleApp {
         return com.minigoogle.query.lexer.QueryKey.canonicalize(query);
     }
 
-    private SearchResponse executeSearch(String query, int pageSize) {
-        // Check cache
-        List<com.minigoogle.network.dto.SearchResult> cachedResults = queryCache.get(cacheKey(query));
+    /**
+     * Returns the {@code [offset, offset + pageSize)} slice of {@code items},
+     * or an empty list once {@code offset} runs past the end. Kept as a pure,
+     * package-visible helper so pagination math is unit-testable without a
+     * live index or server.
+     */
+    static <T> List<T> paginate(List<T> items, int offset, int pageSize) {
+        if (offset >= items.size()) {
+            return List.of();
+        }
+        int end = Math.min(items.size(), offset + pageSize);
+        return items.subList(offset, end);
+    }
+
+    private SearchResponse executeSearch(String query, int page, int pageSize) {
+        int offset = (page - 1) * pageSize;
+        int depth = offset + pageSize;
+
+        // The cache holds only the first page's result set (as before this
+        // endpoint supported paging at all); later pages always recompute at
+        // the deeper retrieval depth they need.
+        List<com.minigoogle.network.dto.SearchResult> cachedResults = page == 1 ? queryCache.get(cacheKey(query)) : null;
         if (cachedResults != null) {
             eventBus.publish(new QueryExecutedEvent(query, cachedResults.size(), 0, true));
-            return new SearchResponse(0, cachedResults.size(), cachedResults);
+            return new SearchResponse(0, cachedResults.size(), paginate(cachedResults, offset, pageSize),
+                    null, 0.0, 0.0, page, pageSize);
         }
 
         long start = System.currentTimeMillis();
@@ -932,17 +963,21 @@ public class MiniGoogleApp {
             IndexState state = lease.value();
             if (state == null) {
                 eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
-                return new SearchResponse(0, 0, List.of());
+                return new SearchResponse(0, 0, List.of(), null, 0.0, 0.0, page, pageSize);
             }
             SearchEngine searchEngine = state.engine();
 
-            RetrievalResult retrieval = searchEngine.retrieveCandidates(query, pageSize);
+            // Retrieve deep enough to cover this page; totalResults reflects
+            // matches found within that depth (the retrieval API has no
+            // separate exhaustive-count query), same convention the
+            // single-page endpoint used before paging existed.
+            RetrievalResult retrieval = searchEngine.retrieveCandidates(query, depth);
             List<RankedDocument> ranked = retrieval.ranked();
             String didYouMean = retrieval.didYouMean();
 
             if (ranked.isEmpty()) {
                 eventBus.publish(new QueryExecutedEvent(query, 0, System.currentTimeMillis() - start, false));
-                return new SearchResponse(0, 0, List.of(), didYouMean);
+                return new SearchResponse(0, 0, List.of(), didYouMean, 0.0, 0.0, page, pageSize);
             }
 
             // Learning-to-rank re-rank: score each candidate with the shared
@@ -1057,11 +1092,27 @@ public class MiniGoogleApp {
         return report.build().toJson();
     }
 
+    /** Minimum length required for a configured {@code security.apiKey}. */
+    static final int MIN_API_KEY_LENGTH = 16;
+
+    /**
+     * Fails startup if a configured API key is too short to be a meaningful
+     * secret. A blank key (admin routes left open) is a separate, allowed
+     * choice and does not go through this check.
+     */
+    static void validateApiKey(String apiKey) {
+        if (!apiKey.isEmpty() && apiKey.length() < MIN_API_KEY_LENGTH) {
+            throw new IllegalStateException(
+                    "security.apiKey must be at least " + MIN_API_KEY_LENGTH + " characters");
+        }
+    }
+
     private ServerOptions serverOptions() {
         String apiKey = config.get("security.apiKey", "").trim();
         if (apiKey.isEmpty()) {
             System.out.println("WARNING: security.apiKey is unset; admin routes such as POST /api/v1/crawl are open. Set MINIGOGLE_API_KEY.");
         }
+        validateApiKey(apiKey);
         return new ServerOptions(
             config.getInt("server.maxThreads", 64),
             config.getLong("server.maxBodyBytes", 1_048_576L),
