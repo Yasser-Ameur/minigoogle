@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -305,17 +306,20 @@ class RestServerTest {
     void requestObserverIsCalledWithRoutePattern() throws Exception {
         server = new RestServer(0, ServerOptions.defaults());
         server.get("/observed", body -> "{}");
-        List<String> routes = new ArrayList<>();
+        List<String> routes = new CopyOnWriteArrayList<>();
         AtomicInteger statuses = new AtomicInteger();
         server.setRequestObserver((route, method, status, durationNanos) -> {
-            routes.add(route);
             statuses.set(status);
+            routes.add(route);
         });
         server.start();
 
         HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/observed?x=1")).GET().build();
         client.send(req, HttpResponse.BodyHandlers.ofString());
 
+        // The observer runs in the handler's finally block, after the response
+        // is already on the wire, so the client can return first (CI, 2026-09-02).
+        awaitObserved(routes, "/observed");
         assertEquals(List.of("/observed"), routes);
         assertEquals(200, statuses.get());
     }
@@ -438,7 +442,7 @@ class RestServerTest {
     void unmatchedPathReturns404AndRootStillServesQueryStrings() throws Exception {
         server = new RestServer(0, ServerOptions.defaults());
         server.getHtml("/", req -> "<html>ok</html>");
-        List<String> routes = new ArrayList<>();
+        List<String> routes = new CopyOnWriteArrayList<>();
         server.setRequestObserver((route, method, status, durationNanos) -> routes.add(route));
         server.start();
 
@@ -452,7 +456,16 @@ class RestServerTest {
         assertEquals(404, unmatchedResp.statusCode());
         assertTrue(unmatchedResp.body().contains("NOT_FOUND"));
 
+        awaitObserved(routes, "unmatched");
         assertTrue(routes.contains("unmatched"));
+    }
+
+    /** Waits, bounded, for the request observer to have recorded {@code route}. */
+    private static void awaitObserved(List<String> routes, String route) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (!routes.contains(route) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
     }
 
     private int sendGet(String path) {
