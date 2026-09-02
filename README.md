@@ -104,7 +104,7 @@ Full request and response shapes and every status code per route: [`API.md`](API
 | GET | `/` | Web UI |
 | GET | `/api/v1/health` | Liveness, with the version and the document count |
 | GET | `/api/v1/health/ready` | Readiness; the probe the Docker image and the compose file call |
-| GET | `/api/v1/version` | `{"version":"1.0.0"}` |
+| GET | `/api/v1/version` | `{"version":"1.1.0"}` |
 | GET | `/metrics` | Prometheus text format 0.0.4; protected when a key is set |
 | POST | `/api/v1/search` | `{"query": "...", "page": 1, "pageSize": 10}` |
 | GET | `/api/v1/suggest?q=` | Autocomplete, a JSON array of strings |
@@ -289,7 +289,7 @@ Documents submitted through `POST /api/v1/crawl` are appended to `crawled-docume
 Two sample lines from a scrape:
 
 ```
-minigoogle_build_info{version="1.0.0"} 1
+minigoogle_build_info{version="1.1.0"} 1
 minigoogle_http_requests_total{method="POST",route="/api/v1/crawl",status="401"} 1
 ```
 
@@ -448,7 +448,7 @@ python assets/make-social.py             # 1280x640 social preview from the ligh
 - [`API.md`](API.md) and [`docs/openapi.yaml`](docs/openapi.yaml): every route, status code and schema.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): the packages and how a query moves through them.
 - [`BENCHMARKS.md`](BENCHMARKS.md) and [`ENGINEERING_FINDINGS.md`](ENGINEERING_FINDINGS.md): performance work and what was measured.
-- [`CHANGELOG.md`](CHANGELOG.md): what 1.0.0 contains.
+- [`CHANGELOG.md`](CHANGELOG.md): what each release contains.
 - [`.env.example`](.env.example): every variable, commented.
 
 ## License

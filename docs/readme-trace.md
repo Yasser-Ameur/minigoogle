@@ -23,7 +23,7 @@ $ docker run -d --name minigoogle -p 8080:8080 -v minigoogle-data:/data -e MINIG
 $ curl localhost:8080/api/v1/health/ready
 {"status":"ok","version":"1.0.0","uptimeSeconds":8,"checks":{"index":{"status":"ok","documents":20}}}   HTTP 200
 $ curl localhost:8080/api/v1/version
-{"version":"1.0.0"}   HTTP 200
+{"version":"1.1.0"}   HTTP 200 (jar built from HEAD; the published latest image still answers 1.0.0 until the v1.1.0 tag is pushed, see row 53)
 ```
 
 R3. Protected route without and with the key:
@@ -71,7 +71,7 @@ minigoogle_http_requests_total counter | minigoogle_http_request_duration_second
 minigoogle_search_duration_seconds histogram | minigoogle_search_queries_total counter
 minigoogle_search_zero_result_queries_total counter | minigoogle_index_documents gauge
 ```
-Sample: `minigoogle_build_info{version="1.0.0"} 1`, `minigoogle_http_requests_total{method="POST",route="/api/v1/crawl",status="401"} 1`.
+Sample: `minigoogle_build_info{version="1.1.0"} 1`, `minigoogle_http_requests_total{method="POST",route="/api/v1/crawl",status="401"} 1`.
 
 R7. Persistence across restart. The node held 42 seeded pages plus the PostgreSQL
 page added once through the UI (43); a second capture run submitted the same
@@ -170,7 +170,7 @@ minigoogle-data
 | 2 | Crawler, inverted index, BM25 ranking, REST API, web UI in one jar | `build.gradle.kts:105-112` jar `mini-google.jar` bundling runtime deps; R2, R3, R4 (crawl, search with `bm25Score`, UI served at `/` `MiniGoogleApp.java:158`) |
 | 3 | Optional Raft cluster with leader election and failover | R8 (`state":"LEADER"`, term 1 then term 2 on a survivor); `DeployedClusterIntegrationTest.java:183` `threeNodeClusterElectsReplicatesSurvivesLeaderLossAndRecovers` |
 | 4 | Runtime dependencies: jsoup, Jackson, Gson, ONNX Runtime, SLF4J/Logback; no web framework | `build.gradle.kts:15-31` |
-| 5 | Version 1.0.0 | `build.gradle.kts:4`; `CHANGELOG.md:6` `[1.0.0] - 2026-09-02`; R2 `/api/v1/version` |
+| 5 | Version 1.1.0 | `build.gradle.kts:4`; `CHANGELOG.md:8` `[1.1.0] - 2026-09-02`; R2 `/api/v1/version` on the jar built from HEAD |
 | 6 | Image `ghcr.io/yasser-ameur/minigoogle:latest` exists and is built from HEAD | R1 |
 | 7 | Try-it commands and their output | R2 |
 | 8 | Image defaults `INDEX_DIR=/data/index`, `VOLUME /data`, port 8080, healthcheck on `/api/v1/health/ready` | `Dockerfile:25,26,28,30-31` |
