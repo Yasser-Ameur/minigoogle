@@ -81,5 +81,6 @@ public class InternalClusterServer {
     public void registerProtectedContext(String path, HttpHandler handler, ClusterSecurity security) {
         HttpContext context = server.createContext(path, handler);
         context.getFilters().add(new AuthFilter(security));
+        context.getFilters().add(new BodyLimitFilter(BodyLimitFilter.DEFAULT_MAX_BODY_BYTES));
     }
 }
