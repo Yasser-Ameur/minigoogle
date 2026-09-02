@@ -257,6 +257,19 @@ public class GossipProtocol {
     }
 
     /**
+     * Returns all nodes currently marked as SUSPECT.
+     */
+    public List<String> getSuspectNodes() {
+        List<String> suspects = new ArrayList<>();
+        for (Map.Entry<String, GossipNodeState> entry : membershipTable.entrySet()) {
+            if (entry.getValue().status() == NodeStatus.SUSPECT) {
+                suspects.add(entry.getKey());
+            }
+        }
+        return suspects;
+    }
+
+    /**
      * Returns the number of nodes in the membership table.
      */
     public int memberCount() {
@@ -267,36 +280,54 @@ public class GossipProtocol {
         heartbeat();
         checkForFailures();
 
+        if (transport == null) {
+            return;
+        }
+
         List<String> peers = getLiveNodes();
         peers.remove(nodeId);
-        if (peers.isEmpty()) return;
+        if (!peers.isEmpty()) {
+            // Pick a random live peer to exchange state with
+            exchangeWith(peers.get(random.nextInt(peers.size())));
+        }
 
-        // Pick a random live peer to exchange state with
-        String peer = peers.get(random.nextInt(peers.size()));
+        // Also probe a random SUSPECT peer each round, so a peer that has
+        // recovered is revived within one round rather than waiting for it
+        // to gossip to us first.
+        List<String> suspects = getSuspectNodes();
+        if (!suspects.isEmpty()) {
+            exchangeWith(suspects.get(random.nextInt(suspects.size())));
+        }
+    }
 
-        if (transport != null) {
-            transport.exchangeState(peer, Map.copyOf(membershipTable))
-                    .thenAccept(ack -> {
-                        // The peer answered, so it is alive right now: refresh
-                        // its liveness so a bootstrapping/rejoining node does
-                        // not fail-detect the very seed it is converging with.
-                        GossipNodeState current = membershipTable.get(peer);
-                        if (current != null) {
-                            boolean rejoined = current.status() != NodeStatus.ALIVE;
-                            membershipTable.put(peer, new GossipNodeState(
-                                    peer, current.heartbeatCounter(), NodeStatus.ALIVE, System.currentTimeMillis()));
-                            if (rejoined) {
-                                for (MembershipListener l : listeners) {
-                                    l.onNodeJoined(peer);
-                                }
+    private void exchangeWith(String peer) {
+        transport.exchangeState(peer, Map.copyOf(membershipTable))
+                .thenAccept(responderStates -> {
+                    // The peer answered, so it is alive right now: refresh
+                    // its liveness so a bootstrapping/rejoining node does
+                    // not fail-detect the very seed it is converging with.
+                    GossipNodeState current = membershipTable.get(peer);
+                    if (current != null) {
+                        boolean rejoined = current.status() != NodeStatus.ALIVE;
+                        membershipTable.put(peer, new GossipNodeState(
+                                peer, current.heartbeatCounter(), NodeStatus.ALIVE, System.currentTimeMillis()));
+                        if (rejoined) {
+                            for (MembershipListener l : listeners) {
+                                l.onNodeJoined(peer);
                             }
                         }
-                    })
-                    .exceptionally(ex -> {
-                        // On failure, rely on normal failure detection
-                        return null;
-                    });
-        }
+                    }
+                    // Push-pull: merge the responder's own view back in, so
+                    // membership converges in one exchange rather than
+                    // waiting on the responder's own next round.
+                    if (responderStates != null && !responderStates.isEmpty()) {
+                        receiveGossip(peer, responderStates);
+                    }
+                })
+                .exceptionally(ex -> {
+                    // On failure, rely on normal failure detection
+                    return null;
+                });
     }
 
     public enum NodeStatus {

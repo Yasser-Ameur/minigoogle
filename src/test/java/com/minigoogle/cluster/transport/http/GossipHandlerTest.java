@@ -6,6 +6,7 @@ import com.minigoogle.cluster.GossipProtocol;
 import com.minigoogle.cluster.GossipProtocol.GossipNodeState;
 import com.minigoogle.cluster.GossipProtocol.NodeStatus;
 import com.minigoogle.cluster.transport.ClusterProtocol;
+import com.minigoogle.cluster.transport.NodeDirectory;
 import com.minigoogle.cluster.transport.dto.GossipExchangeRequest;
 import com.minigoogle.cluster.transport.dto.GossipExchangeResponse;
 import com.sun.net.httpserver.HttpContext;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -78,6 +80,51 @@ class GossipHandlerTest {
         assertEquals("corr-456", body.correlationId());
         assertEquals("local-node", body.sourceNodeId());
         assertTrue(body.accepted());
+    }
+
+    @Test
+    void testResponseCarriesResponderStateForPushPull() throws Exception {
+        // The responder already knows about "peer-2", which the requester
+        // has never heard of.
+        gossip.receiveGossip("peer-2", Map.of(
+                "peer-2", new GossipNodeState("peer-2", 4, NodeStatus.ALIVE, System.currentTimeMillis())));
+
+        GossipNodeState peerState = new GossipNodeState("peer-1", 3, NodeStatus.ALIVE, System.currentTimeMillis());
+        GossipExchangeRequest req = new GossipExchangeRequest(
+                1, "req-pp", "corr-pp", "peer-1", 0L, Map.of("peer-1", peerState));
+
+        HttpResponse<String> resp = post(req);
+
+        assertEquals(200, resp.statusCode());
+        GossipExchangeResponse body = mapper.readValue(resp.body(), GossipExchangeResponse.class);
+        assertNotNull(body.state(), "The response must carry the responder's own table");
+        assertTrue(body.state().containsKey("peer-2"), "The responder's state must include nodes the requester never sent");
+        assertTrue(body.state().containsKey("local-node"), "The responder's state must include its own entry");
+    }
+
+    @Test
+    void testRequesterLearnsResponderStateInOneExchange() throws Exception {
+        // The responder ("local-node", served by this test's handler) already
+        // knows about "peer-2", a node the requester has never heard of.
+        gossip.receiveGossip("peer-2", Map.of(
+                "peer-2", new GossipNodeState("peer-2", 4, NodeStatus.ALIVE, System.currentTimeMillis())));
+
+        String requesterId = "peer-1";
+        NodeDirectory directory = nodeId -> URI.create("http://127.0.0.1:" + port);
+        HttpMembershipTransport requesterTransport = new HttpMembershipTransport(
+                directory, mapper, requesterId, security.deriveToken(requesterId));
+        GossipProtocol requester = new GossipProtocol(requesterId);
+
+        assertFalse(requester.getMembershipTable().containsKey("peer-2"));
+
+        Map<String, GossipNodeState> responderStates = requesterTransport
+                .exchangeState("local-node", requester.getMembershipTable())
+                .get(5, TimeUnit.SECONDS);
+        requester.receiveGossip("local-node", responderStates);
+
+        assertTrue(requester.getMembershipTable().containsKey("peer-2"),
+                "A single push-pull exchange must deliver the responder's full table to the requester");
+        assertTrue(requester.getLiveNodes().contains("peer-2"));
     }
 
     @Test

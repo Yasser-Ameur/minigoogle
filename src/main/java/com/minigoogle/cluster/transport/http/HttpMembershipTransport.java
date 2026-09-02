@@ -47,7 +47,7 @@ public class HttpMembershipTransport implements MembershipTransport {
     }
 
     @Override
-    public CompletableFuture<Void> exchangeState(String targetNodeId, Map<String, GossipNodeState> state) {
+    public CompletableFuture<Map<String, GossipNodeState>> exchangeState(String targetNodeId, Map<String, GossipNodeState> state) {
         URI baseUri = directory.getBaseUri(targetNodeId);
         if (baseUri == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Unknown node: " + targetNodeId));
@@ -86,7 +86,10 @@ public class HttpMembershipTransport implements MembershipTransport {
                                 throw new ProtocolViolationException(
                                         "Correlation ID mismatch: expected " + correlationId + " but got " + ack.correlationId());
                             }
-                            return null;
+                            // A response with no states (older peer) is still
+                            // accepted; the caller treats an empty/null map as
+                            // "no push-pull merge available".
+                            return ack.state() != null ? ack.state() : Map.<String, GossipNodeState>of();
                         } catch (JsonProcessingException e) {
                             throw new RuntimeException("JSON parse error", e);
                         }

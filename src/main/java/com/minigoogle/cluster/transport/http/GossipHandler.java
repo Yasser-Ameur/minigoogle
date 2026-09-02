@@ -44,7 +44,8 @@ public class GossipHandler implements HttpHandler {
                     req.correlationId(),
                     localNodeId,
                     ClusterProtocol.now(),
-                    true
+                    true,
+                    gossip.getMembershipTable()
             );
             sendResponse(exchange, resp);
         } catch (ProtocolViolationException e) {
