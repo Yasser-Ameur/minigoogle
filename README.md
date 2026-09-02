@@ -386,7 +386,7 @@ If you have run `npm install` inside a container on Windows, `docker compose bui
 ./gradlew test
 ```
 
-On 2026-09-02 at commit `dba39a4`, inside the Temurin 21 container: 901 test cases, 0 failures, 23 skipped, `BUILD SUCCESSFUL in 2m 25s` (counted from `build/test-results/test/*.xml`). The suite covers the HTTP server (status codes, request ids, gzip, CORS, rate limit, bounded pool, graceful stop), the document store, the index, ranking, the semantic path and the Raft cluster (election, membership change, snapshots, persistence).
+On 2026-09-02 at commit `150094c`, inside the Temurin 21 container: 922 test cases, 0 failures, 23 skipped, `BUILD SUCCESSFUL in 2m 32s` (counted from `build/test-results/test/*.xml`). The suite covers the HTTP server (status codes, request ids, gzip, CORS, rate limit, bounded pool, graceful stop), the document store, the index, ranking, the semantic path and the Raft cluster (election, membership change, snapshots, persistence).
 
 `./gradlew bench` is a separate task for the timing benchmarks; it is excluded from `test` so machine load cannot fail the suite, and CI runs it after the build. Methodology and past results: [`BENCHMARKS.md`](BENCHMARKS.md).
 

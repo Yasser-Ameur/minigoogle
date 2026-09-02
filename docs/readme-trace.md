@@ -103,10 +103,10 @@ In the working checkout itself `docker compose build` failed with
 `invalid file request frontend/node_modules/.bin/esbuild` (an untracked
 `node_modules` from a container `npm install`, gitignored); the clean clone built.
 
-R9. Test suite, in the project's Gradle container (`eclipse-temurin:21-jdk-jammy`, `./gradlew --no-daemon test`):
+R9. Test suite, in the project's Gradle container (`eclipse-temurin:21-jdk-jammy`, `./gradlew --no-daemon test`), re-run 2026-09-02 at commit `150094c`:
 ```
-BUILD SUCCESSFUL in 2m 25s
-build/test-results/test/*.xml: testcases 901  failures 0  errors 0  skipped 23  (155 files)
+BUILD SUCCESSFUL in 2m 32s
+build/test-results/test/*.xml: testcases 922  failures 0  errors 0  skipped 23  (159 files)
 ```
 
 R10. BEIR scifact, pure BM25, in the clean clone with `data/beir/scifact` copied in, Gradle container:
@@ -180,9 +180,9 @@ minigoogle-data
 | 12 | UI has System/Light/Dark theme switch | `App.jsx:46-75` `ThemeToggle`; visible in hero-dark and hero-light |
 | 13 | UI suggestions come from `/api/v1/suggest` | `App.jsx`/`SearchBox.jsx:52` `suggest(q)`; scene `4-suggestions.png`; R4 suggest output |
 | 14 | `POST /api/v1/search` body `{"query","page","pageSize"}` and response fields | R4; `MiniGoogleApp.java:160`; paging `MiniGoogleAppUnitTest.java:16` `paginatePage2OfSizeThreeReturnsResultsFourToSixOfSevenHits` |
-| 15 | Route table (STANDALONE node) | `MiniGoogleApp.java:158,160,188,189,197,199,202,228,244,265,309,337,391`; cluster routes `:568,582,599` |
+| 15 | Route table (STANDALONE node) | `MiniGoogleApp.java:158,160,188,189,197,199,202,228,244,265,309,337,391`; cluster routes `:620,634,651` |
 | 16 | COORDINATOR node serves `/api/v1/cluster/state` instead | `MiniGoogleApp.java:699` |
-| 17 | `GET /api/v1/cluster/kv` answers 405 at runtime, although a GET handler is registered in the source | R8; `src/main/java/com/minigoogle/demo/MiniGoogleApp.java:599` (`getWithContentType`) beside the POST at `:582` |
+| 17 | `GET /api/v1/cluster/kv` answers 405 at runtime, although a GET handler is registered in the source | R8; `src/main/java/com/minigoogle/demo/MiniGoogleApp.java:651` (`getWithContentType`) beside the POST at `:634` |
 | 18 | Every response carries `X-Request-Id`; a valid incoming id is echoed | R5; `RestServerTest.java:115` `requestIdIsEchoedWhenValidAndGeneratedOtherwise` |
 | 19 | Error envelope shape `{"error":{"code","message"},"requestId"}` | R3, R5; `RestServerTest.java:69` `errorResponsesAreUniformJson` |
 | 20 | 400 malformed JSON, 401 missing key, 404 unknown route, 405 wrong method, 413 body over cap | R5, R3 |
@@ -209,7 +209,7 @@ minigoogle-data
 | 41 | Build from source: JDK 21, Gradle wrapper 8.7, Node 20 for the UI | `gradle/wrapper/gradle-wrapper.properties` `gradle-8.7-bin.zip`; `.github/workflows/ci.yml:19-27`; `frontend/package.json` react 18.3, vite 5.4 |
 | 42 | `./gradlew build -x test` produces `build/libs/mini-google.jar`; without Node the checked-in `src/main/resources/demo/index.html` is served | `Dockerfile:13` runs it; `build.gradle.kts:105-106,124-133`; R8 image (built without Node) served the UI in R2-R4 |
 | 43 | CI runs `./gradlew build`, fails on a stale UI artifact, runs `./gradlew bench`, then publishes `sha` and `latest` tags to GHCR on master | `.github/workflows/ci.yml:35,38,41,65-68` |
-| 44 | Test suite: 901 test cases, 0 failures, 23 skipped, 2m 25s in the container | R9 |
+| 44 | Test suite: 922 test cases, 0 failures, 23 skipped, 2m 32s in the container | R9 |
 | 45 | `bench` is a separate Gradle task | `build.gradle.kts:67` |
 | 46 | BEIR scifact BM25: NDCG@10 0.6746, Recall@100 0.9042, MRR@10 0.6432, MAP@100 0.6355, 5183 docs, 300 judged queries, p50 73 ms | R10 |
 | 47 | License MIT | `LICENSE:1` |
@@ -228,7 +228,7 @@ minigoogle-data
 | 61 | Health and ready both 200 with version, uptime and document count on a running node | R2, R13 |
 | 62 | `HEALTHCHECK` every 30 s after a 15 s start period; compose healthcheck calls `/api/v1/health/ready` | `Dockerfile:30-31`; `docker-compose.yml:35-37` |
 | 63 | One request log line per request at INFO | `RestServer.java:186,269`; container log in R3 (`POST /api/v1/crawl -> 502 (145 ms) requestId=...`) |
-| 64 | Each cluster node also serves the STANDALONE routes against its own index | `MiniGoogleApp.java:158-391` registered before the cluster block at `:568-599` in the same `start()`; R8 (`/api/v1/health/ready` on 8081 answered with `documents":20`) |
+| 64 | Each cluster node also serves the STANDALONE routes against its own index | `MiniGoogleApp.java:158-391` registered before the cluster block at `:620-651` in the same `start()`; R8 (`/api/v1/health/ready` on 8081 answered with `documents":20`) |
 | 65 | `docker compose build` from a checkout with a container-made `frontend/node_modules` fails on the esbuild symlink | R8 note |
 | 66 | Reproduction commands for the assets | R11; `assets/capture.cjs:7-15` header; `assets/seed.sh`; `assets/make-gif.py` |
 | 67 | Docker route for the gate on a machine without Java | R9 command |
