@@ -203,15 +203,15 @@ minigoogle-data
 | 35 | Crawled documents are appended to `crawled-documents.jsonl` under the index dir and replayed at boot | `MiniGoogleApp.java:139-140`; `CrawledDocumentStoreTest.java:47` `appendThenReopenSeesTheDocument`, `:63` `truncatedFinalLineIsSkipped`; R7 |
 | 36 | Metric names and types | R6 |
 | 37 | `/api/v1/health` liveness; `/api/v1/health/ready` readiness, the probe the image and compose call | `MiniGoogleApp.java:188-189` registrations; R2 and R13 (both 200 with `documents`); `Dockerfile:30-31`; `docker-compose.yml:36`. The README makes no claim about the 503 path, which no test or run exercised |
-| 38 | Compose starts three `NODE_TYPE=CLUSTER` nodes on 8080/8081/8082 with per-node volumes and a shared secret | `docker-compose.yml:29-35,44-77`; R8 |
-| 39 | Stopping the leader yields a new leader on a survivor | R8 (term 2, leader minigoogle-3) |
+| 38 | Compose starts three `NODE_TYPE=CLUSTER` nodes on 8080/8081/8082 with per-node volumes and a shared secret | `docker-compose.yml:29-35,44-77`; R8, re-run at HEAD in R21 |
+| 39 | Stopping the leader yields a new leader on a survivor | R8 (term 2, leader minigoogle-3); re-run in R21 (term 3, leader minigoogle-2, commitIndex 1 reflecting the kv write) |
 | 40 | `k8s/` holds manifests (coordinator, search-node, crawler deployments, StatefulSet, HPA, ingress, network policy) | `ls k8s`: 12 files as listed; not exercised in this session |
 | 41 | Build from source: JDK 21, Gradle wrapper 8.7, Node 20 for the UI | `gradle/wrapper/gradle-wrapper.properties` `gradle-8.7-bin.zip`; `.github/workflows/ci.yml:19-27`; `frontend/package.json` react 18.3, vite 5.4 |
 | 42 | `./gradlew build -x test` produces `build/libs/mini-google.jar`; without Node the checked-in `src/main/resources/demo/index.html` is served | `Dockerfile:13` runs it; `build.gradle.kts:105-106,124-133`; R8 image (built without Node) served the UI in R2-R4 |
 | 43 | CI runs `./gradlew build`, fails on a stale UI artifact, runs `./gradlew bench`, then publishes `sha` and `latest` tags to GHCR on master | `.github/workflows/ci.yml:35,38,41,65-68` |
 | 44 | Test suite: 922 test cases, 0 failures, 23 skipped, 2m 32s in the container | R9 |
 | 45 | `bench` is a separate Gradle task | `build.gradle.kts:67` |
-| 46 | BEIR scifact BM25: NDCG@10 0.6746, Recall@100 0.9042, MRR@10 0.6432, MAP@100 0.6355, 5183 docs, 300 judged queries, p50 73 ms | R10 |
+| 46 | BEIR scifact BM25: NDCG@10 0.6746, Recall@100 0.9042, MRR@10 0.6432, MAP@100 0.6355, 5183 docs, 300 judged queries, p50 73 ms | R10, re-run at HEAD in R20 (same four metrics, latency varies) |
 | 47 | License MIT | `LICENSE:1` |
 | 48 | Detailed docs: `API.md`, `docs/openapi.yaml`, `ARCHITECTURE.md`, `BENCHMARKS.md`, `CHANGELOG.md` | files exist in the repo root and `docs/` (`ls`) |
 | 50 | Gzip only above 1024 bytes and only when the client accepts it | `RestServer.java:326,333`; `RestServerTest.java:41` |
@@ -364,6 +364,39 @@ $ docker image inspect ghcr.io/yasser-ameur/minigoogle:latest --format '{{.Creat
 ```
 
 | 74 | Every push to `master` rebuilds `latest`, which names its commit in the revision label | `.github/workflows/ci.yml:3-5,44-47` (push on master, docker job needs build); R18 (the label read `e155932` right after the push of e155932). A README naming one sha is stale by the next push, which is why the sentence names the label and the command instead |
+R20. BEIR scifact, pure BM25, re-run on 2026-09-02 at commit `2e9a078`, dataset downloaded fresh into `data/beir/scifact` (gitignored), same Gradle container:
+```
+$ ./gradlew --no-daemon corpusIndex -Pbeir.dataset=scifact -Pbeir.dir=data/beir/scifact -Pbeir.heap=4g -Pbeir.config=semantic.enabled=false
+documents indexed : 5183   vocabulary size : 29724   avg doc length : 225
+$ ./gradlew --no-daemon corpusEval  -Pbeir.dataset=scifact -Pbeir.dir=data/beir/scifact -Pbeir.heap=4g -Pbeir.variants=bm25 -Pbeir.config=semantic.enabled=false -Pbeir.runOut=build/scifact.txt
+Corpus: 5183 docs, 1109 queries, split='test': 300 judged queries, 339 resolved judgments (docs=5183)
+=== variant: bm25 ===
+  judged queries   : 300 of 1109
+  NDCG@10=0.6746  Recall@100=0.9042  MRR@10=0.6432  MAP@100=0.6355
+  retrieval latency: p50=86.45 ms  p95=206.78 ms  p99=241.66 ms  (n=300, after warmup)
+BUILD SUCCESSFUL in 1m 30s
+```
+All four ranking metrics match R10 (`build.gradle.kts`, indexer and ranking code unchanged since R10; NDCG/Recall/MRR/MAP are deterministic for a fixed index). Retrieval latency differs (p50 86.45 ms vs 73.36 ms, this run's machine load) and is a varying field per the trace rule; the README keeps R10's example latency line and this row records the spread.
+
+R21. Cluster walkthrough re-run on 2026-09-02 at commit `2e9a078`, from a fresh `git clone` of the working tree into a scratch directory (`docker compose up --build -d`, three nodes):
+```
+$ curl localhost:8080/api/v1/cluster/status
+{"nodeId":"minigoogle-1","state":"LEADER","term":2,"leader":"minigoogle-1",...,"liveNodes":["minigoogle-2","minigoogle-1","minigoogle-3"]}
+$ curl -X POST localhost:8080/api/v1/crawl -H "Content-Type: application/json" -H "X-API-Key: change-me-please-16plus" -d '{"url":"https://raft.github.io/"}'
+{"success":true,"title":"Raft Consensus Algorithm","url":"https://raft.github.io/","owners":["minigoogle-3","minigoogle-2","minigoogle-1"],"replicatedTo":["minigoogle-3","minigoogle-2"]}
+$ curl -X POST localhost:8082/api/v1/search -H "Content-Type: application/json" -d '{"query":"raft consensus"}'
+totalResults 3, second result https://raft.github.io/
+$ curl localhost:8080/api/v1/stats && curl localhost:8081/api/v1/stats && curl localhost:8082/api/v1/stats
+{"documentCount":21,...} on all three nodes
+$ curl -X POST localhost:8080/api/v1/cluster/kv -d '{"key":"k","value":"v"}'
+{"success":true,"key":"k"}
+$ curl 'localhost:8081/api/v1/cluster/kv?key=k'
+{"error":{"code":"METHOD_NOT_ALLOWED",...}}   HTTP 405 (also 8080)
+$ docker compose stop minigoogle-1 && sleep 12 && curl localhost:8082/api/v1/cluster/status
+{"nodeId":"minigoogle-3","state":"FOLLOWER","term":3,"leader":"minigoogle-2","commitIndex":1,...}
+```
+Which node leads and the term number are a leader-election outcome, not deterministic across runs, the same category as an id; the README keeps its illustrative leader/term/commitIndex values (`minigoogle-3` term 1, then term 2) and this row records this run's own (`minigoogle-1` term 2, then `minigoogle-2` term 3, commit index 1 reflecting the kv write). Owners, replicatedTo, the 21-document count on every node, the search ranking, the kv write, and the 405 on `GET /api/v1/cluster/kv` all matched the README's shown output exactly. Torn down after: `docker compose down -v` (containers, volumes and network removed) then the three built images removed with `docker rmi`; the SUSPECT/DEAD gossip timing walkthrough (R11-R14 above) was not re-run this session, its code untouched since then and covered by R9's fresh suite pass.
+
 R19. Node rebuilt with the crawl fix, started on an empty index directory, seeded, then one seeded URL crawled again:
 ```
 boot:      {"documentCount":20,"vocabularySize":680,"averageDocumentLength":71,"version":"1.0"}
