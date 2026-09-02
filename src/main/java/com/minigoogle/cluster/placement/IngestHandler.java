@@ -65,6 +65,8 @@ public class IngestHandler implements HttpHandler {
             sendResponse(exchange, resp);
         } catch (ProtocolViolationException e) {
             sendError(exchange, 400, e.getMessage());
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            sendError(exchange, 400, "Malformed JSON body");
         } catch (Exception e) {
             e.printStackTrace();
             exchange.sendResponseHeaders(500, -1);
