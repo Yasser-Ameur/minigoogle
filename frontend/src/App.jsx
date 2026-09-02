@@ -1,10 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import SearchBox from './components/SearchBox';
-import { analytics, click, crawl, search, setApiKey, stats } from './api';
+import { click, crawl, search, setApiKey, stats, suggest } from './api';
 import { formatScore, highlightSnippet, monogram, parseUrl } from './format.jsx';
 
-const PAGE_SIZE = 50;
-const PER_PAGE = 10;
+const PAGE_SIZE = 10;
 
 function readLocation() {
   const params = new URLSearchParams(window.location.search);
@@ -50,16 +49,36 @@ function ThemeToggle({ theme, onChange }) {
     { value: 'light', label: 'Light' },
     { value: 'dark', label: 'Dark' },
   ];
+  const btnRefs = useRef([]);
+
+  const move = (fromIdx, delta) => {
+    const next = (fromIdx + delta + options.length) % options.length;
+    onChange(options[next].value);
+    const el = btnRefs.current[next];
+    if (el) el.focus();
+  };
+
   return (
     <div className="theme-toggle" role="radiogroup" aria-label="Theme">
-      {options.map((opt) => (
+      {options.map((opt, i) => (
         <button
           key={opt.value}
+          ref={(el) => (btnRefs.current[i] = el)}
           type="button"
           role="radio"
           aria-checked={theme === opt.value}
+          tabIndex={theme === opt.value ? 0 : -1}
           className={'theme-toggle__btn' + (theme === opt.value ? ' is-active' : '')}
           onClick={() => onChange(opt.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+              e.preventDefault();
+              move(i, 1);
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+              e.preventDefault();
+              move(i, -1);
+            }
+          }}
         >
           {opt.label}
         </button>
@@ -78,18 +97,16 @@ function AddUrl({ onAdded }) {
     setStatus({ text: 'Crawling…', tone: 'muted' });
     try {
       const data = await crawl(value);
-      if (data.success) {
-        setStatus({ text: 'Added: ' + (data.title || value), tone: 'good' });
-        setUrl('');
-        setNeedsKey(false);
-        onAdded();
-      } else {
-        setStatus({ text: 'Error: ' + (data.error || 'failed'), tone: 'bad' });
-      }
+      setStatus({ text: 'Added: ' + (data.title || value), tone: 'good' });
+      setUrl('');
+      setNeedsKey(false);
+      onAdded();
     } catch (e) {
       if (e.status === 401) {
         setNeedsKey(true);
         setStatus({ text: 'This needs an API key.', tone: 'bad' });
+      } else if (e.status === 429 || e.status === 503) {
+        setStatus({ text: `Busy, try again in ${e.retryAfter || 1} s`, tone: 'bad' });
       } else {
         setStatus({
           text: e.message + (e.requestId ? ' · ' + e.requestId : ''),
@@ -215,18 +232,42 @@ function Skeleton() {
 }
 
 function ErrorBlock({ error, onRetry }) {
+  const isBadRequest = error.status === 400;
   return (
     <div className="state-block state-block--error" role="alert">
-      <p className="state-block__title">Something went wrong.</p>
-      <p>{error.message}</p>
+      <p className="state-block__title">
+        {isBadRequest ? 'That query could not be parsed.' : 'Something went wrong.'}
+      </p>
+      <p>{isBadRequest ? 'Try rephrasing your search.' : error.message}</p>
       {error.requestId && <p className="state-block__meta">Request ID: {error.requestId}</p>}
       <button type="button" onClick={onRetry}>Try again</button>
     </div>
   );
 }
 
-function ZeroResults({ query, didYouMean, onSearch }) {
+function ZeroResults({ query, didYouMean, onSearch, onAddUrl }) {
   const reformulations = suggestReformulations(query);
+  const [prefixSuggestions, setPrefixSuggestions] = useState([]);
+
+  useEffect(() => {
+    const prefix = query.trim().slice(0, 3);
+    if (prefix.length < 2) {
+      setPrefixSuggestions([]);
+      return;
+    }
+    let cancelled = false;
+    suggest(prefix)
+      .then((items) => {
+        if (!cancelled) setPrefixSuggestions((items || []).filter((s) => s.toLowerCase() !== query.trim().toLowerCase()).slice(0, 5));
+      })
+      .catch(() => {
+        if (!cancelled) setPrefixSuggestions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [query]);
+
   return (
     <div className="state-block state-block--empty">
       <p className="state-block__title">No results for &ldquo;{query}&rdquo;.</p>
@@ -244,12 +285,24 @@ function ZeroResults({ query, didYouMean, onSearch }) {
           ))}
         </div>
       )}
+      {!didYouMean && reformulations.length === 0 && prefixSuggestions.length > 0 && (
+        <div className="reformulations">
+          <span>Did you mean:</span>
+          {prefixSuggestions.map((s) => (
+            <button type="button" key={s} onClick={() => onSearch(s)}>{s}</button>
+          ))}
+        </div>
+      )}
+      <p className="state-block__hint">
+        Try fewer or different words, or{' '}
+        <button type="button" className="link-btn" onClick={onAddUrl}>add the page you are looking for</button>.
+      </p>
     </div>
   );
 }
 
-function Pager({ page, pageCount, onGo }) {
-  if (pageCount <= 1) return null;
+function Pager({ page, pageCount, hasNext, onGo }) {
+  if (pageCount <= 1 && !hasNext) return null;
   const nums = [];
   const start = Math.max(1, page - 2);
   const end = Math.min(pageCount, start + 4);
@@ -270,8 +323,8 @@ function Pager({ page, pageCount, onGo }) {
           {n}
         </button>
       ))}
-      {nums[nums.length - 1] < pageCount && <span className="pager__ellipsis">…</span>}
-      <button type="button" disabled={page >= pageCount} onClick={() => onGo(page + 1)}>Next</button>
+      {(nums[nums.length - 1] < pageCount || hasNext) && <span className="pager__ellipsis">…</span>}
+      <button type="button" disabled={!hasNext} onClick={() => onGo(page + 1)}>Next</button>
     </nav>
   );
 }
@@ -285,7 +338,6 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [statsData, setStatsData] = useState(null);
-  const [analyticsData, setAnalyticsData] = useState(null);
   const [theme, setTheme] = useState(() => {
     try {
       return window.localStorage.getItem('minigoogle-theme') || 'system';
@@ -316,17 +368,11 @@ export default function App() {
     if (view === 'home') refreshStats();
   }, [view, refreshStats]);
 
-  const runSearch = useCallback((q) => {
+  const runSearch = useCallback((q, p) => {
     setLoading(true);
     setError(null);
-    setAnalyticsData(null);
-    search(q, PAGE_SIZE)
-      .then((result) => {
-        setData(result);
-        if (result.results && result.results.length > 0) {
-          analytics().then(setAnalyticsData).catch(() => {});
-        }
-      })
+    search(q, p, PAGE_SIZE)
+      .then((result) => setData(result))
       .catch((e) => setError(e))
       .finally(() => setLoading(false));
   }, []);
@@ -334,11 +380,9 @@ export default function App() {
   useEffect(() => {
     if (view === 'results' && query) {
       setData(null);
-      runSearch(query);
+      runSearch(query, page);
     }
-    // Intentionally scoped to query: changing page never re-fetches.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view === 'results' ? query : null]);
+  }, [view, query, page, runSearch]);
 
   useEffect(() => {
     document.title = query ? `${query} — MiniGoogle` : 'MiniGoogle';
@@ -422,10 +466,18 @@ export default function App() {
   }, [data, page]);
 
   const results = data && data.results ? data.results : [];
-  const pageCount = Math.max(1, Math.ceil(results.length / PER_PAGE));
-  const safePage = Math.min(page, pageCount);
-  const pageResults = results.slice((safePage - 1) * PER_PAGE, safePage * PER_PAGE);
+  const hasNext = results.length === PAGE_SIZE;
+  const exactTotal = data && !hasNext ? (page - 1) * PAGE_SIZE + results.length : null;
+  const pageCount = hasNext
+    ? Math.max(page + 1, Math.ceil((data.totalResults || 0) / PAGE_SIZE))
+    : page;
   const didYouMean = data ? data.didYouMean : null;
+  const liveMessage =
+    view === 'results' && !loading && !error && data
+      ? results.length > 0
+        ? `${hasNext ? data.totalResults : exactTotal} results for ${query}`
+        : `No results for ${query}`
+      : '';
 
   resultRefs.current = [];
 
@@ -449,7 +501,8 @@ export default function App() {
         <ThemeToggle theme={theme} onChange={setTheme} />
       </header>
 
-      <main id="main">
+      <main id="main" aria-busy={loading}>
+        <div className="visually-hidden" role="status" aria-live="polite">{liveMessage}</div>
         {view === 'home' ? (
           <div className="home">
             <Logo size="home" />
@@ -463,16 +516,17 @@ export default function App() {
           <div className="results-page">
             {loading && <Skeleton />}
 
-            {!loading && error && <ErrorBlock error={error} onRetry={() => runSearch(query)} />}
+            {!loading && error && <ErrorBlock error={error} onRetry={() => runSearch(query, page)} />}
 
             {!loading && !error && data && results.length === 0 && (
-              <ZeroResults query={query} didYouMean={didYouMean} onSearch={(q) => navigateSearch(q, 1)} />
+              <ZeroResults query={query} didYouMean={didYouMean} onSearch={(q) => navigateSearch(q, 1)} onAddUrl={goHome} />
             )}
 
             {!loading && !error && data && results.length > 0 && (
               <>
                 <p className="results-stats">
-                  About {data.totalResults} results ({data.executionTimeMs} ms)
+                  {hasNext ? `About ${data.totalResults} results` : `${exactTotal} results`}
+                  {' '}({data.executionTimeMs} ms)
                 </p>
                 {didYouMean && (
                   <button type="button" className="did-you-mean" onClick={() => navigateSearch(didYouMean, 1)}>
@@ -480,24 +534,17 @@ export default function App() {
                   </button>
                 )}
                 <ul className="result-list">
-                  {pageResults.map((r, i) => (
+                  {results.map((r, i) => (
                     <ResultCard
                       key={r.url}
                       query={query}
-                      position={(safePage - 1) * PER_PAGE + i + 1}
+                      position={(page - 1) * PAGE_SIZE + i + 1}
                       result={r}
                       linkRef={(el) => (resultRefs.current[i] = el)}
                     />
                   ))}
                 </ul>
-                <Pager page={safePage} pageCount={pageCount} onGo={goToPage} />
-                {analyticsData && analyticsData.totalQueries > 0 && (
-                  <div className="analytics-bar">
-                    <div>Queries: <span>{analyticsData.totalQueries}</span></div>
-                    <div>Avg latency: <span>{analyticsData.averageLatencyMs.toFixed(1)} ms</span></div>
-                    <div>Zero-result rate: <span>{(analyticsData.zeroResultRate * 100).toFixed(0)}%</span></div>
-                  </div>
-                )}
+                <Pager page={page} pageCount={pageCount} hasNext={hasNext} onGo={goToPage} />
               </>
             )}
           </div>

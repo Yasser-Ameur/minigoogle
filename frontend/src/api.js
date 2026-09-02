@@ -18,11 +18,12 @@ export function setApiKey(key) {
 }
 
 export class ApiError extends Error {
-  constructor(message, { status, code, requestId } = {}) {
+  constructor(message, { status, code, requestId, retryAfter } = {}) {
     super(message);
     this.status = status;
     this.code = code;
     this.requestId = requestId;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -47,9 +48,15 @@ async function request(url, options = {}) {
 
   if (!resp.ok) {
     const err = body && body.error;
+    const retryAfterHeader = resp.headers.get('Retry-After');
     throw new ApiError(
       (err && err.message) || `Request failed (${resp.status})`,
-      { status: resp.status, code: err && err.code, requestId: body && body.requestId }
+      {
+        status: resp.status,
+        code: err && err.code,
+        requestId: body && body.requestId,
+        retryAfter: retryAfterHeader ? parseInt(retryAfterHeader, 10) : null,
+      }
     );
   }
   return body;
@@ -59,11 +66,11 @@ export function suggest(q) {
   return request('/api/v1/suggest?q=' + encodeURIComponent(q));
 }
 
-export function search(query, pageSize = 50) {
+export function search(query, page = 1, pageSize = 10) {
   return request('/api/v1/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, page: 1, pageSize }),
+    body: JSON.stringify({ query, page, pageSize }),
   });
 }
 

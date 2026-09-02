@@ -64,6 +64,8 @@ const SearchBox = forwardRef(function SearchBox(
   }, []);
 
   const submit = (text) => {
+    clearTimeout(debounceRef.current);
+    requestSeqRef.current += 1;
     setSuggestions([]);
     setAcIndex(-1);
     onSubmit(text);
@@ -75,6 +77,7 @@ const SearchBox = forwardRef(function SearchBox(
         setSuggestions([]);
         setAcIndex(-1);
       } else {
+        e.stopPropagation();
         inputRef.current && inputRef.current.blur();
       }
       return;
@@ -99,6 +102,8 @@ const SearchBox = forwardRef(function SearchBox(
       className={'search-wrap search-wrap--' + size}
       onBlur={(e) => {
         if (!e.currentTarget.contains(e.relatedTarget)) {
+          clearTimeout(debounceRef.current);
+          requestSeqRef.current += 1;
           setSuggestions([]);
           setAcIndex(-1);
         }
@@ -139,29 +144,33 @@ const SearchBox = forwardRef(function SearchBox(
           </svg>
         </button>
       </form>
-      {suggestions.length > 0 && (
-        <ul className="autocomplete" id={listboxId} role="listbox" aria-label="Suggestions">
-          {suggestions.map((item, i) => (
-            <li
-              key={item}
-              id={`${listboxId}-opt-${i}`}
-              role="option"
-              aria-selected={i === acIndex}
-              className={'ac-item' + (i === acIndex ? ' active' : '')}
-              onMouseDown={(e) => {
-                e.preventDefault();
-                submit(item);
-              }}
-              onMouseEnter={() => setAcIndex(i)}
-            >
-              <svg className="ac-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" />
-              </svg>
-              <span>{item}</span>
-            </li>
-          ))}
-        </ul>
-      )}
+      <ul
+        className="autocomplete"
+        id={listboxId}
+        role="listbox"
+        aria-label="Suggestions"
+        hidden={suggestions.length === 0}
+      >
+        {suggestions.map((item, i) => (
+          <li
+            key={item}
+            id={`${listboxId}-opt-${i}`}
+            role="option"
+            aria-selected={i === acIndex}
+            className={'ac-item' + (i === acIndex ? ' active' : '')}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              submit(item);
+            }}
+            onMouseEnter={() => setAcIndex(i)}
+          >
+            <svg className="ac-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" />
+            </svg>
+            <span>{item}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 });

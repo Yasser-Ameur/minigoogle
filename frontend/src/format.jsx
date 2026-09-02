@@ -2,10 +2,25 @@ import React from 'react';
 
 export function highlightSnippet(text) {
   if (!text) return '';
-  const parts = String(text).split(/\*\*([^*]+)\*\*/g);
-  return parts.map((part, i) =>
-    i % 2 === 1 ? <mark key={i}>{part}</mark> : part
-  );
+  // The server marks only the matched stem (e.g. **Comput**er); extend the
+  // mark to the rest of the word so the highlight covers the whole term.
+  const raw = String(text).split(/\*\*([^*]+)\*\*/g);
+  const parts = [];
+  for (let i = 0; i < raw.length; i++) {
+    if (i % 2 === 1) {
+      let marked = raw[i];
+      const rest = raw[i + 1] || '';
+      const wordTail = rest.match(/^[A-Za-z0-9]+/);
+      if (wordTail) {
+        marked += wordTail[0];
+        raw[i + 1] = rest.slice(wordTail[0].length);
+      }
+      parts.push(<mark key={i}>{marked}</mark>);
+    } else {
+      parts.push(raw[i]);
+    }
+  }
+  return parts;
 }
 
 export function formatScore(value) {
