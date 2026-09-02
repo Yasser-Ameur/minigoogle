@@ -362,4 +362,4 @@ $ docker image inspect ghcr.io/yasser-ameur/minigoogle:latest --format '{{.Creat
 2026-09-02T12:53:12.319224503Z e15593202ab85c8a15e25bd2bd7648c539b6cb8d
 ```
 
-| 74 | The `latest` image carries revision `e155932`, with the cluster work and the google.com UI | R18; commits 1389f64 (cluster wiring) and 28dce35 (UI) are ancestors of e155932 (`git log --oneline`) |
+| 74 | Every push to `master` rebuilds `latest`, which names its commit in the revision label | `.github/workflows/ci.yml:3-5,44-47` (push on master, docker job needs build); R18 (the label read `e155932` right after the push of e155932). A README naming one sha is stale by the next push, which is why the sentence names the label and the command instead |
