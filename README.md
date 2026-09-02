@@ -438,9 +438,10 @@ docker run --rm -v "$PWD/assets:/work" -w /tmp \
   mcr.microsoft.com/playwright:v1.62.1-jammy \
   bash -c "npm i --silent --no-audit --no-fund playwright@1.62.1 && NODE_PATH=/tmp/node_modules node /work/capture.cjs http://host.docker.internal:8080 /work"
 python assets/make-gif.py                # six stills, 3 s each, 960 px wide
+python assets/make-social.py             # 1280x640 social preview from the light hero
 ```
 
-`capture.cjs` shoots the hero in dark and light at 1280x800 and again at device scale 2 (2560x1600), then the six stills of one task at 1280x800. `seed.sh` skips Wikipedia because it answers the crawler with 403.
+`capture.cjs` shoots the hero in dark and light at 1280x800 and again at device scale 2 (2560x1600), then the six stills of one task at 1280x800. `seed.sh` skips Wikipedia because it answers the crawler with 403. `social-preview.png` is the image GitHub shows when the repository link is shared; it is uploaded by hand under Settings, Social preview, since there is no API for it.
 
 ## Further reading
 
