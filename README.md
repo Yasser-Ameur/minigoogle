@@ -12,7 +12,7 @@ docker volume create minigoogle-data
 docker run -d --name minigoogle \
   -p 8080:8080 \
   -v minigoogle-data:/data \
-  -e MINIGOGLE_API_KEY=change-me \
+  -e MINIGOGLE_API_KEY=change-me-please-16plus \
   ghcr.io/yasser-ameur/minigoogle:latest
 ```
 
@@ -34,7 +34,7 @@ curl -X POST localhost:8080/api/v1/search \
 
 curl -X POST localhost:8080/api/v1/crawl \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: change-me" \
+  -H "X-API-Key: change-me-please-16plus" \
   -d '{"url": "https://example.com"}'
 ```
 
@@ -49,7 +49,7 @@ expect, like `NODE_TYPE` or `CLUSTER_PEERS`) lives in `.env.example`.
 
 | Env var | yaml key | Default | Meaning |
 |---|---|---|---|
-| `MINIGOGLE_API_KEY` | `security.apiKey` | (empty, open) | Key required on protected routes |
+| `MINIGOGLE_API_KEY` | `security.apiKey` | (empty, open) | Key required on protected routes; must be at least 16 characters or startup fails |
 | `MINIGOGLE_NODE_TYPE` | `node.type` | `STANDALONE` | `STANDALONE`, `SEARCH`, `COORDINATOR`, or `CLUSTER` |
 | `MINIGOGLE_NODE_PORT` | `server.port` | `8080` | REST API port |
 | `MINIGOGLE_NODE_HOST` | `server.host` | `0.0.0.0` | REST API bind address |
@@ -80,10 +80,10 @@ Full detail, request/response shapes, and error codes: `API.md` and
 |---|---|---|
 | GET | `/` | Web UI |
 | GET | `/api/v1/health` | Liveness, always 200 |
-| GET | `/api/v1/health/ready` | 200 once the index is loaded, else 503 |
+| GET | `/api/v1/health/ready` | 200 once ready, else 503 (a `COORDINATOR` node always 200) |
 | GET | `/api/v1/version` | `{"version":"1.0.0"}` |
-| GET | `/metrics` | Prometheus text format |
-| POST | `/api/v1/search` | `{"query": "..."}` |
+| GET | `/metrics` | Prometheus text format, protected when a key is set |
+| POST | `/api/v1/search` | `{"query": "...", "page": 1, "pageSize": 10}` |
 | GET | `/api/v1/suggest?q=` | Autocomplete |
 | GET | `/api/v1/stats` | Index size |
 | GET | `/api/v1/analytics` | Query stats |
@@ -102,22 +102,27 @@ Every response carries an `X-Request-Id` header. Errors share one shape:
 {"error":{"code":"RATE_LIMITED","message":"Rate limit exceeded"},"requestId":"..."}
 ```
 
-`401` (bad or missing key), `405` (wrong method), `413` (body too large),
-`429` (rate limited, only when configured), `504` (handler timeout), and `500`
-(unhandled) all use it.
+`400` (bad request), `401` (bad or missing key), `404` (no such route), `405`
+(wrong method), `413` (body too large), `429` (rate limited, only when
+configured), `503` (no index yet, or the request queue is full), `504`
+(handler timeout), and `500` (unhandled) all use it; `POST /api/v1/crawl`
+adds `422` and `502` (fetch/parse failure) and `501` on a `COORDINATOR` node.
+Full list with which route uses which: `API.md`.
 
 ## Authentication
 
-`POST /api/v1/crawl` is the only protected route. Set `MINIGOGLE_API_KEY`
-(or `security.apiKey`) and send it as either header:
+`POST /api/v1/crawl` and `GET /metrics` are protected. Set
+`MINIGOGLE_API_KEY` (or `security.apiKey`) to at least 16 characters, or
+startup refuses to boot, and send the key as either header:
 
 ```
 X-API-Key: <key>
 Authorization: Bearer <key>
 ```
 
-Leave it unset and the route stays open, which is fine for a laptop demo and
-wrong for anything reachable from a network.
+Leave it unset and both routes stay open, which is fine for a laptop demo and
+wrong for anything reachable from a network. A Prometheus scrape config must
+add one of these headers once a key is set.
 
 ## Running a cluster
 

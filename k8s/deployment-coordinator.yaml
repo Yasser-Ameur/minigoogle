@@ -46,11 +46,9 @@ spec:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 10
-          # A COORDINATOR node registers only /api/v1/health (no local index to
-          # report readiness for), so both probes point at it.
           readinessProbe:
             httpGet:
-              path: /api/v1/health
+              path: /api/v1/health/ready
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 5

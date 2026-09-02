@@ -23,10 +23,32 @@ All notable changes to this project are documented here. Format follows
   Java build runs, a CI step fails when the checked-in UI artifact is stale,
   the Docker publish job no longer runs on a red build, and container/k8s
   health and readiness probes point at the right endpoints.
-
-### Unreleased
-
-Moved here rather than claimed for 1.0.0 because it is not verifiable on this
-branch:
-
-- Redesigned UI.
+- Redesigned UI: theme, pagination, keyboard navigation, loading and error
+  states, a real ARIA combobox for the search box, and an API key field.
+- Uniform error envelope everywhere: every handler that used to swallow its
+  own exceptions now throws the mapped `HttpError` (`400 BAD_REQUEST` for
+  malformed input, `502 FETCH_FAILED` and `422 PARSE_FAILED` for a failed
+  crawl, `503 NOT_READY` for a click with no index loaded, `501 NOT_SUPPORTED`
+  for `POST /api/v1/crawl` on a `COORDINATOR` node) instead of a 200 body with
+  `"success":false`.
+- Bounded HTTP execution: a fixed-size worker pool plus a bounded queue
+  replace the old unbounded dispatch queue; overflow answers
+  `503 SERVICE_BUSY` with `Retry-After: 1` instead of piling up. Idle
+  rate-limit buckets are now evicted instead of growing forever.
+- CORS list mode now echoes a matching origin with `Vary: Origin` and answers
+  a non-matching preflight `403 FORBIDDEN_ORIGIN`, instead of falling back to
+  a wildcard `Access-Control-Allow-Origin`. `*` is unaffected.
+- An unmatched path now answers `404 NOT_FOUND` instead of falling through to
+  the `/` handler.
+- `POST /api/v1/search` accepts `page` and `pageSize` and echoes both on the
+  response; see `API.md` for the exact (and, on a cache miss, incompletely
+  enforced) paging semantics.
+- `GET /metrics` is now protected the same way as `POST /api/v1/crawl` when
+  an API key is configured; open when it is not.
+- `GET /api/v1/health/ready` is now served by a `COORDINATOR` node too
+  (always `200`, since it has no local index to be not-ready about).
+- Startup now refuses a configured `security.apiKey` shorter than 16
+  characters.
+- A single shutdown hook now stops the REST server, then closes the crawled
+  document store, then stops the cluster node, in that fixed order, replacing
+  three independent hooks that could run in any order.

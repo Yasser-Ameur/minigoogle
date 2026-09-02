@@ -6,13 +6,22 @@ info:
     REST API served by com.minigoogle.demo.MiniGoogleApp. Routes below are
     those a STANDALONE (the default docker image), SEARCH, or CLUSTER node
     registers. A COORDINATOR node (node.type=COORDINATOR) serves a reduced
-    surface: it has no local index, so it lacks /api/v1/health/ready and
-    /api/v1/entities, /api/v1/suggest and /api/v1/stats answer with empty
-    payloads, and POST /api/v1/crawl always returns
-    {"success":false,"error":"..."} without attempting to fetch anything. It
-    additionally serves GET /api/v1/cluster/state instead of the cluster
-    routes below. A CLUSTER node additionally serves the two /api/v1/cluster/*
-    routes documented here.
+    surface: it has no local index, so /api/v1/entities is absent,
+    /api/v1/suggest and /api/v1/stats answer with empty payloads, and POST
+    /api/v1/crawl always returns 501 NOT_SUPPORTED without attempting to
+    fetch anything. It does register /api/v1/health/ready (answering the same
+    200 as /api/v1/health, since it has no local index to be not-ready
+    about). It additionally serves GET /api/v1/cluster/state instead of the
+    cluster routes below. A CLUSTER node additionally serves the two
+    /api/v1/cluster/* routes documented here.
+
+
+    Two error responses apply to every path, matched or not, and aren't
+    listed per operation below: any path that doesn't match a route in this
+    document gets 404 NOT_FOUND (see components.responses.NotFound), and a
+    CORS preflight from a disallowed origin gets 403 FORBIDDEN_ORIGIN (see
+    components.responses.ForbiddenOrigin and the README's CORS section) when
+    server.cors.origins is a list rather than "*".
 servers:
   - url: http://localhost:8080
 
@@ -46,9 +55,10 @@ paths:
     get:
       summary: Readiness
       description: >
-        200 once the index is loaded and can serve search, 503 while it is
-        still building or after it fails to load. Not served by a COORDINATOR
-        node, which has no local index.
+        200 once the index is loaded and can serve search, 503 NOT_READY
+        while it is still building or after it fails to load. A COORDINATOR
+        node has no local index and always answers 200 here, the same as
+        /api/v1/health.
       responses:
         "200":
           description: Ready to serve
@@ -88,7 +98,10 @@ paths:
         minigoogle_http_request_duration_seconds,
         minigoogle_search_duration_seconds, minigoogle_search_queries_total,
         minigoogle_search_zero_result_queries_total, and
-        minigoogle_index_documents.
+        minigoogle_index_documents. Protected the same way as
+        POST /api/v1/crawl; open when no API key is configured.
+      security:
+        - apiKey: []
       responses:
         "200":
           description: Metrics snapshot
@@ -96,10 +109,29 @@ paths:
             text/plain:
               schema:
                 type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
+        "504":
+          $ref: "#/components/responses/HandlerTimeout"
 
   /api/v1/search:
     post:
       summary: Search the index
+      description: >
+        page and pageSize are accepted and echoed on the response (page
+        defaults to 1, pageSize defaults to 10 and is clamped to 1..100).
+        offset = (page-1)*pageSize; the server retrieves offset+pageSize
+        candidates deep and totalResults counts matches found within that
+        depth, not an exhaustive corpus count. Only a repeated page:1 query
+        served from the query cache is reliably sliced to the requested
+        page; a cache miss returns the full depth unsliced with page/pageSize
+        echoed as 1/<actual result count> regardless of what was requested.
+        A SEARCH-mode node ignores page. A COORDINATOR node echoes
+        page/pageSize but can only ever serve page 1's results.
       requestBody:
         required: true
         content:
@@ -109,20 +141,28 @@ paths:
               properties:
                 query:
                   type: string
+                page:
+                  type: integer
+                  description: 1-indexed; values below 1 are treated as 1
                 pageSize:
                   type: integer
+                  description: Defaults to 10 if below 1; clamped to 100 if above
               required: [query]
       responses:
         "200":
           description: Ranked results (empty list for a blank query)
           content:
             application/json: {}
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -148,6 +188,8 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -163,6 +205,8 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -178,6 +222,8 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -204,15 +250,27 @@ paths:
               required: [query]
       responses:
         "200":
-          description: "{success, documentId, position, trainedPairs} or {success:false, error}"
+          description: "{success, documentId, position, trainedPairs}"
           content:
             application/json: {}
+        "400":
+          description: Malformed JSON body, missing query, or a click that matches no local document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          description: No index loaded yet (NOT_READY), or the request queue is full (SERVICE_BUSY, Retry-After 1)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -228,6 +286,8 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -250,12 +310,17 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
   /api/v1/crawl:
     post:
       summary: Fetch a URL, parse it, and add it to the index
+      description: >
+        On a COORDINATOR node (no local index) this always answers
+        501 NOT_SUPPORTED without attempting anything.
       security:
         - apiKey: []
       requestBody:
@@ -270,17 +335,39 @@ paths:
               required: [url]
       responses:
         "200":
-          description: "{success:true, title, url} or {success:false, error}"
+          description: "{success:true, title, url}"
           content:
             application/json: {}
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "422":
+          description: Page was fetched but could not be parsed (PARSE_FAILED)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "501":
+          description: Node is a COORDINATOR; it has no local index to crawl into (NOT_SUPPORTED)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: The URL could not be fetched (FETCH_FAILED)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -296,6 +383,8 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -317,6 +406,8 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
     post:
@@ -345,6 +436,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceBusy"
         "504":
           $ref: "#/components/responses/HandlerTimeout"
 
@@ -359,6 +452,43 @@ components:
         "Authorization: Bearer <key>" header is accepted in place of
         X-API-Key. When no key is configured, protected routes are open.
   responses:
+    BadRequest:
+      description: Malformed request body or missing/invalid required field (BAD_REQUEST)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: >
+        Path does not match any registered route (NOT_FOUND). Not tied to a
+        specific operation below; any path outside this document's paths
+        gets this.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ForbiddenOrigin:
+      description: >
+        CORS preflight (OPTIONS) from an Origin not present in
+        server.cors.origins, when that setting is a comma-separated list
+        rather than "*" (FORBIDDEN_ORIGIN)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceBusy:
+      description: >
+        The request queue (server.maxThreads workers plus a 4x queue) is
+        full (SERVICE_BUSY)
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Always "1"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing or invalid API key
       content:
