@@ -148,10 +148,18 @@ class RaftConsensusConfigChangeTest {
             assertTrue(waitUntil(() -> b.getState() == RaftConsensus.RaftState.LEADER, 3000),
                     "The survivors must re-elect a leader");
 
-            // The new leader commits a current-term entry, which indirectly
-            // commits the removal entry it had replicated but not yet applied.
-            b.appendEntry(K1);
-            assertTrue(waitUntil(() -> b.getCommitIndex() == 2
+            // Whether b had already learned of a's commit (via a's one final
+            // heartbeat, sent just before it stepped down) by the time it
+            // became leader is a race: under load that delivery can still be
+            // in flight. If it had not, becomeLeader() finds an uncommitted
+            // tail and appends its own leadership no-op ahead of K1 (Raft
+            // S5.4.2: a leader may not treat a prior-term entry as committed
+            // by log presence alone), so K1 lands one index later than it
+            // would otherwise. The old assertion hard-coded index 2, assuming
+            // no no-op. Asserting on appendEntry's own return value instead
+            // is exact either way, without racing that delivery.
+            int k1Index = b.appendEntry(K1);
+            assertTrue(waitUntil(() -> b.getCommitIndex() == k1Index
                     && b.getCommittedConfig().members().equals(Set.of("b", "c")), 3000),
                     "The new leader must commit its term entry and adopt the {b, c} configuration");
         } finally {

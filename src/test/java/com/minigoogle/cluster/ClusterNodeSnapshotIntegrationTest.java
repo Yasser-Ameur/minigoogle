@@ -174,7 +174,16 @@ class ClusterNodeSnapshotIntegrationTest {
             node3b.getGossip().seedPeer(NODE_2);
             node3b.start();
             try {
-                String trace = awaitCatchUp(node1, node2, node3b, store3b);
+                // receiveInstallSnapshot() restores the state machine (making
+                // the KV visible to store3b.get()) before it persists the
+                // snapshot to disk a few statements later. Polling only the
+                // KV and then reading the snapshot file in a single, separate
+                // shot races that gap: under load the poll can observe the KV
+                // fully caught up while the snapshot save has not yet landed,
+                // so the disk read sees an older (or absent) snapshot. Fold
+                // the disk check into the same bounded poll so both signals
+                // are required together before the loop exits.
+                String trace = awaitCatchUp(node1, node2, node3b, store3b, snapshotStore3b);
                 assertTrue(trace == null, "The rejoining follower must converge to the full committed KV:\n" + trace);
                 for (int i = 1; i <= 20; i++) {
                     assertArrayEquals(value(i), store3b.get("k" + i), "key " + i);
@@ -210,18 +219,24 @@ class ClusterNodeSnapshotIntegrationTest {
     }
 
     /**
-     * Waits for the rejoining follower to hold all {@code count} keys, or
-     * returns a sampled state trace for diagnosis when it never does.
+     * Waits for the rejoining follower to hold all {@code count} keys AND to
+     * have durably installed a snapshot covering node-3's stale position, or
+     * returns a sampled state trace for diagnosis when it never does. Both
+     * conditions are checked together on every poll: the KV becomes visible
+     * before the snapshot is persisted to disk (see the caller), so waiting
+     * on the KV alone and then reading the snapshot file once, afterward,
+     * can observe the gap between those two steps.
      *
      * @return {@code null} when caught up, otherwise a diagnostic trace.
      */
     private static String awaitCatchUp(ClusterNode node1, ClusterNode node2, ClusterNode node3b,
-                                       ReplicatedKeyValueStore store3b) throws InterruptedException {
+                                       ReplicatedKeyValueStore store3b,
+                                       RaftSnapshotStore snapshotStore3b) throws IOException, InterruptedException {
         StringBuilder trace = new StringBuilder();
         long deadline = System.currentTimeMillis() + CATCH_UP_DEADLINE_MS;
         long lastSample = 0;
         while (System.currentTimeMillis() < deadline) {
-            if (hasApplied(store3b, 20)) {
+            if (hasApplied(store3b, 20) && installedSnapshotCoversPosition(snapshotStore3b, 7)) {
                 return null;
             }
             long now = System.currentTimeMillis();
@@ -343,6 +358,11 @@ class ClusterNodeSnapshotIntegrationTest {
             }
         }
         return true;
+    }
+
+    private static boolean installedSnapshotCoversPosition(RaftSnapshotStore snapshotStore, int index) throws IOException {
+        RaftSnapshot snapshot = snapshotStore.load();
+        return snapshot != null && snapshot.lastIncludedIndex() >= index;
     }
 
     private void makeLeader(ClusterNode node) {
