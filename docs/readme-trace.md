@@ -354,3 +354,12 @@ R17. `gh repo view Yasser-Ameur/minigoogle --json description,homepageUrl,reposi
 | 71 | About box topics | `java` (`build.gradle.kts:41-42` toolchain 21, row 1), `gradle` (`gradlew`), `search-engine` and `information-retrieval` (rows 2, 14; `corpusEval` BEIR harness, R10), `inverted-index` (`src/main/java/com/minigoogle/indexer`), `bm25` and `pagerank` (`bm25Score`, `pageRankScore` in R4), `raft` (row 3, `RaftConsensus.java`), `gossip-protocol` (`getGossip()` in `ClusterNodeSnapshotIntegrationTest.java`), `consistent-hashing` (row 3, `ClusterTest.testConsistentHashRingGetNodes`), `react` (`frontend/package.json` react 18), `docker` (`Dockerfile`, row 8). 12 topics, all lowercase with hyphens, under 50 characters |
 | 72 | The About box is unset until the user runs the command in the final report | R17 |
 | 73 | `assets/make-social.py` writes `assets/social-preview.png`, 1280x640, uploaded by hand | run: `python assets/make-social.py` printed `assets/social-preview.png (1280, 640)`, 145185 bytes; `assets/make-social.py:1-3` header; GitHub Docs social preview rule in the readme skill's sources.md |
+
+R18. After pushing e155932, run 33631942300 (build: success, docker: success), then:
+```
+$ docker pull ghcr.io/yasser-ameur/minigoogle:latest
+$ docker image inspect ghcr.io/yasser-ameur/minigoogle:latest --format '{{.Created}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+2026-09-02T12:53:12.319224503Z e15593202ab85c8a15e25bd2bd7648c539b6cb8d
+```
+
+| 74 | The `latest` image carries revision `e155932`, with the cluster work and the google.com UI | R18; commits 1389f64 (cluster wiring) and 28dce35 (UI) are ancestors of e155932 (`git log --oneline`) |
