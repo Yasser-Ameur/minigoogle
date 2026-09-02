@@ -144,10 +144,13 @@ class ReindexLifecycleTest {
                         doc("https://gen-" + gen, "alpha delta epsilon")));
             }
         } finally {
-            pool.shutdownNow();
+            // Let every reader finish its searches. shutdownNow() interrupted
+            // readers that were still running on a slow runner, and they
+            // reported that interruption as a failure of the index.
+            pool.shutdown();
         }
 
-        assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS));
+        assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS), "readers finished");
         assertTrue(failures.isEmpty(), "failures: " + failures);
         assertEquals(6, buildSeq.get(), "six reindex generations published");
     }
