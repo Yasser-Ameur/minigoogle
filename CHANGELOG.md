@@ -25,6 +25,12 @@ All notable changes to this project are documented here. Format follows
 - `POST /api/v1/crawl` on a CLUSTER node reports `owners` and `replicatedTo`.
 - `MINIGOGLE_GOSSIP_DEAD_TIMEOUT_MS` (`cluster.gossipDeadTimeoutMs`).
 
+### Changed
+
+- The web UI follows google.com's results page: Arial, a white or `#202124`
+  ground, blue titles, grey snippets, a pill search box, and the four brand
+  colours only in the wordmark. The System / Light / Dark switch stays.
+
 ### Fixed
 
 - `ConsistentHashRing` reads were unsynchronised against concurrent
