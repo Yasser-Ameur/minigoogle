@@ -110,8 +110,11 @@ class GossipProtocolTest {
         List<String> left = new ArrayList<>();
         node.addListener(new RecordingListener(joined, left));
 
+        // Silent for 150ms: past failureTimeoutMs (100ms), short of deadTimeoutMs
+        // (200ms). Silence is measured from the last real contact, so the
+        // DEAD clock does not restart at the moment of suspicion.
         node.receiveGossip("peer", Map.of(
-                "peer", state("peer", 1, NodeStatus.ALIVE, System.currentTimeMillis() - 5000)));
+                "peer", state("peer", 1, NodeStatus.ALIVE, System.currentTimeMillis() - 150)));
 
         // First pass: silent past failureTimeoutMs (100ms) => SUSPECT.
         node.checkForFailures();

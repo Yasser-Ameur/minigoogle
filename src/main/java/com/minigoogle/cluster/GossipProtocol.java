@@ -56,7 +56,10 @@ public class GossipProtocol {
         this.deadTimeoutMs = deadTimeoutMs;
         this.transport = transport;
         // Add self
-        membershipTable.put(nodeId, new GossipNodeState(nodeId, 0, NodeStatus.ALIVE, System.currentTimeMillis()));
+        // The counter starts at the wall clock so a restarted node outranks every
+        // frozen copy of its previous life; survivors then accept its ALIVE state
+        // from third parties by the ordinary fresher-counter rule.
+        membershipTable.put(nodeId, new GossipNodeState(nodeId, System.currentTimeMillis(), NodeStatus.ALIVE, System.currentTimeMillis()));
     }
 
     /**
@@ -139,22 +142,26 @@ public class GossipProtocol {
                     }
                 }
         } else if (senderId.equals(key)
-                || remote.heartbeatCounter() > local.heartbeatCounter()
-                || (remote.status() == NodeStatus.ALIVE && local.status() != NodeStatus.ALIVE)) {
-            // A node that contacts us is alive right now even if it restarted
-            // its heartbeat counter at zero (rejoin), and an ALIVE claim revives
-            // a suspect/dead local entry; otherwise a rejoining node whose
-            // counter restarts below the survivors' frozen value could never
-            // re-enter the cluster. Never regress the highest-known counter or
-            // liveness freshness.
+                || remote.heartbeatCounter() > local.heartbeatCounter()) {
+            // A node that contacts us is alive right now whatever counter it
+            // carries. Anyone else's entry is taken only when it is fresher: a
+            // survivor's frozen ALIVE copy of a stopped peer must not revive
+            // that peer on every exchange, or SUSPECT never reaches DEAD. A
+            // restarted node outranks its old copies because its counter
+            // starts at the wall clock. Never regress the highest-known counter
+            // or liveness freshness.
+            // The sender is talking to us right now, so its own entry is ALIVE
+            // whatever its table says: a stale or hostile self-report must not
+            // demote a peer we can plainly reach.
+            NodeStatus status = senderId.equals(key) ? NodeStatus.ALIVE : remote.status();
             GossipNodeState updated = new GossipNodeState(
                     key,
                     Math.max(remote.heartbeatCounter(), local.heartbeatCounter()),
-                    remote.status(),
+                    status,
                     Math.max(remote.lastSeen(), local.lastSeen()));
             membershipTable.put(key, updated);
             // Transition: was not ALIVE, now ALIVE => joined
-            if (local.status() != NodeStatus.ALIVE && remote.status() == NodeStatus.ALIVE) {
+            if (local.status() != NodeStatus.ALIVE && status == NodeStatus.ALIVE) {
                 for (MembershipListener l : listeners) {
                     l.onNodeJoined(key);
                 }
@@ -168,7 +175,7 @@ public class GossipProtocol {
      */
     public GossipNodeState heartbeat() {
         GossipNodeState self = membershipTable.get(nodeId);
-        long newCounter = self != null ? self.heartbeatCounter() + 1 : 0;
+        long newCounter = self != null ? self.heartbeatCounter() + 1 : System.currentTimeMillis();
         GossipNodeState updated = new GossipNodeState(nodeId, newCounter, NodeStatus.ALIVE, System.currentTimeMillis());
         membershipTable.put(nodeId, updated);
         return updated;
@@ -180,8 +187,10 @@ public class GossipProtocol {
     public void suspect(String targetNodeId) {
         GossipNodeState state = membershipTable.get(targetNodeId);
         if (state != null) {
+            // lastSeen stays the last real contact: the DEAD clock measures
+            // silence since then, not since the suspicion.
             membershipTable.put(targetNodeId, new GossipNodeState(
-                    targetNodeId, state.heartbeatCounter(), NodeStatus.SUSPECT, System.currentTimeMillis()));
+                    targetNodeId, state.heartbeatCounter(), NodeStatus.SUSPECT, state.lastSeen()));
         }
     }
 
