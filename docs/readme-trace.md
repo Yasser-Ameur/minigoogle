@@ -323,3 +323,4 @@ R15. Full suite on the tree at d184e7a: 921 test cases, 0 failures, 0 errors, 23
 | 50 | A document crawled while a node is SUSPECT reaches only owners that answer | R12 `replicatedTo` lists node 2 only while `owners` lists three |
 | 51 | Defaults 30000 and 90000 | `ConfigurationLoader.java` defaults, `config/application.yaml` |
 | 52 | Suite 921 tests, 0 failures, 23 skipped | R15 |
+| 53 | The published `latest` image is the 1.0.0 revision `dba39a4`; the cluster features reach it on the next push | R1 (`docker image inspect` label); `git log dba39a4..HEAD` lists the cluster commits; `docker-compose.yml` uses `build: .` |
