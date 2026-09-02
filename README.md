@@ -83,14 +83,14 @@ The walkthrough above, one still per step: the home page with the index count; a
 
 ## What the demo opened
 
-The page at `/` is a React 18 single-file build served by the Java process (`src/main/resources/demo/index.html`). It has a search box with suggestions from `/api/v1/suggest`, a results list where every hit can expand a "Why this result" panel with its BM25, PageRank and combined score, an "Add a URL to the index" box that asks for the API key on a 401 and remembers it, and a System / Light / Dark theme switch. The layout and colours are google.com's own: Arial, a white or `#202124` ground, blue titles, grey snippets, a pill search box, and the four brand colours only in the wordmark (`frontend/src/styles.css`). The hero above is the same page in dark and light.
+The page at `/` is a React 18 single-file build served by the Java process (`src/main/resources/demo/index.html`). It has a search box with suggestions from `/api/v1/suggest`, the two buttons under it (MiniGoogle Search, and I'm Feeling Lucky, which opens the top result itself), a results list where every hit can expand a "Why this result" panel with its BM25, PageRank and combined score, an "Add a URL to the index" box that asks for the API key on a 401 and remembers it, and a System / Light / Dark theme switch. The layout and colours are google.com's own: Arial, a white or `#202124` ground, blue titles, grey snippets, a pill search box, and the four brand colours only in the wordmark (`frontend/src/styles.css`). The hero above is the same page in dark and light.
 
 ## How it works
 
 A `STANDALONE` node (the default) does everything in one JVM:
 
 1. At start it indexes the 20 built-in demo documents plus every document ever submitted through `POST /api/v1/crawl`, replayed from `crawled-documents.jsonl` under the index directory.
-2. `POST /api/v1/crawl` fetches one URL, parses it with jsoup, appends it to that file and rebuilds the index. A target that cannot be fetched comes back as `502 FETCH_FAILED` (Wikipedia, for instance, answers the crawler with 403).
+2. `POST /api/v1/crawl` fetches one URL, parses it with jsoup, appends it to that file and rebuilds the index. A URL already in the index is replaced, not added twice. A target that cannot be fetched comes back as `502 FETCH_FAILED` (Wikipedia, for instance, answers the crawler with 403).
 3. `POST /api/v1/search` scores by BM25 and PageRank, and, with `semantic.enabled` on as it is by default, merges lexical and semantic candidates before ranking (asserted by `HybridEndToEndTest` and `SemanticEndToEndTest`). Pure BM25 is what the Relevance section below measures.
 
 Runtime dependencies are jsoup, Jackson, Gson, ONNX Runtime and SLF4J with Logback (`build.gradle.kts`). The HTTP server is `com.sun.net.httpserver` wrapped in `RestServer`; there is no web framework.

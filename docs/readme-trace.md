@@ -329,14 +329,15 @@ R15. Full suite on the tree at d184e7a: 921 test cases, 0 failures, 0 errors, 23
 
 `path:line` below cites the tree with the UI restyle applied on 2026-09-02.
 
-R16. Assets regenerated with `assets/seed.sh` (stats after seeding: `{"documentCount":43,"vocabularySize":7155,"averageDocumentLength":4532,"version":"1.0"}`), `assets/capture.cjs` in the Playwright container and `assets/make-gif.py`, then measured with Pillow:
+R16. Assets regenerated on the R19 node (42 seeded documents, 43 after the scene that adds one) with `assets/seed.sh`, `assets/capture.cjs` in the Playwright container and `assets/make-gif.py`, then measured with Pillow:
 ```
-assets/hero-dark.png      (1280, 800)   110424 bytes
+assets/hero-dark.png      (1280, 800)   110119 bytes
 assets/hero-dark@2x.png   (2560, 1600)  272320 bytes
 assets/hero-light.png     (1280, 800)   107300 bytes
 assets/hero-light@2x.png  (2560, 1600)  266113 bytes
+assets/social-preview.png (1280, 640)   145185 bytes
 assets/scenes/1-home.png .. 6-why-this-result.png  (1280, 800) each
-assets/demo.gif           (960, 600)    222235 bytes  6 frames  18.0 s
+assets/demo.gif           (960, 600)    229273 bytes  6 frames  18.0 s
 ```
 
 R17. `gh repo view Yasser-Ameur/minigoogle --json description,homepageUrl,repositoryTopics` before any About box was set:
@@ -363,3 +364,16 @@ $ docker image inspect ghcr.io/yasser-ameur/minigoogle:latest --format '{{.Creat
 ```
 
 | 74 | Every push to `master` rebuilds `latest`, which names its commit in the revision label | `.github/workflows/ci.yml:3-5,44-47` (push on master, docker job needs build); R18 (the label read `e155932` right after the push of e155932). A README naming one sha is stale by the next push, which is why the sentence names the label and the command instead |
+R19. Node rebuilt with the crawl fix, started on an empty index directory, seeded, then one seeded URL crawled again:
+```
+boot:      {"documentCount":20,"vocabularySize":680,"averageDocumentLength":71,"version":"1.0"}
+seeded:    {"documentCount":42,"vocabularySize":7155,"averageDocumentLength":4639,"version":"1.0"}
+$ curl -X POST localhost:8080/api/v1/crawl ... -d '{"url": "https://raft.github.io/"}'
+{"success":true,"title":"Raft Consensus Algorithm","url":"https://raft.github.io/"}
+recrawled: {"documentCount":42,...}
+$ search "http caching semantics" pageSize 20 -> total 13, unique URLs 13 of 13
+```
+Before the fix the same sequence on a node whose store already held the seeds reached 65 documents and listed every page twice (this session, 15:44).
+
+| 75 | A URL already in the index is replaced by a re-crawl, not added twice | `MiniGoogleAppUnitTest.java` `crawlingAUrlAgainReplacesItsDocumentInsteadOfAddingASecondCopy` (fails without the fix, checked this session); `MiniGoogleApp.java` `replaceByUrl` called from the crawl handler; R19 |
+| 76 | The two buttons under the home box; I'm Feeling Lucky opens the top result itself | `frontend/src/components/SearchBox.jsx:177-179`; `frontend/src/App.jsx:432-443` (`search(q, 1, 1)` then `window.location.assign(top.url)`); R19; scene `1-home.png` |

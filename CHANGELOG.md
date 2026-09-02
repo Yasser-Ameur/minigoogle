@@ -29,10 +29,15 @@ All notable changes to this project are documented here. Format follows
 
 - The web UI follows google.com's results page: Arial, a white or `#202124`
   ground, blue titles, grey snippets, a pill search box, and the four brand
-  colours only in the wordmark. The System / Light / Dark switch stays.
+  colours only in the wordmark, and the two buttons under the home box, the
+  second of which opens the top result itself. The System / Light / Dark
+  switch stays.
 
 ### Fixed
 
+- Crawling a URL that was already in the index added a second copy until the
+  next restart; it now replaces the earlier document, as the replay on boot
+  already did.
 - `ConsistentHashRing` reads were unsynchronised against concurrent
   add and remove; a read-write lock now guards them.
 - Internal cluster RPC routes accepted bodies of any size; they now answer
