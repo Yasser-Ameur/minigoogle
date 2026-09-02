@@ -437,7 +437,7 @@ public class MiniGoogleApp {
             synchronized (indexLock) {
                 try {
                     crawledDocumentStore.append(doc);
-                    allDocs.add(doc);
+                    replaceByUrl(allDocs, doc);
                     reindex();
                 } catch (IOException e) {
                     throw new RuntimeException("Failed to persist crawled document", e);
@@ -984,6 +984,17 @@ public class MiniGoogleApp {
      * package-visible helper so pagination math is unit-testable without a
      * live index or server.
      */
+    /**
+     * Adds {@code doc} to {@code docs}, dropping any document already held for
+     * the same URL, so a re-crawl refreshes a page instead of indexing it
+     * twice. Matches {@link CrawledDocumentStore#readAll()}, where the later
+     * record for a URL wins on replay.
+     */
+    static void replaceByUrl(List<ParsedDocument> docs, ParsedDocument doc) {
+        docs.removeIf(existing -> existing.url().equals(doc.url()));
+        docs.add(doc);
+    }
+
     static <T> List<T> paginate(List<T> items, int offset, int pageSize) {
         if (offset >= items.size()) {
             return List.of();
