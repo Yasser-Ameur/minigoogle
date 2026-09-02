@@ -156,6 +156,10 @@ class ClusterNodeSnapshotIntegrationTest {
                     "All three nodes must apply the first six entries");
 
             // Lose node-3, then push the surviving majority well past its position.
+            // Its position is the index it actually holds, not the put count:
+            // a leadership change during the first burst adds a no-op or a
+            // re-issued entry, so 6 puts need not mean index 6.
+            int node3Position = node3.getRaft().getLastLogIndex();
             node3.stop();
             node3Stopped = true;
             assertTrue(waitUntil(() -> leaderAmong(List.of(node1, node2)) != null, CONVERGENCE_DEADLINE_MS),
@@ -172,7 +176,7 @@ class ClusterNodeSnapshotIntegrationTest {
             // survivors, since leadership may have moved during the burst.
             assertTrue(waitUntil(() -> appliedOn(survivors, 20), CONVERGENCE_DEADLINE_MS),
                     "Every entry must apply on both survivors");
-            assertTrue(waitUntil(() -> bothCompactedPast(survivors, 7), CONVERGENCE_DEADLINE_MS),
+            assertTrue(waitUntil(() -> bothCompactedPast(survivors, node3Position + 1), CONVERGENCE_DEADLINE_MS),
                     "Both surviving nodes must compact past node-3's position so neither can serve the tail via log replication");
 
             // A fresh node-3 process rejoins on the same port. Its next index
@@ -194,16 +198,27 @@ class ClusterNodeSnapshotIntegrationTest {
                 // so the disk read sees an older (or absent) snapshot. Fold
                 // the disk check into the same bounded poll so both signals
                 // are required together before the loop exits.
-                String trace = awaitCatchUp(node1, node2, node3b, store3b, snapshotStore3b);
+                String trace = awaitCatchUp(node1, node2, node3b, store3b, snapshotStore3b, node3Position);
                 assertTrue(trace == null, "The rejoining follower must converge to the full committed KV:\n" + trace);
                 for (int i = 1; i <= 20; i++) {
                     assertArrayEquals(value(i), store3b.get("k" + i), "key " + i);
                 }
                 RaftSnapshot installed = snapshotStore3b.load();
                 assertNotNull(installed, "The rejoining follower must install the leader's snapshot");
-                assertTrue(installed.lastIncludedIndex() >= 7,
-                        "The installed snapshot must cover node-3's position");
-                assertEquals(20, node3b.getRaft().getLastApplied());
+                assertTrue(installed.lastIncludedIndex() > node3Position,
+                        "The installed snapshot must reach past node-3's position " + node3Position
+                                + " (its own last snapshot could cover up to it), got " + installed.lastIncludedIndex());
+                // Twenty puts land at index 20 only while one leader serves
+                // them all. A write re-issued through a new leader leaves the
+                // first attempt's entry or a leadership no-op in the log, so
+                // the index the survivors applied through, not 20, is what
+                // the rejoined follower must reach (CI, 2026-09-02, line 206
+                // read more than 20 on two runs).
+                int survivorsApplied = Math.max(node1.getRaft().getLastApplied(), node2.getRaft().getLastApplied());
+                assertTrue(survivorsApplied >= 20, "The survivors must have applied every put, applied " + survivorsApplied);
+                assertTrue(waitUntil(() -> node3b.getRaft().getLastApplied() >= survivorsApplied, CONVERGENCE_DEADLINE_MS),
+                        "The rejoining follower must apply through the survivors' index " + survivorsApplied
+                                + ", applied " + node3b.getRaft().getLastApplied());
             } finally {
                 node3b.stop();
             }
@@ -242,12 +257,13 @@ class ClusterNodeSnapshotIntegrationTest {
      */
     private static String awaitCatchUp(ClusterNode node1, ClusterNode node2, ClusterNode node3b,
                                        ReplicatedKeyValueStore store3b,
-                                       RaftSnapshotStore snapshotStore3b) throws IOException, InterruptedException {
+                                       RaftSnapshotStore snapshotStore3b,
+                                       int node3Position) throws IOException, InterruptedException {
         StringBuilder trace = new StringBuilder();
         long deadline = System.currentTimeMillis() + CATCH_UP_DEADLINE_MS;
         long lastSample = 0;
         while (System.currentTimeMillis() < deadline) {
-            if (hasApplied(store3b, 20) && installedSnapshotCoversPosition(snapshotStore3b, 7)) {
+            if (hasApplied(store3b, 20) && installedSnapshotCoversPosition(snapshotStore3b, node3Position + 1)) {
                 return null;
             }
             long now = System.currentTimeMillis();
