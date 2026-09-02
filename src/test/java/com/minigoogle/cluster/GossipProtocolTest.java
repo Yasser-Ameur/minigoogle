@@ -103,6 +103,74 @@ class GossipProtocolTest {
         assertEquals(NodeStatus.ALIVE, survivor.getMembershipTable().get("peer").status());
     }
 
+    @Test
+    void testSuspectEscalatesToDeadAfterDeadTimeoutAndFiresOnNodeLeftOnce() throws InterruptedException {
+        GossipProtocol node = new GossipProtocol("local", 1000, 100, 200, null);
+        List<String> joined = new ArrayList<>();
+        List<String> left = new ArrayList<>();
+        node.addListener(new RecordingListener(joined, left));
+
+        node.receiveGossip("peer", Map.of(
+                "peer", state("peer", 1, NodeStatus.ALIVE, System.currentTimeMillis() - 5000)));
+
+        // First pass: silent past failureTimeoutMs (100ms) => SUSPECT.
+        node.checkForFailures();
+        assertEquals(NodeStatus.SUSPECT, node.getMembershipTable().get("peer").status());
+        assertTrue(left.isEmpty(), "SUSPECT alone must not fire onNodeLeft");
+
+        // checkForFailures again before deadTimeoutMs elapses: still SUSPECT.
+        node.checkForFailures();
+        assertEquals(NodeStatus.SUSPECT, node.getMembershipTable().get("peer").status());
+
+        Thread.sleep(250);
+        node.checkForFailures();
+        node.checkForFailures();
+
+        assertEquals(NodeStatus.DEAD, node.getMembershipTable().get("peer").status());
+        assertEquals(1, left.size(), "onNodeLeft must fire exactly once");
+        assertEquals("peer", left.get(0));
+    }
+
+    @Test
+    void testRejoinAfterDeadFiresOnNodeJoinedOnce() {
+        GossipProtocol node = new GossipProtocol("local", 1000, 100, 200, null);
+        node.receiveGossip("peer", Map.of(
+                "peer", state("peer", 5, NodeStatus.ALIVE, 0)));
+        node.suspect("peer");
+        node.confirmDead("peer");
+        assertEquals(NodeStatus.DEAD, node.getMembershipTable().get("peer").status());
+
+        // Only start counting after the node is already known and DEAD, so
+        // the count below isolates the DEAD-to-ALIVE revival.
+        List<String> joined = new ArrayList<>();
+        List<String> left = new ArrayList<>();
+        node.addListener(new RecordingListener(joined, left));
+
+        node.receiveGossip("peer", Map.of(
+                "peer", state("peer", 6, NodeStatus.ALIVE, System.currentTimeMillis())));
+
+        assertEquals(NodeStatus.ALIVE, node.getMembershipTable().get("peer").status());
+        assertEquals(1, joined.size(), "onNodeJoined must fire exactly once for the rejoin");
+        assertEquals("peer", joined.get(0));
+    }
+
+    @Test
+    void testDeadReportWithStaleCounterDoesNotRegressLiveEntry() {
+        GossipProtocol survivor = new GossipProtocol("survivor", 1000, 100, 200, null);
+        survivor.receiveGossip("peer", Map.of(
+                "peer", state("peer", 10, NodeStatus.ALIVE, System.currentTimeMillis())));
+
+        // A third party's stale view reports "peer" DEAD with a lower
+        // counter than what the survivor already knows: this must not
+        // regress the live, higher-counter entry.
+        survivor.receiveGossip("other", Map.of(
+                "peer", state("peer", 2, NodeStatus.DEAD, 0)));
+
+        GossipNodeState result = survivor.getMembershipTable().get("peer");
+        assertEquals(10, result.heartbeatCounter(), "A stale DEAD report must not regress the counter");
+        assertEquals(NodeStatus.ALIVE, result.status(), "A stale DEAD report must not regress a live entry");
+    }
+
     private static GossipNodeState state(String nodeId, long counter, NodeStatus status, long lastSeen) {
         return new GossipNodeState(nodeId, counter, status, lastSeen);
     }

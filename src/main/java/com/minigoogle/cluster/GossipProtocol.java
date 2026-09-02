@@ -34,8 +34,30 @@ public class GossipProtocol {
     private ScheduledExecutorService scheduler;
     private final long gossipIntervalMs;
     private final long failureTimeoutMs;
+    private final long deadTimeoutMs;
 
     private final MembershipTransport transport;
+
+    /**
+     * Creates a gossip protocol node with full configuration, including the
+     * SUSPECT to DEAD escalation timeout.
+     *
+     * @param nodeId            The unique identifier for this node.
+     * @param gossipIntervalMs  The interval between gossip rounds in milliseconds.
+     * @param failureTimeoutMs  The timeout after which a node is considered suspect.
+     * @param deadTimeoutMs     The timeout after which a SUSPECT node is confirmed DEAD.
+     * @param transport         The transport layer for cluster communication.
+     */
+    public GossipProtocol(String nodeId, long gossipIntervalMs, long failureTimeoutMs, long deadTimeoutMs,
+                           MembershipTransport transport) {
+        this.nodeId = nodeId;
+        this.gossipIntervalMs = gossipIntervalMs;
+        this.failureTimeoutMs = failureTimeoutMs;
+        this.deadTimeoutMs = deadTimeoutMs;
+        this.transport = transport;
+        // Add self
+        membershipTable.put(nodeId, new GossipNodeState(nodeId, 0, NodeStatus.ALIVE, System.currentTimeMillis()));
+    }
 
     /**
      * Creates a gossip protocol node with full configuration.
@@ -46,12 +68,7 @@ public class GossipProtocol {
      * @param transport         The transport layer for cluster communication.
      */
     public GossipProtocol(String nodeId, long gossipIntervalMs, long failureTimeoutMs, MembershipTransport transport) {
-        this.nodeId = nodeId;
-        this.gossipIntervalMs = gossipIntervalMs;
-        this.failureTimeoutMs = failureTimeoutMs;
-        this.transport = transport;
-        // Add self
-        membershipTable.put(nodeId, new GossipNodeState(nodeId, 0, NodeStatus.ALIVE, System.currentTimeMillis()));
+        this(nodeId, gossipIntervalMs, failureTimeoutMs, 3 * failureTimeoutMs, transport);
     }
 
     /**
@@ -63,7 +80,7 @@ public class GossipProtocol {
     public GossipProtocol(String nodeId, MembershipTransport transport) {
         this(nodeId, 1000, 5000, transport);
     }
-    
+
     /**
      * Legacy constructor for tests without transport.
      */
@@ -169,7 +186,10 @@ public class GossipProtocol {
     }
 
     /**
-     * Confirms a node as dead and removes it from the cluster.
+     * Confirms a node as dead. The entry stays in the table (never removed)
+     * so a later exchange from the node, or a higher heartbeat counter for
+     * it, can revive it to ALIVE. Fires {@code onNodeLeft} exactly once per
+     * SUSPECT-to-DEAD transition.
      */
     public void confirmDead(String targetNodeId) {
         GossipNodeState state = membershipTable.get(targetNodeId);
@@ -217,16 +237,21 @@ public class GossipProtocol {
     }
 
     /**
-     * Checks for timed-out nodes and marks them as suspect.
+     * Checks for timed-out nodes: an ALIVE node silent past
+     * {@code failureTimeoutMs} is marked SUSPECT, and a SUSPECT node silent
+     * past {@code deadTimeoutMs} is escalated to DEAD.
      */
     public void checkForFailures() {
         long now = System.currentTimeMillis();
         for (Map.Entry<String, GossipNodeState> entry : membershipTable.entrySet()) {
             GossipNodeState state = entry.getValue();
-            if (!entry.getKey().equals(nodeId) &&
-                    state.status() == NodeStatus.ALIVE &&
-                    (now - state.lastSeen()) > failureTimeoutMs) {
+            if (entry.getKey().equals(nodeId)) {
+                continue;
+            }
+            if (state.status() == NodeStatus.ALIVE && (now - state.lastSeen()) > failureTimeoutMs) {
                 suspect(entry.getKey());
+            } else if (state.status() == NodeStatus.SUSPECT && (now - state.lastSeen()) > deadTimeoutMs) {
+                confirmDead(entry.getKey());
             }
         }
     }
@@ -248,7 +273,7 @@ public class GossipProtocol {
 
         // Pick a random live peer to exchange state with
         String peer = peers.get(random.nextInt(peers.size()));
-        
+
         if (transport != null) {
             transport.exchangeState(peer, Map.copyOf(membershipTable))
                     .thenAccept(ack -> {
