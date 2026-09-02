@@ -140,11 +140,17 @@ class ClusterNodeSnapshotIntegrationTest {
             List<ClusterNode> cluster = List.of(node1, node2, node3);
             assertTrue(waitUntil(() -> allLiveSetsConverged(cluster), CONVERGENCE_DEADLINE_MS),
                     "Gossip did not converge");
-            ClusterNode leader = stableLeaderAmong(cluster, 800);
+            stableLeaderAmong(cluster, 800);
             assertTrue(exactlyOneLeader(cluster), "Leadership must be stable before any write");
 
+            // A leader that has held for 800 ms can still lose its term during
+            // the burst: on a loaded runner a heartbeat arrives after a
+            // follower's 400 ms election timeout, that follower's higher term
+            // steps the leader down, and put() throws NotLeaderException
+            // (CI, 2026-09-02, at the first burst). Raft does not promise a
+            // stable leader, so write through whichever node leads right now.
             for (int i = 1; i <= 6; i++) {
-                leader.put("k" + i, value(i));
+                putThroughLeader(cluster, "k" + i, value(i));
             }
             assertTrue(waitUntil(() -> appliedOn(cluster, 6), CONVERGENCE_DEADLINE_MS),
                     "All three nodes must apply the first six entries");
@@ -154,20 +160,19 @@ class ClusterNodeSnapshotIntegrationTest {
             node3Stopped = true;
             assertTrue(waitUntil(() -> leaderAmong(List.of(node1, node2)) != null, CONVERGENCE_DEADLINE_MS),
                     "A surviving node must take over leadership");
-            leader = stableLeaderAmong(List.of(node1, node2), 800);
+            List<ClusterNode> survivors = List.of(node1, node2);
+            stableLeaderAmong(survivors, 800);
             for (int i = 7; i <= 20; i++) {
-                leader.put("k" + i, value(i));
+                putThroughLeader(survivors, "k" + i, value(i));
             }
             // put() acks once the entry is committed, but apply and the
             // snapshot that compacts the log run a step later; on a loaded
             // two-core runner that step was still in flight when a plain
-            // assertion read lastApplied. Poll for both, bounded.
-            final ClusterNode writer = leader;
-            assertTrue(waitUntil(() -> writer.getRaft().getLastApplied() == 20, CONVERGENCE_DEADLINE_MS),
-                    "Every entry must commit on the leader");
-            assertTrue(waitUntil(() -> writer.getRaft().getLogFirstIndex() > 7, CONVERGENCE_DEADLINE_MS),
-                    "The leader must compact the log past node-3's position");
-            assertTrue(waitUntil(() -> bothCompactedPast(List.of(node1, node2), 7), CONVERGENCE_DEADLINE_MS),
+            // assertion read lastApplied. Poll for both, bounded, on both
+            // survivors, since leadership may have moved during the burst.
+            assertTrue(waitUntil(() -> appliedOn(survivors, 20), CONVERGENCE_DEADLINE_MS),
+                    "Every entry must apply on both survivors");
+            assertTrue(waitUntil(() -> bothCompactedPast(survivors, 7), CONVERGENCE_DEADLINE_MS),
                     "Both surviving nodes must compact past node-3's position so neither can serve the tail via log replication");
 
             // A fresh node-3 process rejoins on the same port. Its next index
@@ -336,6 +341,27 @@ class ClusterNodeSnapshotIntegrationTest {
             Thread.sleep(25);
         }
         throw new AssertionError("No single leader remained stable for " + stabilityMs + "ms");
+    }
+
+    /**
+     * Writes through whichever node is currently leader, retrying across
+     * leadership changes until the write commits or the deadline passes.
+     */
+    private void putThroughLeader(List<ClusterNode> nodes, String key, byte[] value) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + CONVERGENCE_DEADLINE_MS;
+        while (System.currentTimeMillis() < deadline) {
+            ClusterNode leader = leaderAmong(nodes);
+            if (leader != null) {
+                try {
+                    leader.put(key, value);
+                    return;
+                } catch (NotLeaderException leadershipMoved) {
+                    // Re-issue on whoever leads now.
+                }
+            }
+            Thread.sleep(25);
+        }
+        fail("Could not commit " + key + " through any leader before the deadline");
     }
 
     private boolean appliedOn(List<ClusterNode> nodes, int index) {
