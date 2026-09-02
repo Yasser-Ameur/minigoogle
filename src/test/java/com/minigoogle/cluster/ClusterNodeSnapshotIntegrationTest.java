@@ -158,8 +158,14 @@ class ClusterNodeSnapshotIntegrationTest {
             for (int i = 7; i <= 20; i++) {
                 leader.put("k" + i, value(i));
             }
-            assertEquals(20, leader.getRaft().getLastApplied(), "Every entry must commit on the leader");
-            assertTrue(leader.getRaft().getLogFirstIndex() > 7,
+            // put() acks once the entry is committed, but apply and the
+            // snapshot that compacts the log run a step later; on a loaded
+            // two-core runner that step was still in flight when a plain
+            // assertion read lastApplied. Poll for both, bounded.
+            final ClusterNode writer = leader;
+            assertTrue(waitUntil(() -> writer.getRaft().getLastApplied() == 20, CONVERGENCE_DEADLINE_MS),
+                    "Every entry must commit on the leader");
+            assertTrue(waitUntil(() -> writer.getRaft().getLogFirstIndex() > 7, CONVERGENCE_DEADLINE_MS),
                     "The leader must compact the log past node-3's position");
             assertTrue(waitUntil(() -> bothCompactedPast(List.of(node1, node2), 7), CONVERGENCE_DEADLINE_MS),
                     "Both surviving nodes must compact past node-3's position so neither can serve the tail via log replication");
