@@ -1028,7 +1028,8 @@ public class MiniGoogleApp {
             queryCache.put(cacheKey(query), dtoResults);
             eventBus.publish(new QueryExecutedEvent(query, dtoResults.size(), elapsed, false));
 
-            return new SearchResponse(elapsed, dtoResults.size(), dtoResults, didYouMean);
+            return new SearchResponse(elapsed, dtoResults.size(), paginate(dtoResults, offset, pageSize),
+                    didYouMean, 0.0, 0.0, page, pageSize);
         }
     }
 
