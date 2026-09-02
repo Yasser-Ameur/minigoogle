@@ -11,6 +11,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -209,11 +213,52 @@ class RestServerTest {
         assertEquals("https://allowed.example", preflightResp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
         assertEquals("GET, POST, OPTIONS", preflightResp.headers().firstValue("Access-Control-Allow-Methods").orElse(null));
 
+        HttpRequest matchingActual = HttpRequest.newBuilder(URI.create(base() + "/cors"))
+                .header("Origin", "https://allowed.example")
+                .GET().build();
+        HttpResponse<String> matchingResp = client.send(matchingActual, HttpResponse.BodyHandlers.ofString());
+        assertEquals("https://allowed.example", matchingResp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+        assertEquals("Origin", matchingResp.headers().firstValue("Vary").orElse(null));
+
         HttpRequest actual = HttpRequest.newBuilder(URI.create(base() + "/cors"))
                 .header("Origin", "https://other.example")
                 .GET().build();
         HttpResponse<String> actualResp = client.send(actual, HttpResponse.BodyHandlers.ofString());
-        assertEquals("*", actualResp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+        assertTrue(actualResp.headers().firstValue("Access-Control-Allow-Origin").isEmpty(),
+                "a non-matching origin in list mode must get no ACAO header at all");
+        assertEquals(200, actualResp.statusCode(), "an unmatched origin still lets the actual request through");
+    }
+
+    @Test
+    void corsPreflightFromDisallowedOriginIsForbidden() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 10_000, 0, 0, "https://allowed.example", null, 1000);
+        server = new RestServer(0, opts);
+        server.get("/cors2", body -> "{}");
+        server.start();
+
+        HttpRequest preflight = HttpRequest.newBuilder(URI.create(base() + "/cors2"))
+                .method("OPTIONS", HttpRequest.BodyPublishers.noBody())
+                .header("Origin", "https://evil.example")
+                .build();
+        HttpResponse<String> resp = client.send(preflight, HttpResponse.BodyHandlers.ofString());
+        assertEquals(403, resp.statusCode());
+        assertTrue(resp.body().contains("FORBIDDEN_ORIGIN"));
+        assertTrue(resp.headers().firstValue("Access-Control-Allow-Origin").isEmpty());
+    }
+
+    @Test
+    void wildcardCorsStaysWildcardRegardlessOfOrigin() throws Exception {
+        ServerOptions opts = new ServerOptions(4, 1_048_576, 10_000, 0, 0, "*", null, 1000);
+        server = new RestServer(0, opts);
+        server.get("/cors3", body -> "{}");
+        server.start();
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(base() + "/cors3"))
+                .header("Origin", "https://anything.example")
+                .GET().build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertEquals("*", resp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+        assertTrue(resp.headers().firstValue("Vary").isEmpty());
     }
 
     @Test
@@ -271,5 +316,122 @@ class RestServerTest {
         assertEquals(200, resp.statusCode());
         assertTrue(resp.body().contains("done"));
         server = null;
+    }
+
+    @Test
+    void threadCountStaysBoundedUnderConcurrentSlowRequests() throws Exception {
+        int maxThreads = 8;
+        ServerOptions opts = new ServerOptions(maxThreads, 1_048_576, 150, 0, 0, "", null, 500);
+        server = new RestServer(0, opts);
+        CountDownLatch release = new CountDownLatch(1);
+        server.get("/stuck", body -> {
+            try {
+                release.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return "{}";
+        });
+        server.start();
+
+        ExecutorService callers = Executors.newFixedThreadPool(50);
+        List<CompletableFuture<Integer>> futures = new ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+            futures.add(CompletableFuture.supplyAsync(() -> sendGet("/stuck"), callers));
+        }
+
+        Thread.sleep(400);
+        long restServerThreads = Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.getName().startsWith("rest-server-"))
+                .count();
+        assertTrue(restServerThreads <= maxThreads + 2,
+                "expected at most " + (maxThreads + 2) + " rest-server threads, found " + restServerThreads);
+
+        release.countDown();
+        for (CompletableFuture<Integer> f : futures) {
+            f.get(10, TimeUnit.SECONDS);
+        }
+        callers.shutdown();
+    }
+
+    @Test
+    void requestBeyondCapacityGets503() throws Exception {
+        int maxThreads = 2;
+        int queueCapacity = maxThreads * 4;
+        int capacity = maxThreads + queueCapacity;
+        ServerOptions opts = new ServerOptions(maxThreads, 1_048_576, 5_000, 0, 0, "", null, 500);
+        server = new RestServer(0, opts);
+        CountDownLatch release = new CountDownLatch(1);
+        server.get("/stuck3", body -> {
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return "{}";
+        });
+        server.start();
+
+        ExecutorService callers = Executors.newFixedThreadPool(capacity);
+        List<CompletableFuture<Integer>> fillers = new ArrayList<>();
+        for (int i = 0; i < capacity; i++) {
+            fillers.add(CompletableFuture.supplyAsync(() -> sendGet("/stuck3"), callers));
+        }
+        Thread.sleep(500);
+
+        HttpRequest overflow = HttpRequest.newBuilder(URI.create(base() + "/stuck3")).GET().build();
+        HttpResponse<String> resp = client.send(overflow, HttpResponse.BodyHandlers.ofString());
+        assertEquals(503, resp.statusCode());
+        assertTrue(resp.body().contains("SERVICE_BUSY"));
+        assertEquals("1", resp.headers().firstValue("Retry-After").orElse(null));
+
+        release.countDown();
+        for (CompletableFuture<Integer> f : fillers) {
+            f.get(10, TimeUnit.SECONDS);
+        }
+        callers.shutdown();
+    }
+
+    @Test
+    void twentyThousandDistinctAddressesDoNotLeaveTwentyThousandBuckets() throws Exception {
+        server = new RestServer(0, new ServerOptions(4, 1_048_576, 10_000, 5.0, 5, "", null, 1000));
+        server.setRateBucketIdleNanosForTesting(0);
+
+        for (int i = 0; i < 20_000; i++) {
+            server.allowRequestForTesting("client-" + i);
+        }
+
+        assertTrue(server.rateBucketCountForTesting() < 20_000,
+                "expected idle buckets to be swept, found " + server.rateBucketCountForTesting());
+    }
+
+    @Test
+    void unmatchedPathReturns404AndRootStillServesQueryStrings() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        server.getHtml("/", req -> "<html>ok</html>");
+        List<String> routes = new ArrayList<>();
+        server.setRequestObserver((route, method, status, durationNanos) -> routes.add(route));
+        server.start();
+
+        HttpRequest rootWithQuery = HttpRequest.newBuilder(URI.create(base() + "/?q=test")).GET().build();
+        HttpResponse<String> rootResp = client.send(rootWithQuery, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, rootResp.statusCode());
+        assertTrue(rootResp.body().contains("ok"));
+
+        HttpRequest unmatched = HttpRequest.newBuilder(URI.create(base() + "/does/not/exist")).GET().build();
+        HttpResponse<String> unmatchedResp = client.send(unmatched, HttpResponse.BodyHandlers.ofString());
+        assertEquals(404, unmatchedResp.statusCode());
+        assertTrue(unmatchedResp.body().contains("NOT_FOUND"));
+
+        assertTrue(routes.contains("unmatched"));
+    }
+
+    private int sendGet(String path) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder(URI.create(base() + path)).GET().build();
+            return client.send(req, HttpResponse.BodyHandlers.ofString()).statusCode();
+        } catch (Exception e) {
+            return -1;
+        }
     }
 }

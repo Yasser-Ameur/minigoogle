@@ -13,15 +13,16 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
@@ -29,12 +30,48 @@ public class RestServer {
 
     private static final Logger log = LoggerFactory.getLogger(RestServer.class);
     private static final Pattern REQUEST_ID_PATTERN = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+    private static final long DEFAULT_RATE_BUCKET_IDLE_NANOS = TimeUnit.SECONDS.toNanos(60);
+    private static final int RATE_BUCKET_EVICT_THRESHOLD = 10_000;
+    private static final long RATE_BUCKET_SWEEP_INTERVAL_SECONDS = 30;
 
     private final HttpServer server;
     private final ServerOptions options;
-    private final ThreadPoolExecutor executor;
-    private final ExecutorService handlerExecutor;
+
+    /**
+     * Fixed-size pool that runs every handler end to end (parsing, the
+     * registered {@code Function<String,String>}, response writing). This is
+     * the ONLY thread pool RestServer owns for request work, so total
+     * concurrency is capped at {@code maxThreads} no matter how much traffic
+     * arrives; overflow is turned away in {@link #dispatch} before it ever
+     * reaches a pool thread.
+     */
+    private final ThreadPoolExecutor pool;
+
+    /**
+     * Single shared thread used for two cheap, infrequent jobs: firing the
+     * per-request timeout watchdog and sweeping idle rate-limit buckets. It
+     * never runs handler code itself.
+     */
+    private final ScheduledExecutorService scheduler;
+
+    /** Total requests currently admitted (running in {@link #pool} or queued in it). */
+    private final AtomicInteger admitted = new AtomicInteger();
+    private final int capacity;
+
+    /**
+     * Marks the calling thread as being inside the synchronous "reject, don't
+     * queue" path taken when {@link #admitted} is already at {@link #capacity}.
+     * Set by {@link #dispatch} immediately around running the (otherwise
+     * opaque) HttpServer-supplied task, so {@link #handleRequest} - invoked
+     * transitively from that same call - can tell it must answer 503 without
+     * doing any real work or touching the pool.
+     */
+    private final ThreadLocal<Boolean> overloaded = new ThreadLocal<>();
+
     private final ConcurrentHashMap<String, TokenBucket> rateBuckets = new ConcurrentHashMap<>();
+    private volatile long rateBucketIdleNanos = DEFAULT_RATE_BUCKET_IDLE_NANOS;
+    private final AtomicBoolean rateBucketSweeping = new AtomicBoolean();
+
     private volatile RequestObserver observer;
 
     public RestServer(int port) {
@@ -49,10 +86,54 @@ public class RestServer {
             throw new RuntimeException("Failed to start RestServer on port " + port, e);
         }
         int maxThreads = Math.max(1, options.maxThreads());
-        this.executor = new ThreadPoolExecutor(maxThreads, maxThreads, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
-        this.executor.allowCoreThreadTimeOut(true);
-        this.server.setExecutor(executor);
-        this.handlerExecutor = Executors.newCachedThreadPool();
+        int queueCapacity = maxThreads * 4;
+        this.capacity = maxThreads + queueCapacity;
+        AtomicInteger workerSeq = new AtomicInteger();
+        ThreadFactory workerFactory = r -> {
+            Thread t = new Thread(r, "rest-server-worker-" + workerSeq.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        this.pool = new ThreadPoolExecutor(maxThreads, maxThreads, 60L, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(queueCapacity), workerFactory);
+        this.pool.allowCoreThreadTimeOut(true);
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "rest-server-watchdog");
+            t.setDaemon(true);
+            return t;
+        });
+        this.scheduler.scheduleAtFixedRate(this::evictIdleRateBuckets,
+                RATE_BUCKET_SWEEP_INTERVAL_SECONDS, RATE_BUCKET_SWEEP_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        this.server.setExecutor(this::dispatch);
+    }
+
+    /**
+     * Entry point HttpServer calls once a request's headers are parsed.
+     * Admits up to {@code capacity} (maxThreads + queue) requests into
+     * {@link #pool}; anything beyond that is answered 503 synchronously, on
+     * the calling (HttpServer dispatch) thread, without ever occupying a pool
+     * thread - this is the backpressure mechanism, in place of an unbounded
+     * queue or a raw {@code RejectedExecutionException} (which would just
+     * reset the client's connection with no response).
+     */
+    private void dispatch(Runnable command) {
+        if (admitted.incrementAndGet() > capacity) {
+            admitted.decrementAndGet();
+            overloaded.set(Boolean.TRUE);
+            try {
+                command.run();
+            } finally {
+                overloaded.remove();
+            }
+            return;
+        }
+        pool.execute(() -> {
+            try {
+                command.run();
+            } finally {
+                admitted.decrementAndGet();
+            }
+        });
     }
 
     public void setRequestObserver(RequestObserver o) {
@@ -93,15 +174,60 @@ public class RestServer {
         String method = exchange.getRequestMethod();
         String requestId = resolveRequestId(exchange);
         exchange.getResponseHeaders().set("X-Request-Id", requestId);
+        String observedRoute = route;
 
+        if (Boolean.TRUE.equals(overloaded.get())) {
+            int status = 503;
+            exchange.getResponseHeaders().set("Retry-After", "1");
+            writeError(exchange, requestId, 503, "SERVICE_BUSY", "Server is busy, try again shortly");
+            long durationNanos = System.nanoTime() - startNanos;
+            log.info("{} {} -> {} ({} ms) requestId={}", method, route, status, durationNanos / 1_000_000, requestId);
+            RequestObserver o = observer;
+            if (o != null) {
+                o.onRequest(route, method, status, durationNanos);
+            }
+            return;
+        }
+
+        // The "/" context also catches every unmatched path (HttpServer routes
+        // by longest matching prefix), so only the exact "/" path may reach the
+        // registered handler; anything else is an explicit 404.
+        if ("/".equals(route) && !"/".equals(exchange.getRequestURI().getPath())) {
+            observedRoute = "unmatched";
+        }
+
+        String allowedOrigin = null;
+        boolean corsIsWildcard = false;
         boolean corsEnabled = options.corsAllowedOrigins() != null && !options.corsAllowedOrigins().isBlank();
         if (corsEnabled) {
-            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", resolveAllowedOrigin(exchange));
+            String origins = options.corsAllowedOrigins().trim();
+            if ("*".equals(origins)) {
+                allowedOrigin = "*";
+                corsIsWildcard = true;
+            } else {
+                allowedOrigin = matchOrigin(origins, exchange.getRequestHeaders().getFirst("Origin"));
+            }
+            if (allowedOrigin != null) {
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", allowedOrigin);
+                if (!corsIsWildcard) {
+                    exchange.getResponseHeaders().add("Vary", "Origin");
+                }
+            }
         }
 
         int status = 500;
         try {
+            if ("unmatched".equals(observedRoute)) {
+                status = 404;
+                writeError(exchange, requestId, 404, "NOT_FOUND", "No such route");
+                return;
+            }
             if (corsEnabled && "OPTIONS".equals(method)) {
+                if (allowedOrigin == null) {
+                    status = 403;
+                    writeError(exchange, requestId, 403, "FORBIDDEN_ORIGIN", "Origin not allowed");
+                    return;
+                }
                 exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
                 exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Request-Id");
                 exchange.sendResponseHeaders(204, -1);
@@ -128,21 +254,10 @@ public class RestServer {
             }
 
             String input = "POST".equals(expectedMethod) ? readBodyWithCap(exchange) : exchange.getRequestURI().toString();
-            String responseBody = runWithTimeout(handler, input);
-
-            byte[] bytes = responseBody.getBytes(StandardCharsets.UTF_8);
-            exchange.getResponseHeaders().set("Content-Type", contentType);
-            exchange.sendResponseHeaders(200, bytes.length);
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(bytes);
-            }
-            status = 200;
+            status = runWithWatchdog(exchange, requestId, handler, input, contentType);
         } catch (HttpError he) {
             status = he.status();
             writeError(exchange, requestId, he.status(), he.code(), he.getMessage());
-        } catch (TimeoutException te) {
-            status = 504;
-            writeError(exchange, requestId, 504, "TIMEOUT", "Handler timed out");
         } catch (Exception e) {
             status = 500;
             log.error("Unhandled error handling {} {} requestId={}", method, route, requestId, e);
@@ -152,8 +267,64 @@ public class RestServer {
             log.info("{} {} -> {} ({} ms) requestId={}", method, route, status, durationNanos / 1_000_000, requestId);
             RequestObserver o = observer;
             if (o != null) {
-                o.onRequest(route, method, status, durationNanos);
+                o.onRequest(observedRoute, method, status, durationNanos);
             }
+        }
+    }
+
+    /**
+     * Runs {@code handler} on the current (pool) thread and races it against a
+     * single scheduled watchdog task. If the handler overruns
+     * {@code requestTimeoutMs}, the watchdog writes the 504 response itself,
+     * flips {@code answered} so the eventual handler result is discarded, and
+     * interrupts this worker thread. A handler that ignores the interrupt
+     * simply keeps this pool thread occupied until it returns on its own -
+     * that thread is still "busy" from the pool's point of view, which is the
+     * mechanism (not a separate accounting step) that keeps a stuck handler
+     * from ever exceeding the pool's thread budget.
+     *
+     * @return the HTTP status actually written to the exchange, for logging.
+     */
+    private int runWithWatchdog(HttpExchange exchange, String requestId, Function<String, String> handler,
+                                 String input, String contentType) throws IOException {
+        long timeoutMs = options.requestTimeoutMs();
+        if (timeoutMs <= 0) {
+            byte[] bytes = handler.apply(input).getBytes(StandardCharsets.UTF_8);
+            writeSuccess(exchange, contentType, bytes);
+            return 200;
+        }
+
+        AtomicBoolean answered = new AtomicBoolean(false);
+        Thread worker = Thread.currentThread();
+        ScheduledFuture<?> watchdogFuture = scheduler.schedule(() -> {
+            if (answered.compareAndSet(false, true)) {
+                writeError(exchange, requestId, 504, "TIMEOUT", "Handler timed out");
+                worker.interrupt();
+            }
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+
+        String responseBody;
+        try {
+            responseBody = handler.apply(input);
+        } finally {
+            watchdogFuture.cancel(false);
+        }
+
+        if (!answered.compareAndSet(false, true)) {
+            // The watchdog already answered (and interrupted us) while the
+            // handler kept running; its response was already sent, discard ours.
+            return 504;
+        }
+        byte[] bytes = responseBody.getBytes(StandardCharsets.UTF_8);
+        writeSuccess(exchange, contentType, bytes);
+        return 200;
+    }
+
+    private void writeSuccess(HttpExchange exchange, String contentType, byte[] bytes) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
         }
     }
 
@@ -179,29 +350,6 @@ public class RestServer {
         return buffer.toString(StandardCharsets.UTF_8);
     }
 
-    private String runWithTimeout(Function<String, String> handler, String input) throws TimeoutException {
-        long timeoutMs = options.requestTimeoutMs();
-        if (timeoutMs <= 0) {
-            return handler.apply(input);
-        }
-        Future<String> future = handlerExecutor.submit(() -> handler.apply(input));
-        try {
-            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException te) {
-            future.cancel(true);
-            throw te;
-        } catch (ExecutionException ee) {
-            Throwable cause = ee.getCause();
-            if (cause instanceof RuntimeException re) {
-                throw re;
-            }
-            throw new RuntimeException(cause);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException(ie);
-        }
-    }
-
     private String resolveRequestId(HttpExchange exchange) {
         String header = exchange.getRequestHeaders().getFirst("X-Request-Id");
         if (header != null && REQUEST_ID_PATTERN.matcher(header).matches()) {
@@ -210,20 +358,17 @@ public class RestServer {
         return RequestIdGenerator.generate();
     }
 
-    private String resolveAllowedOrigin(HttpExchange exchange) {
-        String origins = options.corsAllowedOrigins().trim();
-        if ("*".equals(origins)) {
-            return "*";
+    /** Returns the matching allowed origin, or {@code null} if none of the comma-separated entries match. */
+    private static String matchOrigin(String commaSeparatedOrigins, String origin) {
+        if (origin == null) {
+            return null;
         }
-        String origin = exchange.getRequestHeaders().getFirst("Origin");
-        if (origin != null) {
-            for (String allowed : origins.split(",")) {
-                if (allowed.trim().equals(origin)) {
-                    return origin;
-                }
+        for (String allowed : commaSeparatedOrigins.split(",")) {
+            if (allowed.trim().equals(origin)) {
+                return origin;
             }
         }
-        return "*";
+        return null;
     }
 
     private boolean authorized(HttpExchange exchange) {
@@ -255,7 +400,40 @@ public class RestServer {
         int computedBurst = options.rateLimitBurst() > 0 ? options.rateLimitBurst() : (int) Math.ceil(rate);
         final int burst = Math.max(1, computedBurst);
         TokenBucket bucket = rateBuckets.computeIfAbsent(key, k -> new TokenBucket(burst));
-        return bucket.tryConsume(rate, burst);
+        boolean allowed = bucket.tryConsume(rate, burst);
+        if (rateBuckets.size() > RATE_BUCKET_EVICT_THRESHOLD) {
+            evictIdleRateBuckets();
+        }
+        return allowed;
+    }
+
+    /** Removes buckets not touched in the last {@link #rateBucketIdleNanos}, so distinct-client volume never grows the map without bound. */
+    private void evictIdleRateBuckets() {
+        if (!rateBucketSweeping.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            long now = System.nanoTime();
+            long idleNanos = rateBucketIdleNanos;
+            rateBuckets.entrySet().removeIf(e -> e.getValue().isIdle(now, idleNanos));
+        } finally {
+            rateBucketSweeping.set(false);
+        }
+    }
+
+    /** Test-only seam: lets a test shrink the idle window instead of waiting 60s for real. */
+    void setRateBucketIdleNanosForTesting(long nanos) {
+        this.rateBucketIdleNanos = nanos;
+    }
+
+    /** Test-only seam: exercises the rate limiter for an arbitrary client key without a real socket. */
+    boolean allowRequestForTesting(String key) {
+        return allowRequest(key);
+    }
+
+    /** Test-only seam: current rate-bucket count. */
+    int rateBucketCountForTesting() {
+        return rateBuckets.size();
     }
 
     private void writeError(HttpExchange exchange, String requestId, int status, String code, String message) {
@@ -317,14 +495,14 @@ public class RestServer {
     public void stop() {
         int delaySeconds = (int) Math.max(0, Math.ceil(options.shutdownGraceMs() / 1000.0));
         server.stop(delaySeconds);
-        executor.shutdown();
+        pool.shutdown();
         try {
-            executor.awaitTermination(Math.max(0, options.shutdownGraceMs()), TimeUnit.MILLISECONDS);
+            pool.awaitTermination(Math.max(0, options.shutdownGraceMs()), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        executor.shutdownNow();
-        handlerExecutor.shutdownNow();
+        pool.shutdownNow();
+        scheduler.shutdownNow();
     }
 
     private static final class TokenBucket {
@@ -346,6 +524,10 @@ public class RestServer {
                 return true;
             }
             return false;
+        }
+
+        synchronized boolean isIdle(long nowNanos, long idleNanos) {
+            return nowNanos - lastRefillNanos > idleNanos;
         }
     }
 }
