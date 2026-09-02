@@ -5,10 +5,13 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Consistent hash ring for distributing data across cluster nodes.
@@ -20,12 +23,20 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * When a node is added, only the keys between it and its predecessor
  * need to be moved — not all keys.
+ *
+ * <p>The ring itself ({@code TreeMap}) is guarded by a
+ * {@link ReentrantReadWriteLock}: {@link #addNode(String)} and
+ * {@link #removeNode(String)} take the write lock, while every read
+ * ({@link #getNode(String)}, {@link #getNodes(String, int)}, {@link #nodes()},
+ * counts) takes the read lock. Without this, a lookup racing a membership
+ * change could observe a {@code TreeMap} mid-mutation.</p>
  */
 public class ConsistentHashRing {
 
     private final TreeMap<Long, String> ring = new TreeMap<>();
     private final int virtualNodesPerPhysical;
     private final Map<String, List<Long>> nodePositions = new ConcurrentHashMap<>();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     public ConsistentHashRing(int virtualNodesPerPhysical) {
         this.virtualNodesPerPhysical = virtualNodesPerPhysical;
@@ -38,25 +49,37 @@ public class ConsistentHashRing {
     /**
      * Adds a node to the ring with virtual nodes.
      */
-    public synchronized void addNode(String nodeId) {
+    public void addNode(String nodeId) {
         List<Long> positions = new ArrayList<>();
         for (int i = 0; i < virtualNodesPerPhysical; i++) {
             long hash = hash(nodeId + "#" + i);
-            ring.put(hash, nodeId);
             positions.add(hash);
         }
-        nodePositions.put(nodeId, positions);
+        lock.writeLock().lock();
+        try {
+            for (long pos : positions) {
+                ring.put(pos, nodeId);
+            }
+            nodePositions.put(nodeId, positions);
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     /**
      * Removes a node from the ring.
      */
-    public synchronized void removeNode(String nodeId) {
-        List<Long> positions = nodePositions.remove(nodeId);
-        if (positions != null) {
-            for (long pos : positions) {
-                ring.remove(pos);
+    public void removeNode(String nodeId) {
+        lock.writeLock().lock();
+        try {
+            List<Long> positions = nodePositions.remove(nodeId);
+            if (positions != null) {
+                for (long pos : positions) {
+                    ring.remove(pos);
+                }
             }
+        } finally {
+            lock.writeLock().unlock();
         }
     }
 
@@ -67,47 +90,57 @@ public class ConsistentHashRing {
      * @return The node ID, or null if the ring is empty.
      */
     public String getNode(String key) {
-        if (ring.isEmpty()) return null;
         long hash = hash(key);
-        Map.Entry<Long, String> entry = ring.ceilingEntry(hash);
-        if (entry == null) {
-            // Wrap around to the first node
-            entry = ring.firstEntry();
+        lock.readLock().lock();
+        try {
+            if (ring.isEmpty()) return null;
+            Map.Entry<Long, String> entry = ring.ceilingEntry(hash);
+            if (entry == null) {
+                // Wrap around to the first node
+                entry = ring.firstEntry();
+            }
+            return entry.getValue();
+        } finally {
+            lock.readLock().unlock();
         }
-        return entry.getValue();
     }
 
     /**
      * Returns the N nodes responsible for a key (for replication).
      */
     public List<String> getNodes(String key, int count) {
-        if (ring.isEmpty()) return List.of();
-        List<String> nodes = new ArrayList<>();
         long hash = hash(key);
+        lock.readLock().lock();
+        try {
+            if (ring.isEmpty()) return List.of();
+            List<String> nodes = new ArrayList<>();
 
-        Map.Entry<Long, String> entry = ring.ceilingEntry(hash);
-        if (entry == null) {
-            entry = ring.firstEntry();
-        }
-
-        // Walk clockwise, collecting unique node IDs
-        var cursor = ring.tailMap(entry.getKey(), true).entrySet().iterator();
-        while (cursor.hasNext() && nodes.size() < count) {
-            String node = cursor.next().getValue();
-            if (!nodes.contains(node)) {
-                nodes.add(node);
+            Map.Entry<Long, String> entry = ring.ceilingEntry(hash);
+            if (entry == null) {
+                entry = ring.firstEntry();
             }
-        }
-        // Wrap around if needed
-        cursor = ring.entrySet().iterator();
-        while (cursor.hasNext() && nodes.size() < count) {
-            String node = cursor.next().getValue();
-            if (!nodes.contains(node)) {
-                nodes.add(node);
-            }
-        }
 
-        return Collections.unmodifiableList(nodes);
+            // Walk clockwise, collecting unique node IDs
+            var cursor = ring.tailMap(entry.getKey(), true).entrySet().iterator();
+            while (cursor.hasNext() && nodes.size() < count) {
+                String node = cursor.next().getValue();
+                if (!nodes.contains(node)) {
+                    nodes.add(node);
+                }
+            }
+            // Wrap around if needed
+            cursor = ring.entrySet().iterator();
+            while (cursor.hasNext() && nodes.size() < count) {
+                String node = cursor.next().getValue();
+                if (!nodes.contains(node)) {
+                    nodes.add(node);
+                }
+            }
+
+            return Collections.unmodifiableList(nodes);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -122,10 +155,24 @@ public class ConsistentHashRing {
     }
 
     /**
+     * @return An immutable snapshot of the physical node IDs currently on the
+     *         ring. Unlike {@link #getAllNodes()}, the returned set has no
+     *         defined order.
+     */
+    public Set<String> nodes() {
+        return Collections.unmodifiableSet(new LinkedHashSet<>(nodePositions.keySet()));
+    }
+
+    /**
      * @return The total number of virtual nodes on the ring.
      */
     public int virtualNodeCount() {
-        return ring.size();
+        lock.readLock().lock();
+        try {
+            return ring.size();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**

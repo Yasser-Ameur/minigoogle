@@ -2,7 +2,11 @@ package com.minigoogle.cluster;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -56,6 +60,81 @@ class ClusterTest {
         List<String> nodes = ring.getNodes("key", 3);
         assertEquals(3, nodes.size());
         assertEquals(3, ring.nodeCount());
+    }
+
+    @Test
+    void testRingBalanceWithinQuarterOfMean() {
+        ConsistentHashRing ring = new ConsistentHashRing();
+        String[] nodeIds = {"node-1", "node-2", "node-3", "node-4", "node-5"};
+        for (String nodeId : nodeIds) {
+            ring.addNode(nodeId);
+        }
+
+        int keyCount = 10_000;
+        Map<String, Integer> counts = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            String owner = ring.getNode("key-" + i);
+            counts.merge(owner, 1, Integer::sum);
+        }
+
+        double mean = keyCount / (double) nodeIds.length;
+        double tolerance = mean * 0.25;
+        for (String nodeId : nodeIds) {
+            int count = counts.getOrDefault(nodeId, 0);
+            assertTrue(Math.abs(count - mean) <= tolerance,
+                    nodeId + " got " + count + " keys, mean is " + mean + ", tolerance is " + tolerance);
+        }
+    }
+
+    @Test
+    void testRingMinimalMovementOnNodeRemoval() {
+        ConsistentHashRing ring = new ConsistentHashRing();
+        String[] nodeIds = {"node-1", "node-2", "node-3", "node-4", "node-5"};
+        for (String nodeId : nodeIds) {
+            ring.addNode(nodeId);
+        }
+
+        int keyCount = 2_000;
+        Map<String, String> before = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            String key = "key-" + i;
+            before.put(key, ring.getNode(key));
+        }
+
+        Set<String> keysOwnedByRemoved = new HashSet<>();
+        for (Map.Entry<String, String> entry : before.entrySet()) {
+            if (entry.getValue().equals("node-3")) {
+                keysOwnedByRemoved.add(entry.getKey());
+            }
+        }
+
+        ring.removeNode("node-3");
+
+        for (String key : before.keySet()) {
+            String previousOwner = before.get(key);
+            String currentOwner = ring.getNode(key);
+            if (keysOwnedByRemoved.contains(key)) {
+                assertNotEquals("node-3", currentOwner, "Removed node's key must move: " + key);
+            } else {
+                assertEquals(previousOwner, currentOwner,
+                        "Key not owned by the removed node must keep its owner: " + key);
+            }
+        }
+    }
+
+    @Test
+    void testRingNodesSnapshot() {
+        ConsistentHashRing ring = new ConsistentHashRing();
+        ring.addNode("A");
+        ring.addNode("B");
+
+        Set<String> nodes = ring.nodes();
+        assertEquals(Set.of("A", "B"), nodes);
+
+        // Mutating the ring afterwards must not affect a previously taken snapshot.
+        ring.addNode("C");
+        assertEquals(Set.of("A", "B"), nodes);
+        assertEquals(Set.of("A", "B", "C"), ring.nodes());
     }
 
     @Test
