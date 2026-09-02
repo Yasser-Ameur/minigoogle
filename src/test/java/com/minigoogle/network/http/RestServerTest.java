@@ -7,6 +7,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.zip.GZIPInputStream;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,6 +35,34 @@ class RestServerTest {
 
     private String base() {
         return "http://localhost:" + server.getPort();
+    }
+
+    @Test
+    void largeBodiesAreGzippedOnlyWhenTheClientAcceptsIt() throws Exception {
+        server = new RestServer(0, ServerOptions.defaults());
+        String big = "<html>" + "x".repeat(20_000) + "</html>";
+        server.getHtml("/big", body -> big);
+        server.get("/small", body -> "{\"ok\":true}");
+        server.start();
+
+        HttpRequest gz = HttpRequest.newBuilder(URI.create(base() + "/big")).header("Accept-Encoding", "gzip, br").GET().build();
+        HttpResponse<byte[]> gzResp = client.send(gz, HttpResponse.BodyHandlers.ofByteArray());
+        assertEquals("gzip", gzResp.headers().firstValue("Content-Encoding").orElse(null));
+        assertTrue(gzResp.headers().allValues("Vary").contains("Accept-Encoding"));
+        assertTrue(gzResp.body().length < big.length() / 10);
+        try (GZIPInputStream in = new GZIPInputStream(new java.io.ByteArrayInputStream(gzResp.body()))) {
+            assertEquals(big, new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+        }
+
+        HttpRequest plain = HttpRequest.newBuilder(URI.create(base() + "/big")).GET().build();
+        HttpResponse<String> plainResp = client.send(plain, HttpResponse.BodyHandlers.ofString());
+        assertTrue(plainResp.headers().firstValue("Content-Encoding").isEmpty());
+        assertEquals(big, plainResp.body());
+
+        HttpRequest small = HttpRequest.newBuilder(URI.create(base() + "/small")).header("Accept-Encoding", "gzip").GET().build();
+        HttpResponse<String> smallResp = client.send(small, HttpResponse.BodyHandlers.ofString());
+        assertTrue(smallResp.headers().firstValue("Content-Encoding").isEmpty());
+        assertEquals("{\"ok\":true}", smallResp.body());
     }
 
     @Test

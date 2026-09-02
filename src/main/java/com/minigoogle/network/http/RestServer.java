@@ -13,6 +13,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.util.zip.GZIPOutputStream;
 
 public class RestServer {
 
@@ -320,12 +322,31 @@ public class RestServer {
         return 200;
     }
 
+    /** Bodies below this size are sent as-is; gzip framing would only add bytes. */
+    private static final int GZIP_MIN_BYTES = 1024;
+
     private void writeSuccess(HttpExchange exchange, String contentType, byte[] bytes) throws IOException {
         exchange.getResponseHeaders().set("Content-Type", contentType);
+        if (bytes.length >= GZIP_MIN_BYTES) {
+            exchange.getResponseHeaders().add("Vary", "Accept-Encoding");
+        }
+        if (bytes.length >= GZIP_MIN_BYTES && acceptsGzip(exchange)) {
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream(bytes.length / 4);
+            try (GZIPOutputStream gzip = new GZIPOutputStream(buffer)) {
+                gzip.write(bytes);
+            }
+            bytes = buffer.toByteArray();
+            exchange.getResponseHeaders().set("Content-Encoding", "gzip");
+        }
         exchange.sendResponseHeaders(200, bytes.length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
         }
+    }
+
+    private static boolean acceptsGzip(HttpExchange exchange) {
+        String accept = exchange.getRequestHeaders().getFirst("Accept-Encoding");
+        return accept != null && accept.toLowerCase(Locale.ROOT).contains("gzip");
     }
 
     /**
