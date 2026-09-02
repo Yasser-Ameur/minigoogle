@@ -47,6 +47,9 @@ tasks.test {
     useJUnitPlatform()
     testLogging {
         events("passed", "skipped", "failed")
+        // CI keeps only the console: a failure must print its message and
+        // trace there, not only the line number.
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
     // Machine-load-sensitive latency benchmarks belong in the dedicated `bench`
     // task below so the normal suite (and CI) stays deterministic.
