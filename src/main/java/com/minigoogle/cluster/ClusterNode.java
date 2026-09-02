@@ -1,6 +1,15 @@
 package com.minigoogle.cluster;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.minigoogle.cluster.placement.DocumentIngest;
+import com.minigoogle.cluster.placement.DocumentPlacement;
+import com.minigoogle.cluster.placement.HttpIngestTransport;
+import com.minigoogle.cluster.placement.IngestHandler;
+import com.minigoogle.cluster.placement.IngestedDocument;
+import com.minigoogle.cluster.placement.LocalDocuments;
+import com.minigoogle.cluster.placement.PlacementRepairListener;
+import com.minigoogle.cluster.placement.PlacementResult;
+import com.minigoogle.cluster.routing.BroadcastQueryRouter;
 import com.minigoogle.cluster.state.KvCommand;
 import com.minigoogle.cluster.state.ReplicatedKeyValueStore;
 import com.minigoogle.cluster.transport.ClusterTransport;
@@ -16,7 +25,13 @@ import com.minigoogle.cluster.transport.http.HttpSearchTransport;
 import com.minigoogle.cluster.transport.http.InternalClusterServer;
 import com.minigoogle.cluster.transport.http.RaftHandler;
 import com.minigoogle.cluster.transport.http.SearchHandler;
+import com.minigoogle.distributed.query.coordinator.DistributedSearchCoordinator;
+import com.minigoogle.distributed.query.execution.LocalSearchExecutor;
 import com.minigoogle.distributed.query.execution.SearchExecutor;
+import com.minigoogle.distributed.query.model.LocalSearchResponse;
+import com.minigoogle.distributed.query.model.QueryContext;
+import com.minigoogle.network.dto.SearchResponse;
+import com.minigoogle.network.dto.SearchResult;
 import com.minigoogle.storage.filesystem.StorageLayout;
 import com.minigoogle.storage.metadata.RaftAppliedStore;
 import com.minigoogle.storage.metadata.RaftConfigurationStore;
@@ -26,10 +41,13 @@ import com.minigoogle.storage.wal.WriteAheadLog;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -53,6 +71,12 @@ public class ClusterNode {
      */
     private static final int SNAPSHOT_INTERVAL = 10_000;
 
+    /**
+     * Default document replication factor for the constructor overloads that
+     * do not take an explicit one.
+     */
+    private static final int DEFAULT_REPLICATION_FACTOR = 2;
+
     private final String nodeId;
     private final InternalClusterServer server;
     private final GossipProtocol gossip;
@@ -61,6 +85,11 @@ public class ClusterNode {
     private final List<ClusterTransport> transports;
     private final RaftTransport raftTransport;
     private final ReplicatedKeyValueStore kv;
+    private final SearchExecutor localSearch;
+    private final HttpSearchTransport searchTransport;
+    private final DocumentPlacement placement;
+    private final HttpIngestTransport ingestTransport;
+    private final PlacementRepairListener placementRepairListener;
 
     public ClusterNode(String nodeId, int port, NodeDirectory directory) throws IOException {
         this(nodeId, port, directory, 1000, 5000, 5000, 1000, null);
@@ -166,7 +195,7 @@ public class ClusterNode {
                 security, createRaftMetadataStore(storageDirectory), createRaftLog(storageDirectory),
                 new ReplicatedKeyValueStore(), createRaftAppliedStore(storageDirectory),
                 createRaftSnapshotStore(storageDirectory), SNAPSHOT_INTERVAL,
-                createRaftConfigurationStore(storageDirectory));
+                createRaftConfigurationStore(storageDirectory), DEFAULT_REPLICATION_FACTOR, null, null);
     }
 
     /**
@@ -307,7 +336,8 @@ public class ClusterNode {
                        ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
                        RaftSnapshotStore snapshotStore, int snapshotInterval) throws IOException {
         this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
-                security, raftMetadataStore, raftLog, stateMachine, appliedStore, snapshotStore, snapshotInterval, null);
+                security, raftMetadataStore, raftLog, stateMachine, appliedStore, snapshotStore, snapshotInterval, null,
+                DEFAULT_REPLICATION_FACTOR, null, null);
     }
 
     /**
@@ -349,6 +379,16 @@ public class ClusterNode {
      *                             {@code snapshotStore} is {@code null}.
      * @param configStore          Store for the committed configuration, or
      *                             {@code null} to keep it in memory only.
+     * @param replicationFactor    How many nodes each document is placed on;
+     *                             see {@link #getPlacement()}.
+     * @param documentIngest       Accepts documents placed or repaired onto
+     *                             this node by a peer, or {@code null} to
+     *                             disable placement delivery (the ingest
+     *                             endpoint still exists but answers 503, and
+     *                             {@link #place} throws).
+     * @param localDocuments       Enumerates this node's own documents for
+     *                             {@link com.minigoogle.cluster.placement.PlacementRepairListener},
+     *                             or {@code null} to skip repair.
      */
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
@@ -356,8 +396,71 @@ public class ClusterNode {
                        ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
                        RaftSnapshotStore snapshotStore, int snapshotInterval,
                        RaftConfigurationStore configStore) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, raftElectionTimeout, raftHeartbeat, localSearch,
+                security, raftMetadataStore, raftLog, stateMachine, appliedStore, snapshotStore, snapshotInterval,
+                configStore, DEFAULT_REPLICATION_FACTOR, null, null);
+    }
+
+    /**
+     * Creates a fully configured, authenticated cluster node with explicit
+     * Raft metadata store, replicated log, replicated key-value state machine,
+     * snapshot-driven log compaction, a durable committed configuration for
+     * membership reconfiguration, and document placement on the consistent
+     * hash ring.
+     *
+     * <p>Document placement is layered on top of everything the {@code
+     * configStore} overload provides: every document is placed on {@code
+     * replicationFactor} ring owners (see {@link #getPlacement()} and {@link
+     * #place}), incoming placements and repairs from peers are handed to
+     * {@code documentIngest}, and {@code localDocuments} lets a {@link
+     * com.minigoogle.cluster.placement.PlacementRepairListener} re-deliver
+     * this node's documents to any owner a membership change adds.</p>
+     *
+     * @param nodeId               The unique identifier for this node.
+     * @param port                 The internal RPC port.
+     * @param directory            Resolves peer node IDs to base URIs.
+     * @param gossipInterval       Gossip round interval in milliseconds.
+     * @param gossipTimeout        Failure detection timeout in milliseconds.
+     * @param raftElectionTimeout  Raft election timeout in milliseconds.
+     * @param raftHeartbeat        Raft heartbeat interval in milliseconds.
+     * @param localSearch          Executor for local queries, or {@code null} to
+     *                             disable the search dispatch endpoint.
+     * @param security             The shared cluster security manager.
+     * @param raftMetadataStore    Store for {@code currentTerm} and
+     *                             {@code votedFor}, or {@code null} to keep the
+     *                             metadata in memory only.
+     * @param raftLog              The replicated log, or {@code null} for a
+     *                             memory-only log.
+     * @param stateMachine         The replicated key-value state machine, or
+     *                             {@code null} to disable the client operations.
+     * @param appliedStore         Store for the apply watermark, or {@code null}
+     *                             to keep it in memory only.
+     * @param snapshotStore        Store for state-machine snapshots, or
+     *                             {@code null} to disable log compaction.
+     * @param snapshotInterval     Entries between snapshots; ignored when
+     *                             {@code snapshotStore} is {@code null}.
+     * @param configStore          Store for the committed configuration, or
+     *                             {@code null} to keep it in memory only.
+     * @param replicationFactor    How many nodes each document is placed on;
+     *                             see {@link #getPlacement()}.
+     * @param documentIngest       Accepts documents placed or repaired onto
+     *                             this node by a peer, or {@code null} to
+     *                             disable placement delivery (the ingest
+     *                             endpoint still exists but answers 503).
+     * @param localDocuments       Enumerates this node's own documents for
+     *                             {@link com.minigoogle.cluster.placement.PlacementRepairListener},
+     *                             or {@code null} to skip repair.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
+                       ClusterSecurity security, RaftMetadataStore raftMetadataStore, RaftLog raftLog,
+                       ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
+                       RaftSnapshotStore snapshotStore, int snapshotInterval,
+                       RaftConfigurationStore configStore, int replicationFactor,
+                       DocumentIngest documentIngest, LocalDocuments localDocuments) throws IOException {
         this.nodeId = nodeId;
         this.kv = stateMachine;
+        this.localSearch = localSearch;
         ObjectMapper mapper = new ObjectMapper();
         this.server = new InternalClusterServer(port, mapper);
 
@@ -369,6 +472,7 @@ public class ClusterNode {
         HttpMembershipTransport membershipTransport = new HttpMembershipTransport(directory, mapper, nodeId, bearerToken);
         HttpRaftTransport raftTransport = new HttpRaftTransport(directory, mapper, nodeId, bearerToken);
         HttpSearchTransport searchTransport = new HttpSearchTransport(directory, mapper, nodeId, bearerToken);
+        this.searchTransport = searchTransport;
 
         this.gossip = new GossipProtocol(nodeId, gossipInterval, gossipTimeout, membershipTransport);
         gossip.addListener(new RingMembershipListener(ring));
@@ -380,12 +484,24 @@ public class ClusterNode {
                 raftLog == null ? RaftLog.inMemory() : raftLog,
                 stateMachine, appliedStore, snapshotStore, snapshotInterval, configStore);
 
+        this.placement = new DocumentPlacement(ring, replicationFactor);
+        HttpIngestTransport ingestTransport = new HttpIngestTransport(directory, mapper, nodeId, bearerToken);
+        this.ingestTransport = ingestTransport;
+
         server.registerProtectedContext("/cluster/v1/gossip/exchange", new GossipHandler(gossip, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/request-vote", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/append-entries", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/install-snapshot", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/raft/read-index", new RaftHandler(raft, mapper, nodeId), security);
         server.registerProtectedContext("/cluster/v1/search/dispatch", new SearchHandler(localSearch, mapper, nodeId), security);
+        server.registerProtectedContext("/cluster/v1/documents/ingest", new IngestHandler(documentIngest, mapper, nodeId), security);
+
+        if (localDocuments != null) {
+            this.placementRepairListener = new PlacementRepairListener(placement, localDocuments, ingestTransport, nodeId);
+            gossip.addListener(placementRepairListener);
+        } else {
+            this.placementRepairListener = null;
+        }
 
         this.raftTransport = raftTransport;
         this.transports = List.of(membershipTransport, raftTransport, searchTransport);
@@ -450,6 +566,9 @@ public class ClusterNode {
     public void stop() {
         gossip.stop();
         raft.stop();
+        if (placementRepairListener != null) {
+            placementRepairListener.shutdown();
+        }
         for (ClusterTransport transport : transports) {
             transport.stop();
         }
@@ -470,6 +589,89 @@ public class ClusterNode {
 
     public InternalClusterServer getServer() {
         return server;
+    }
+
+    /**
+     * @return The ring-backed placement policy for this node's replication
+     *         factor. Always available, independent of whether a {@link
+     *         DocumentIngest} was configured.
+     */
+    public DocumentPlacement getPlacement() {
+        return placement;
+    }
+
+    /**
+     * Places {@code doc} on its ring owners, delivering it to every owner
+     * other than this node over HTTP. The caller (this node, having just
+     * crawled the document) is expected to keep its own local copy outside of
+     * placement — {@code place} only forwards to remote owners and reports
+     * whether this node is itself one of them. Delivery to a remote owner that
+     * currently has no {@link DocumentIngest} configured (placement disabled
+     * there) counts as a failure, the same as an unreachable node.
+     */
+    public PlacementResult place(IngestedDocument doc) {
+        List<String> owners = placement.owners(doc.url().toString());
+        boolean selfIsOwner = owners.contains(nodeId);
+        List<String> delivered = new ArrayList<>();
+        List<String> failed = new ArrayList<>();
+        for (String owner : owners) {
+            if (owner.equals(nodeId)) {
+                continue;
+            }
+            try {
+                // A response of either true or false is a successful delivery —
+                // false only means the owner already had the document (idempotent
+                // by URL), which is not a failure.
+                ingestTransport.ingest(owner, doc).get(OPERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                delivered.add(owner);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failed.add(owner);
+            } catch (java.util.concurrent.ExecutionException | TimeoutException e) {
+                failed.add(owner);
+            }
+        }
+        return new PlacementResult(owners, selfIsOwner, delivered, failed);
+    }
+
+    /**
+     * Runs a search across every live cluster member (including this node)
+     * via {@link BroadcastQueryRouter} and {@link
+     * DistributedSearchCoordinator}, deduplicating merged results by URL —
+     * replication can place the same document on more than one shard that
+     * answers the same query, and neither the coordinator nor {@link
+     * com.minigoogle.distributed.query.merge.KWayMerger} it delegates to
+     * dedupes.
+     *
+     * @param query The raw query string.
+     * @param topK  The number of top results to return.
+     * @return The globally ranked, URL-deduplicated Top-K results.
+     */
+    public List<SearchResult> distributedSearch(String query, int topK) {
+        // The coordinator only ever routes its own node ID through the given
+        // local executors (see DistributedSearchCoordinator#search), so this
+        // node's own shard is served in-process rather than over its own HTTP
+        // loopback.
+        List<LocalSearchExecutor> localExecutors = localSearch == null ? List.of() : List.of(
+                new LocalSearchExecutor(0, (q, k) -> {
+                    QueryContext context = new QueryContext(q, k, Duration.ofSeconds(5), UUID.randomUUID());
+                    LocalSearchResponse response = localSearch.execute(context);
+                    return response.results();
+                }));
+
+        BroadcastQueryRouter router = new BroadcastQueryRouter(gossip);
+        DistributedSearchCoordinator coordinator = new DistributedSearchCoordinator(
+                router, searchTransport, localExecutors, nodeId, 4, Duration.ofSeconds(5), 16);
+        try {
+            SearchResponse response = coordinator.search(query, topK);
+            Map<String, SearchResult> deduplicated = new LinkedHashMap<>();
+            for (SearchResult result : response.results()) {
+                deduplicated.putIfAbsent(result.url(), result);
+            }
+            return new ArrayList<>(deduplicated.values());
+        } finally {
+            coordinator.shutdown();
+        }
     }
 
     /**
