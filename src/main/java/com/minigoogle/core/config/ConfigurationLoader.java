@@ -45,6 +45,7 @@ public final class ConfigurationLoader {
         putIfEnv(props, "MINIGOGLE_CLUSTER_PORT", "cluster.port");
         putIfEnv(props, "MINIGOGLE_CLUSTER_COORDINATOR_URL", "cluster.coordinatorUrl");
         putIfEnv(props, "MINIGOGLE_REPLICATION_FACTOR", "cluster.replicationFactor");
+        putIfEnv(props, "MINIGOGLE_GOSSIP_DEAD_TIMEOUT_MS", "cluster.gossipDeadTimeoutMs");
         putIfEnv(props, "MINIGOGLE_LOG_LEVEL", "logging.level");
         putIfEnv(props, "MINIGOGLE_CLUSTER_SECRET", "cluster.secret");
         putIfEnv(props, "MINIGOGLE_API_KEY", "security.apiKey");
@@ -79,6 +80,7 @@ public final class ConfigurationLoader {
         defaults.put("cluster.replicationFactor", "3");
         defaults.put("cluster.nodeTimeout", "30000");
         defaults.put("cluster.gossipInterval", "1000");
+        defaults.put("cluster.gossipDeadTimeoutMs", "90000");
         defaults.put("cluster.port", "8081");
         defaults.put("cluster.advertisedHost", "localhost");
         defaults.put("crawler.workers", "32");

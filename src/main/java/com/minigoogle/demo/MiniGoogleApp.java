@@ -38,6 +38,10 @@ import com.minigoogle.cluster.ClusterNode;
 import com.minigoogle.cluster.ClusterSecurity;
 import com.minigoogle.cluster.NotLeaderException;
 import com.minigoogle.cluster.RaftConsensus;
+import com.minigoogle.cluster.placement.DocumentIngest;
+import com.minigoogle.cluster.placement.IngestedDocument;
+import com.minigoogle.cluster.placement.LocalDocuments;
+import com.minigoogle.cluster.placement.PlacementResult;
 import com.minigoogle.cluster.transport.StaticNodeDirectory;
 import com.minigoogle.distributed.coordinator.ClusterCoordinator;
 import com.minigoogle.distributed.coordinator.SearchCoordinator;
@@ -175,9 +179,14 @@ public class MiniGoogleApp {
             // features for coordinator-side global ranking; a standalone
             // node returns fully ranked results.
             long startNanos = System.nanoTime();
-            SearchResponse response = "SEARCH".equals(nodeType)
-                    ? gatherCandidateResults(request.query().trim(), pageSize)
-                    : executeSearch(request.query().trim(), page, pageSize);
+            SearchResponse response;
+            if ("SEARCH".equals(nodeType)) {
+                response = gatherCandidateResults(request.query().trim(), pageSize);
+            } else if (clusterNode != null) {
+                response = clusterSearch(request.query().trim(), page, pageSize);
+            } else {
+                response = executeSearch(request.query().trim(), page, pageSize);
+            }
             metrics.observeSearch(System.nanoTime() - startNanos, response.results().size());
             long elapsed = System.currentTimeMillis() - start;
             return JsonSerializer.toJson(new SearchResponse(elapsed, response.totalResults(),
@@ -435,8 +444,18 @@ public class MiniGoogleApp {
                 }
             }
 
+            // On a CLUSTER node the crawling node keeps its copy and the ring
+            // decides which peers hold the document as well.
+            String owners = "";
+            if (clusterNode != null) {
+                PlacementResult placed = clusterNode.place(new IngestedDocument(doc.id(), doc.url(), doc.title(),
+                        doc.text(), doc.outgoingLinks(), doc.crawlTime()));
+                owners = ",\"owners\":" + JsonSerializer.toJson(placed.owners())
+                        + ",\"replicatedTo\":" + JsonSerializer.toJson(placed.deliveredTo());
+            }
+
             String title = doc.title() != null && !doc.title().isEmpty() ? doc.title() : url;
-            return "{\"success\":true,\"title\":\"" + title.replace("\"", "\\\"") + "\",\"url\":\"" + url.replace("\"", "\\\"") + "\"}";
+            return "{\"success\":true,\"title\":\"" + title.replace("\"", "\\\"") + "\",\"url\":\"" + url.replace("\"", "\\\"") + "\"" + owners + "}";
         });
 
         server.start();
@@ -522,17 +541,50 @@ public class MiniGoogleApp {
         Path raftDir = indexPath.resolve("raft");
         Files.createDirectories(raftDir);
 
+        // Documents a peer places on this node enter through the same store,
+        // list and reindex as a local crawl; a URL already held is a no-op, so
+        // repair rounds may replay freely.
+        DocumentIngest documentIngest = incoming -> {
+            ParsedDocument parsed = new ParsedDocument(incoming.id(), incoming.url(), incoming.title(),
+                    incoming.text(), incoming.outgoingLinks(), incoming.crawlTime());
+            synchronized (indexLock) {
+                for (ParsedDocument existing : allDocs) {
+                    if (existing.url().equals(parsed.url())) {
+                        return false;
+                    }
+                }
+                crawledDocumentStore.append(parsed);
+                allDocs.add(parsed);
+                reindex();
+            }
+            return true;
+        };
+        LocalDocuments localDocuments = () -> {
+            synchronized (indexLock) {
+                List<IngestedDocument> snapshot = new ArrayList<>(allDocs.size());
+                for (ParsedDocument d : allDocs) {
+                    snapshot.add(new IngestedDocument(d.id(), d.url(), d.title(), d.text(), d.outgoingLinks(), d.crawlTime()));
+                }
+                return snapshot;
+            }
+        };
+        long nodeTimeout = config.getLong("cluster.nodeTimeout", 30000);
+
         clusterNode = new ClusterNode(
                 nodeId,
                 clusterPort,
                 directory,
                 config.getLong("cluster.gossipInterval", 1000),
-                config.getLong("cluster.nodeTimeout", 30000),
+                nodeTimeout,
+                config.getLong("cluster.gossipDeadTimeoutMs", 3 * nodeTimeout),
                 config.getLong("cluster.raft.electionTimeoutMs", 1500),
                 config.getLong("cluster.raft.heartbeatMs", 300),
                 localSearch,
                 security,
-                raftDir);
+                raftDir,
+                config.getInt("cluster.replicationFactor", 3),
+                documentIngest,
+                localDocuments);
         clusterNode.start();
 
         // Seed gossip with the configured peers so membership converges without
@@ -938,6 +990,27 @@ public class MiniGoogleApp {
         }
         int end = Math.min(items.size(), offset + pageSize);
         return items.subList(offset, end);
+    }
+
+    /**
+     * A CLUSTER node answers from every live member: each member's candidates
+     * are gathered over the internal dispatch route, merged, deduplicated by
+     * URL and ranked once. If the fan-out fails the node's own index answers,
+     * so a partition degrades to standalone behaviour rather than an error.
+     */
+    private SearchResponse clusterSearch(String query, int page, int pageSize) {
+        int offset = (page - 1) * pageSize;
+        List<com.minigoogle.network.dto.SearchResult> merged;
+        try {
+            merged = clusterNode.distributedSearch(query, offset + pageSize);
+        } catch (RuntimeException e) {
+            System.out.println("WARN: distributed search failed, answering from this node's own index: " + e.getMessage());
+            return executeSearch(query, page, pageSize);
+        }
+        int from = Math.min(offset, merged.size());
+        int to = Math.min(offset + pageSize, merged.size());
+        return new SearchResponse(0, merged.size(), new ArrayList<>(merged.subList(from, to)),
+                null, 0.0, 0.0, page, pageSize);
     }
 
     private SearchResponse executeSearch(String query, int page, int pageSize) {

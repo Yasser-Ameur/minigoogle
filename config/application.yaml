@@ -25,6 +25,8 @@ cluster:
   replicationFactor: 3
   nodeTimeout: 30000
   gossipInterval: 1000
+  # SUSPECT peers become DEAD after this much silence; three times nodeTimeout
+  gossipDeadTimeoutMs: 90000
   port: 8081              # COORDINATOR: cluster registry port
   # coordinatorUrl: http://localhost:8081   # defaults to cluster.port when unset
   advertisedHost: localhost

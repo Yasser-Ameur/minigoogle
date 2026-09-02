@@ -183,6 +183,19 @@ public class ClusterNode {
      *                             {@code null} to keep Raft metadata in memory.
      */
     public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long gossipDeadTimeout, long raftElectionTimeout, long raftHeartbeat,
+                       SearchExecutor localSearch, ClusterSecurity security, Path storageDirectory,
+                       int replicationFactor, DocumentIngest documentIngest, LocalDocuments localDocuments)
+            throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, gossipDeadTimeout, raftElectionTimeout,
+                raftHeartbeat, localSearch, security, createRaftMetadataStore(storageDirectory),
+                createRaftLog(storageDirectory), new ReplicatedKeyValueStore(),
+                createRaftAppliedStore(storageDirectory), createRaftSnapshotStore(storageDirectory),
+                SNAPSHOT_INTERVAL, createRaftConfigurationStore(storageDirectory), replicationFactor,
+                documentIngest, localDocuments);
+    }
+
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
                        long raftElectionTimeout, long raftHeartbeat, SearchExecutor localSearch,
                        ClusterSecurity security, Path storageDirectory) throws IOException {
         // A node configured with durable storage gets a complete durable stack:
@@ -458,6 +471,23 @@ public class ClusterNode {
                        RaftSnapshotStore snapshotStore, int snapshotInterval,
                        RaftConfigurationStore configStore, int replicationFactor,
                        DocumentIngest documentIngest, LocalDocuments localDocuments) throws IOException {
+        this(nodeId, port, directory, gossipInterval, gossipTimeout, 3 * gossipTimeout, raftElectionTimeout,
+                raftHeartbeat, localSearch, security, raftMetadataStore, raftLog, stateMachine, appliedStore,
+                snapshotStore, snapshotInterval, configStore, replicationFactor, documentIngest, localDocuments);
+    }
+
+    /**
+     * The complete constructor. {@code gossipDeadTimeout} is how long a SUSPECT
+     * peer stays silent before gossip declares it DEAD and the ring drops it;
+     * every shorter constructor uses three times {@code gossipTimeout}.
+     */
+    public ClusterNode(String nodeId, int port, NodeDirectory directory, long gossipInterval, long gossipTimeout,
+                       long gossipDeadTimeout, long raftElectionTimeout, long raftHeartbeat,
+                       SearchExecutor localSearch, ClusterSecurity security, RaftMetadataStore raftMetadataStore,
+                       RaftLog raftLog, ReplicatedKeyValueStore stateMachine, RaftAppliedStore appliedStore,
+                       RaftSnapshotStore snapshotStore, int snapshotInterval,
+                       RaftConfigurationStore configStore, int replicationFactor,
+                       DocumentIngest documentIngest, LocalDocuments localDocuments) throws IOException {
         this.nodeId = nodeId;
         this.kv = stateMachine;
         this.localSearch = localSearch;
@@ -474,7 +504,7 @@ public class ClusterNode {
         HttpSearchTransport searchTransport = new HttpSearchTransport(directory, mapper, nodeId, bearerToken);
         this.searchTransport = searchTransport;
 
-        this.gossip = new GossipProtocol(nodeId, gossipInterval, gossipTimeout, membershipTransport);
+        this.gossip = new GossipProtocol(nodeId, gossipInterval, gossipTimeout, gossipDeadTimeout, membershipTransport);
         gossip.addListener(new RingMembershipListener(ring));
 
         // Raft resolves its peers from the gossip membership table, so it only
