@@ -63,12 +63,13 @@ expect, like `NODE_TYPE` or `CLUSTER_PEERS`) lives in `.env.example`.
 | `MINIGOGLE_ADVERTISED_HOST` | `cluster.advertisedHost` | `localhost` | Hostname this node advertises to peers |
 | `MINIGOGLE_LOG_LEVEL` | `logging.level` | `INFO` | Root logger level |
 
-`server.maxThreads`, `maxBodyBytes`, `requestTimeoutMs`, `shutdownGraceMs`,
-`rateLimit.perSecond/burst`, and `cors.origins` harden the HTTP server (bounded
-thread pool, a 1 MiB request body cap, a 10 s handler timeout, graceful
-shutdown, an optional per-client token-bucket rate limit, and optional CORS).
-They are set only in `config/application.yaml`; there is no environment
-variable for them.
+| `MINIGOGLE_MAX_THREADS` | `server.maxThreads` | `64` | Request handler pool size |
+| `MINIGOGLE_MAX_BODY_BYTES` | `server.maxBodyBytes` | `1048576` | POST bodies above this get 413 |
+| `MINIGOGLE_REQUEST_TIMEOUT_MS` | `server.requestTimeoutMs` | `10000` | Handlers slower than this answer 504 |
+| `MINIGOGLE_SHUTDOWN_GRACE_MS` | `server.shutdownGraceMs` | `10000` | How long SIGTERM waits for in-flight requests |
+| `MINIGOGLE_RATE_LIMIT_PER_SECOND` | `server.rateLimit.perSecond` | `0` | Per-client token bucket; `0` disables |
+| `MINIGOGLE_RATE_LIMIT_BURST` | `server.rateLimit.burst` | `0` | Bucket size; `0` means ceil(perSecond) |
+| `MINIGOGLE_CORS_ORIGINS` | `server.cors.origins` | (empty) | `*` or a comma list enables CORS |
 
 ## Endpoints
 

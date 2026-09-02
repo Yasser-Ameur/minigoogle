@@ -49,6 +49,13 @@ public final class ConfigurationLoader {
         putIfEnv(props, "MINIGOGLE_CLUSTER_SECRET", "cluster.secret");
         putIfEnv(props, "MINIGOGLE_API_KEY", "security.apiKey");
         putIfEnv(props, "MINIGOGLE_ADVERTISED_HOST", "cluster.advertisedHost");
+        putIfEnv(props, "MINIGOGLE_MAX_THREADS", "server.maxThreads");
+        putIfEnv(props, "MINIGOGLE_MAX_BODY_BYTES", "server.maxBodyBytes");
+        putIfEnv(props, "MINIGOGLE_REQUEST_TIMEOUT_MS", "server.requestTimeoutMs");
+        putIfEnv(props, "MINIGOGLE_SHUTDOWN_GRACE_MS", "server.shutdownGraceMs");
+        putIfEnv(props, "MINIGOGLE_RATE_LIMIT_PER_SECOND", "server.rateLimit.perSecond");
+        putIfEnv(props, "MINIGOGLE_RATE_LIMIT_BURST", "server.rateLimit.burst");
+        putIfEnv(props, "MINIGOGLE_CORS_ORIGINS", "server.cors.origins");
         // Unprefixed aliases. Container orchestrators set plain names, and
         // docker-compose already did so for CLUSTER_PEERS while only the
         // MINIGOGLE_-prefixed key was read - so the peer list was silently
