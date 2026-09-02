@@ -270,3 +270,56 @@ Every command, flag, key, dependency, number and feature of the previous README.
 | `./gradlew bench` runs benchmarks, see `BENCHMARKS.md` | kept | row 45 |
 | Relevance table: scifact 0.2647 / 0.5938, TREC-COVID 0.0000 / 0.4027, 2026-08-15 | removed | numbers not from this session; replaced by R10 (scifact BM25 only; TREC-COVID not run, 171k documents) |
 | License MIT | kept | `LICENSE:1` |
+
+## Cluster placement, failure detection and repair (added after commit d184e7a)
+
+Runs on the three node compose cluster built from the tree at d184e7a
+(`docker compose up --build -d`, this machine, 2026-09-02). Quoted verbatim.
+
+R11. Fresh cluster status, then a crawl on node 1 and the search on node 3:
+```
+{"nodeId":"minigoogle-1","state":"FOLLOWER","term":1,"leader":"minigoogle-3",...,"liveNodes":["minigoogle-1","minigoogle-2","minigoogle-3"]}
+{"success":true,"title":"Raft Consensus Algorithm","url":"https://raft.github.io/","owners":["minigoogle-3","minigoogle-2","minigoogle-1"],"replicatedTo":["minigoogle-3","minigoogle-2"]}
+stats 8080/8081/8082: {"documentCount":21,...} on each
+search 8082 "raft consensus": total 3 ['https://example.com/distributed-systems', 'https://raft.github.io/', 'https://example.com/blockchain']
+```
+
+R12. `docker compose stop minigoogle-3` at 13:02:27, status at T+40 on nodes 1 and 2, a crawl and a search on node 2 meanwhile:
+```
+node minigoogle-1 live ['minigoogle-1', 'minigoogle-2'] leader minigoogle-1
+node minigoogle-2 live ['minigoogle-1', 'minigoogle-2'] leader minigoogle-1
+{"success":true,"title":"Write-Ahead Logging","url":"https://www.sqlite.org/wal.html","owners":["minigoogle-3","minigoogle-2","minigoogle-1"],"replicatedTo":["minigoogle-2"]}
+search 8081 "write ahead log": total 5 ['https://www.sqlite.org/wal.html', ...]
+```
+
+R13. Status at T+105 and a crawl with node 3 DEAD:
+```
+node minigoogle-1 live ['minigoogle-1', 'minigoogle-2'] leader minigoogle-1
+{"success":true,"title":"PostgreSQL: Documentation: 18: 13.1. Introduction","url":"https://www.postgresql.org/docs/current/mvcc-intro.html","owners":["minigoogle-2","minigoogle-1"],"replicatedTo":["minigoogle-2"]}
+```
+
+R14. `docker compose start minigoogle-3` at 13:04:17, status and stats 45 s later, and node 3's search:
+```
+node minigoogle-1 live ['minigoogle-1', 'minigoogle-2', 'minigoogle-3'] leader minigoogle-3
+node minigoogle-3 live ['minigoogle-1', 'minigoogle-2', 'minigoogle-3'] leader minigoogle-3
+stats 8080/8081/8082: {"documentCount":23,...} on each
+search 8082 "mvcc": total 1 ['https://www.postgresql.org/docs/current/mvcc-intro.html']
+```
+
+R15. Full suite on the tree at d184e7a: 921 test cases, 0 failures, 0 errors, 23 skipped.
+
+| # | Claim | Evidence |
+|---|---|---|
+| 40 | A CLUSTER node runs gossip, a ring from that membership, and Raft | `ClusterNode.java` constructor: `GossipProtocol`, `ConsistentHashRing` with `RingMembershipListener`, `RaftConsensus` |
+| 41 | Raft never reads gossip once its configuration is committed | `RaftConsensus.peers()` and `majorityThreshold()` branch on `configEstablished`; `docs/rfc/raft-membership-reconfiguration.md` |
+| 42 | Crawl places a document on `cluster.replicationFactor` owners and names them | R11; `ClusterNode.place`, `DocumentPlacement.owners`; response built in the `MiniGoogleApp` crawl route |
+| 43 | All three nodes hold the document; search on node 3 finds it | R11 |
+| 44 | Search on a CLUSTER node fans out, dedupes by URL, falls back to the local index | `MiniGoogleApp.clusterSearch`, `ClusterNode.distributedSearch`; R12 search while a member is down |
+| 45 | SUSPECT after `cluster.nodeTimeout` and gone from `liveNodes` | R12; `GossipProtocol.checkForFailures`, `getLiveNodes` returns ALIVE only |
+| 46 | DEAD after `cluster.gossipDeadTimeoutMs`, leaves the ring, owners become two | R13; `GossipProtocol.confirmDead`, `RingMembershipListener.onNodeLeft` |
+| 47 | A rejoining node triggers repair; all nodes reach 23 documents; node 3 serves the doc crawled while it was DEAD | R14; `PlacementRepairListener` |
+| 48 | Repair never deletes | `PlacementRepairListener` has no delete path; `DocumentIngest` only appends |
+| 49 | A node restarted inside `cluster.nodeTimeout` keeps its gap | Design consequence of rows 45 and 47: no leave, no join, no repair; not exercised by a run |
+| 50 | A document crawled while a node is SUSPECT reaches only owners that answer | R12 `replicatedTo` lists node 2 only while `owners` lists three |
+| 51 | Defaults 30000 and 90000 | `ConfigurationLoader.java` defaults, `config/application.yaml` |
+| 52 | Suite 921 tests, 0 failures, 23 skipped | R15 |

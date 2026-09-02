@@ -1,6 +1,6 @@
 # MiniGoogle
 
-A search engine you run yourself: crawl pages into it, query them over HTTP or in the bundled web UI, and, if you need it, run three nodes as a Raft cluster. Java 21, one jar, one Docker image.
+A search engine you run yourself: crawl pages into it, query them over HTTP or in the bundled web UI, and, if you need it, run several nodes that place documents by consistent hashing, track each other by gossip and replicate a key-value store by Raft. Java 21, one jar, one Docker image.
 
 [![CI](https://github.com/Yasser-Ameur/minigoogle/actions/workflows/ci.yml/badge.svg)](https://github.com/Yasser-Ameur/minigoogle/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/Yasser-Ameur/minigoogle)](LICENSE)
@@ -189,7 +189,8 @@ Precedence is environment variable, then `config/application.yaml`, then the bui
 | `MINIGOGLE_CLUSTER_PEERS` | `cluster.peers` | (unset) | `nodeId=http://host:port` pairs, comma separated |
 | `MINIGOGLE_CLUSTER_PORT` | `cluster.port` | `8081` | Internal RPC port |
 | `MINIGOGLE_CLUSTER_COORDINATOR_URL` | `cluster.coordinatorUrl` | (unset) | Where a `SEARCH` node registers |
-| `MINIGOGLE_REPLICATION_FACTOR` | `cluster.replicationFactor` | `3` | Copies kept per key |
+| `MINIGOGLE_REPLICATION_FACTOR` | `cluster.replicationFactor` | `3` | Ring owners each crawled document is placed on in a `CLUSTER` (clamped to the member count) |
+| `MINIGOGLE_GOSSIP_DEAD_TIMEOUT_MS` | `cluster.gossipDeadTimeoutMs` | `90000` | Silence after which a `SUSPECT` peer is declared `DEAD` and leaves the ring; `cluster.nodeTimeout` (30000, yaml only) is the `SUSPECT` threshold |
 | `MINIGOGLE_CLUSTER_SECRET` | `cluster.secret` | (unset) | Shared secret peers must present to each other |
 | `MINIGOGLE_ADVERTISED_HOST` | `cluster.advertisedHost` | `localhost` | Hostname this node advertises to peers |
 | `MINIGOGLE_LOG_LEVEL` | `logging.level` | `INFO` | Root logger level |
@@ -296,7 +297,9 @@ minigoogle_http_requests_total{method="POST",route="/api/v1/crawl",status="401"}
 
 ## Running a cluster
 
-`docker-compose.yml` starts three `NODE_TYPE=CLUSTER` nodes, each with its own `/data` volume, sharing `MINIGOGLE_CLUSTER_SECRET`, with the public API on 8080, 8081 and 8082 and the internal RPC port on 9080 to 9082:
+A `CLUSTER` node runs three things beside its own index and REST API: gossip membership, a consistent hash ring built from that membership, and Raft for the replicated key-value store. Membership decides who is alive, the ring decides which nodes hold each crawled document, and Raft never reads either once its configuration is committed.
+
+`docker-compose.yml` starts three such nodes, each with its own `/data` volume, sharing `MINIGOGLE_CLUSTER_SECRET` and the crawl key `change-me-please-16plus`, with the public API on 8080, 8081 and 8082 and the internal RPC port on 9080 to 9082:
 
 ```bash
 git clone https://github.com/Yasser-Ameur/minigoogle.git && cd minigoogle
@@ -305,10 +308,42 @@ curl localhost:8080/api/v1/cluster/status
 ```
 
 ```
-{"nodeId":"minigoogle-1","state":"LEADER","term":1,"leader":"minigoogle-1","commitIndex":0,"members":["minigoogle-2","minigoogle-1","minigoogle-3"],"liveNodes":["minigoogle-2","minigoogle-1","minigoogle-3"]}
+{"nodeId":"minigoogle-1","state":"FOLLOWER","term":1,"leader":"minigoogle-3","commitIndex":0,"members":["minigoogle-1","minigoogle-2","minigoogle-3"],"liveNodes":["minigoogle-1","minigoogle-2","minigoogle-3"]}
 ```
 
-Write a key through the leader, then stop it:
+Crawl on one node and the ring places the document on `cluster.replicationFactor` owners (3 by default, so on three nodes every document lands everywhere). The response names them:
+
+```bash
+curl -X POST localhost:8080/api/v1/crawl -H "Content-Type: application/json" \
+  -H "X-API-Key: change-me-please-16plus" -d '{"url":"https://raft.github.io/"}'
+curl -X POST localhost:8082/api/v1/search -H "Content-Type: application/json" -d '{"query":"raft consensus"}'
+```
+
+```
+{"success":true,"title":"Raft Consensus Algorithm","url":"https://raft.github.io/","owners":["minigoogle-3","minigoogle-2","minigoogle-1"],"replicatedTo":["minigoogle-3","minigoogle-2"]}
+```
+
+Every node's `/api/v1/stats` then reports 21 documents, and the search on node 3 returns `https://raft.github.io/` second. `POST /api/v1/search` on a `CLUSTER` node fans out to every live member, merges, deduplicates by URL and ranks once; if the fan-out fails it answers from its own index.
+
+Stop a node and watch membership follow it. After `cluster.nodeTimeout` (30 s) of silence the peer is `SUSPECT` and leaves `liveNodes`; after `cluster.gossipDeadTimeoutMs` (90 s) it is `DEAD` and leaves the ring, so a document crawled then gets two owners instead of three:
+
+```bash
+docker compose stop minigoogle-3
+sleep 40 && curl localhost:8080/api/v1/cluster/status
+sleep 65 && curl -X POST localhost:8080/api/v1/crawl -H "Content-Type: application/json" \
+  -H "X-API-Key: change-me-please-16plus" -d '{"url":"https://www.postgresql.org/docs/current/mvcc-intro.html"}'
+```
+
+```
+{"nodeId":"minigoogle-1","state":"LEADER","term":2,"leader":"minigoogle-1","commitIndex":0,"members":["minigoogle-1","minigoogle-2","minigoogle-3"],"liveNodes":["minigoogle-1","minigoogle-2"]}
+{"success":true,"title":"PostgreSQL: Documentation: 18: 13.1. Introduction","url":"https://www.postgresql.org/docs/current/mvcc-intro.html","owners":["minigoogle-2","minigoogle-1"],"replicatedTo":["minigoogle-2"]}
+```
+
+Start it again and it rejoins within a gossip round. The join triggers a repair on every node: each re-offers the documents it owns to their other owners, ingest is a no-op for a URL already held, and 45 s after `docker compose start minigoogle-3` all three nodes report 23 documents and node 3 answers a search for `mvcc` with the page crawled while it was dead. Nothing is ever deleted by repair; a node that stops owning a key range keeps its copies, and search deduplicates them.
+
+Two boundaries. Repair runs on membership change, so a node restarted inside `cluster.nodeTimeout` never left and keeps whatever it missed until the next join or leave. And a document crawled while a node is `SUSPECT` (still in the ring, unreachable) reaches only the owners that answer, as `replicatedTo` shows.
+
+The key-value store is what Raft replicates. Write a key through the leader, then stop it:
 
 ```bash
 curl -X POST localhost:8080/api/v1/cluster/kv -d '{"key":"k","value":"v"}'
@@ -317,14 +352,7 @@ sleep 12
 curl localhost:8082/api/v1/cluster/status
 ```
 
-```
-{"success":true,"key":"k"}
-{"nodeId":"minigoogle-3","state":"LEADER","term":2,"leader":"minigoogle-3","commitIndex":1,"members":["minigoogle-3","minigoogle-1","minigoogle-2"],"liveNodes":["minigoogle-2","minigoogle-1","minigoogle-3"]}
-```
-
-A survivor is leader in term 2 with the write committed. The same scenario is asserted end to end by `DeployedClusterIntegrationTest.threeNodeClusterElectsReplicatesSurvivesLeaderLossAndRecovers`. Reading the key back over `GET /api/v1/cluster/kv?key=k` answered `405 METHOD_NOT_ALLOWED` on every node when this page was written, although `MiniGoogleApp.java` registers a `GET` handler on that path beside the `POST` one, so the read example in the compose file's comments does not work yet.
-
-Each node's REST API is the same as a `STANDALONE` node's, so `/api/v1/search` and `/api/v1/crawl` work per node against that node's own index; the kv store is what Raft replicates. `docker compose down -v` removes the three volumes.
+A survivor is leader in the next term with the write committed; `DeployedClusterIntegrationTest.threeNodeClusterElectsReplicatesSurvivesLeaderLossAndRecovers` asserts the scenario end to end. Reading the key back over `GET /api/v1/cluster/kv?key=k` answered `405 METHOD_NOT_ALLOWED` on every node when this page was written, although `MiniGoogleApp.java` registers a `GET` handler on that path beside the `POST` one, so the read example in the compose file's comments does not work yet. `docker compose down -v` removes the three volumes.
 
 ## Kubernetes
 

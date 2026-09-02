@@ -17,6 +17,9 @@
 - [x] Real Web Crawling (robots.txt, politeness delays, incremental recrawling, persistent crawl frontier)
 - [x] ML-Based Ranking (learning-to-rank, click-through signals, query-document feature extraction, semantic embedding search via HNSW)
 - [x] Frontend (React) - prebuilt demo bundle served from `demo/index.html`
+- [x] Gossip membership with failure detection (SUSPECT, then DEAD, then rejoin) and push-pull exchange
+- [x] Consistent hashing for document placement across CLUSTER nodes, with replication repair on join and leave
+- [x] Cross-node query fan-out and result merging on CLUSTER nodes
 
 ## In Progress
 
@@ -25,10 +28,7 @@
 ## Planned
 
 ### Multi-Node Distributed Mode
-- Gossip protocol for cluster membership
-- Consistent hashing for shard placement
-- Automatic rebalancing on node join/leave
-- Cross-node query fan-out and result merging
+- Shrinking a node's index after it stops owning a key range (repair today only adds copies, never deletes)
 
 ### Production Hardening
 - Authentication and rate limiting

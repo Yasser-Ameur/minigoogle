@@ -3,6 +3,39 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- Gossip failure detection: a silent peer goes SUSPECT after `cluster.nodeTimeout`
+  and DEAD after `cluster.gossipDeadTimeoutMs` (default three times the node
+  timeout), which fires `onNodeLeft` and drops it from the hash ring; a peer
+  that returns is revived and re-added. Each round also probes one SUSPECT peer.
+- Push-pull gossip: an exchange response carries the responder's membership
+  table, so two nodes converge in one round trip instead of two.
+- Document placement on CLUSTER nodes: a crawled document is kept by the node
+  that fetched it and forwarded to the `cluster.replicationFactor` owners the
+  consistent hash ring names, over the authenticated
+  `/cluster/v1/documents/ingest` route. Ingest is idempotent by URL. On every
+  membership change each node re-offers the documents it owns to their other
+  owners, so a new owner catches up without an operator.
+- Cluster-wide search: `POST /api/v1/search` on a CLUSTER node fans out to
+  every live member over the dispatch route, merges, deduplicates by URL and
+  ranks once; if the fan-out fails the node answers from its own index.
+- `POST /api/v1/crawl` on a CLUSTER node reports `owners` and `replicatedTo`.
+- `MINIGOGLE_GOSSIP_DEAD_TIMEOUT_MS` (`cluster.gossipDeadTimeoutMs`).
+
+### Fixed
+
+- `ConsistentHashRing` reads were unsynchronised against concurrent
+  add and remove; a read-write lock now guards them.
+- Internal cluster RPC routes accepted bodies of any size; they now answer
+  411 without a `Content-Length` and 413 above 8 MiB before reading a byte.
+- A gossip peer's own stale self-report could demote it, and a survivor's
+  frozen ALIVE copy could revive a stopped peer forever; third parties now
+  need a fresher heartbeat counter, and a node's counter starts at the wall
+  clock so a restart outranks its previous life.
+
 ## [1.0.0] - 2026-09-02
 
 ### Added
