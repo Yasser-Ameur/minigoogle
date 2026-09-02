@@ -126,10 +126,9 @@ paths:
         defaults to 1, pageSize defaults to 10 and is clamped to 1..100).
         offset = (page-1)*pageSize; the server retrieves offset+pageSize
         candidates deep and totalResults counts matches found within that
-        depth, not an exhaustive corpus count. Only a repeated page:1 query
-        served from the query cache is reliably sliced to the requested
-        page; a cache miss returns the full depth unsliced with page/pageSize
-        echoed as 1/<actual result count> regardless of what was requested.
+        depth, not an exhaustive corpus count, so it grows as you page. A
+        page shorter than pageSize is the last one; a page past the end
+        returns an empty results list.
         A SEARCH-mode node ignores page. A COORDINATOR node echoes
         page/pageSize but can only ever serve page 1's results.
       requestBody:

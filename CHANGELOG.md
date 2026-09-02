@@ -40,9 +40,16 @@ All notable changes to this project are documented here. Format follows
   a wildcard `Access-Control-Allow-Origin`. `*` is unaffected.
 - An unmatched path now answers `404 NOT_FOUND` instead of falling through to
   the `/` handler.
-- `POST /api/v1/search` accepts `page` and `pageSize` and echoes both on the
-  response; see `API.md` for the exact (and, on a cache miss, incompletely
-  enforced) paging semantics.
+- `POST /api/v1/search` accepts `page` and `pageSize`, slices the result set
+  accordingly on fresh and cached queries alike, and echoes both on the
+  response; see `API.md` for the paging semantics.
+- Responses of 1 KiB or more are gzip-compressed when the client sends
+  `Accept-Encoding: gzip`, with `Vary: Accept-Encoding`; the UI document
+  drops from about 170 KB to a fraction of that.
+- The UI pages through the server (10 per page, `?q=&page=` in the URL),
+  offers suggestions and a way forward on zero results, announces result
+  counts to assistive technology, highlights whole words, and keeps every
+  control at least 44 px tall on phones.
 - `GET /metrics` is now protected the same way as `POST /api/v1/crawl` when
   an API key is configured; open when it is not.
 - `GET /api/v1/health/ready` is now served by a `COORDINATOR` node too

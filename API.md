@@ -138,19 +138,14 @@ A blank or missing `query` returns (verified against a running server)
 rather than an error.
 
 **Paging semantics.** `offset = (page - 1) * pageSize`; the server retrieves
-`offset + pageSize` candidates deep (`depth`) and `totalResults` is the count
-of matches found within that depth, not the full corpus. A repeat of the same
-`page: 1` query within the query cache's lifetime is sliced correctly to
-`results[offset:offset+pageSize]`. On a cache miss, however,
-`MiniGoogleApp.executeSearch`'s success path returns the full set of matches
-found at `depth` unsliced, and echoes `page: 1` and `pageSize: <the number of
-results actually returned>` regardless of what was requested. The intended
-per-page slice (`page`/`pageSize` echoed as requested, `results` cut to
-exactly `pageSize` entries) only happens on that cache hit. Verified against
-a running server: a fresh `{"query":"data","page":2,"pageSize":3}` returned
-all 9 matches for "data" with `"page":1,"pageSize":9`, not a 3-entry slice.
-Treat page/pageSize as accepted and echoed, but not yet reliably enforced,
-outside of a repeated page-1 query.
+`offset + pageSize` candidates deep (`depth`), returns
+`results[offset:offset+pageSize]`, and echoes `page` and `pageSize` as
+requested. `totalResults` is the count of matches found within that depth,
+not the full corpus, so it grows as you page; a page shorter than `pageSize`
+is the last one, and a page past the end returns an empty `results` list.
+Verified against a running server: `{"query":"computer","pageSize":3}` for
+pages 1 to 4 returned results 1-3, 4-6, 7-9 and 10 of the 10 matches, and
+page 5 returned none.
 
 A **SEARCH-mode** node (behind a coordinator) ignores `page` entirely; it
 always returns its full candidate set for coordinator-side global ranking.
