@@ -1,7 +1,7 @@
 import java.nio.file.Files
 import java.nio.file.Path
 
-version = "1.0.0"
+version = "1.1.0"
 
 plugins {
     java

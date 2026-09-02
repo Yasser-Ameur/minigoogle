@@ -5,6 +5,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-02
+
 ### Added
 
 - Gossip failure detection: a silent peer goes SUSPECT after `cluster.nodeTimeout`
