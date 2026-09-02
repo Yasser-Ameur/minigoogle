@@ -100,6 +100,7 @@ const SearchBox = forwardRef(function SearchBox(
   return (
     <div
       className={'search-wrap search-wrap--' + size}
+      data-open={suggestions.length > 0}
       onBlur={(e) => {
         if (!e.currentTarget.contains(e.relatedTarget)) {
           clearTimeout(debounceRef.current);

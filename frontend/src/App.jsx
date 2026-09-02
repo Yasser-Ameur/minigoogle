@@ -27,18 +27,28 @@ function suggestReformulations(query) {
   return [...new Set(out)].filter((w) => w && w.toLowerCase() !== query.trim().toLowerCase()).slice(0, 3);
 }
 
+function Wordmark() {
+  return (
+    <>
+      Mini
+      <span className="l-b">G</span><span className="l-r">o</span><span className="l-y">o</span>
+      <span className="l-b">g</span><span className="l-g">l</span><span className="l-r">e</span>
+    </>
+  );
+}
+
 function Logo({ size = 'home', onClick }) {
   const cls = size === 'sm' ? 'mini-logo mini-logo--sm' : 'mini-logo mini-logo--home';
   if (size === 'sm') {
     return (
       <button type="button" className={cls} onClick={onClick} aria-label="MiniGoogle home">
-        MiniG<em>oo</em>gle
+        <Wordmark />
       </button>
     );
   }
   return (
     <span className={cls}>
-      MiniG<em>oo</em>gle
+      <Wordmark />
     </span>
   );
 }

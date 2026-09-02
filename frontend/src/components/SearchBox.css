@@ -2,27 +2,31 @@
 
 .search-input {
   width: 100%;
-  padding: 14px 48px 14px 20px;
-  border: 1px solid var(--line-strong);
+  height: 46px;
+  padding: 0 48px 0 20px;
+  border: 1px solid var(--line);
   border-radius: 24px;
-  font: 400 16px/1.4 var(--font-sans);
-  color: var(--ink);
-  background: var(--raised);
+  font: 400 16px/1 var(--font);
+  color: var(--text);
+  background: var(--surface);
   outline: none;
-  transition: border-color 120ms ease-out, box-shadow 120ms ease-out;
 }
-.search-input::placeholder { color: var(--ink-disabled); }
-.search-input:hover { border-color: var(--line-strong); }
-.search-input:focus-visible {
-  border-color: var(--focus);
-  box-shadow: 0 0 0 2px var(--paper), 0 0 0 4px var(--focus);
+.search-input::placeholder { color: var(--meta); }
+.search-input:hover,
+.search-input:focus,
+.search-wrap[data-open="true"] .search-input {
+  box-shadow: var(--shadow);
+  border-color: transparent;
 }
+.search-input:focus-visible { outline: none; }
+/* Open list: the box squares off and the list hangs from it, as on google.com */
+.search-wrap[data-open="true"] .search-input { border-radius: 24px 24px 0 0; }
 
-.search-wrap--sm .search-input { padding: 10px 44px 10px 16px; font-size: 15px; }
+.search-wrap--sm .search-input { height: 44px; font-size: 16px; }
 
 .search-btn {
   position: absolute;
-  right: 6px;
+  right: 4px;
   top: 50%;
   transform: translateY(-50%);
   width: 40px;
@@ -34,42 +38,40 @@
   border: none;
   border-radius: 50%;
   cursor: pointer;
-  color: var(--ink-muted);
-  transition: background-color 120ms ease-out, color 120ms ease-out;
+  color: var(--blue);
 }
-.search-btn:hover { background: var(--wash); color: var(--accent); }
-.search-btn:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--paper), 0 0 0 4px var(--focus);
-}
-.search-btn svg { width: 20px; height: 20px; fill: currentColor; display: block; }
+.search-btn:hover { background: var(--chip); }
+.search-btn svg { width: 24px; height: 24px; fill: currentColor; display: block; }
 
 .autocomplete {
   position: absolute;
-  top: calc(100% + 4px);
+  top: 100%;
   left: 0;
   right: 0;
   z-index: 100;
-  background: var(--raised);
-  border: 1px solid var(--line-strong);
-  border-radius: 14px;
-  box-shadow: 0 8px 24px oklch(0 0 0 / 0.12);
-  overflow: hidden;
+  background: var(--surface);
+  border-radius: 0 0 24px 24px;
+  box-shadow: var(--shadow);
   list-style: none;
   margin: 0;
-  padding: 6px;
+  padding: 0 0 12px;
   max-height: 60vh;
   overflow-y: auto;
 }
+.autocomplete::before {
+  content: '';
+  display: block;
+  height: 1px;
+  margin: 0 20px 6px;
+  background: var(--line);
+}
 .ac-item {
-  padding: 10px 12px;
-  border-radius: 8px;
+  padding: 6px 20px;
   cursor: pointer;
-  font: 400 15px/1.4 var(--font-sans);
-  color: var(--ink);
+  font: 400 16px/1.4 var(--font);
+  color: var(--text);
   display: flex;
   align-items: center;
-  min-height: 40px;
 }
-.ac-item:hover, .ac-item.active { background: var(--wash); }
-.ac-icon { width: 16px; height: 16px; fill: var(--ink-muted); margin-inline-end: 12px; flex-shrink: 0; }
+.ac-item:hover, .ac-item.active { background: var(--sunken); }
+.ac-icon { width: 20px; height: 20px; fill: var(--meta); margin-inline-end: 12px; flex-shrink: 0; }
