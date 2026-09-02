@@ -32,6 +32,8 @@ x-cluster-common: &cluster-common
     # nodeId=host:port for every member, including self.
     CLUSTER_PEERS: "minigoogle-1=http://minigoogle-1:9080,minigoogle-2=http://minigoogle-2:9080,minigoogle-3=http://minigoogle-3:9080"
     MINIGOGLE_CLUSTER_SECRET: "change-me-in-production"
+    # Protects POST /api/v1/crawl on every node; the README demo sends it as X-API-Key.
+    MINIGOGLE_API_KEY: "change-me-please-16plus"
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health/ready"]
     interval: 10s
