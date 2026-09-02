@@ -100,9 +100,13 @@ class RaftConsensusConfigChangeTest {
 
             int index = a.appendConfigChange(new ConfigChange(ConfigChange.ChangeType.REMOVE, "c"));
             assertEquals(2, index);
-            assertTrue(waitUntil(() -> a.getCommitIndex() == 2, 3000),
-                    "The removal must commit on the old config's majority");
-            assertEquals(Set.of("a", "b"), a.getCommittedConfig().members());
+            // advanceCommit() publishes the commit index before applyCommitted()
+            // adopts the new configuration a few statements later, so a poll on
+            // the index alone can observe 2 while the config still reads {a, b, c}.
+            // Both signals are required together before the poll exits.
+            assertTrue(waitUntil(() -> a.getCommitIndex() == 2
+                    && a.getCommittedConfig().members().equals(Set.of("a", "b")), 3000),
+                    "The removal must commit on the old config's majority and adopt {a, b}");
 
             // After the removal, c no longer counts: a alone is not a majority
             // of {a, b}, even though a + c would be two servers.
