@@ -428,6 +428,25 @@ export default function App() {
     setPage(p);
   }, []);
 
+  // I'm Feeling Lucky: open the top result itself, as google.com does.
+  const lucky = useCallback(
+    (q) => {
+      if (!q) return;
+      search(q, 1, 1)
+        .then((result) => {
+          const top = result && result.results && result.results[0];
+          if (!top) {
+            navigateSearch(q, 1);
+            return;
+          }
+          click(q, top.url, 1).catch(() => {});
+          window.location.assign(top.url);
+        })
+        .catch(() => navigateSearch(q, 1));
+    },
+    [navigateSearch]
+  );
+
   const goToPage = useCallback(
     (p) => {
       const params = new URLSearchParams();
@@ -517,7 +536,7 @@ export default function App() {
           <div className="home">
             <Logo size="home" />
             <div className="search-box">
-              <SearchBox ref={searchBoxRef} onSubmit={(q) => navigateSearch(q, 1)} autoFocus />
+              <SearchBox ref={searchBoxRef} onSubmit={(q) => navigateSearch(q, 1)} onLucky={lucky} autoFocus />
             </div>
             <AddUrl onAdded={refreshStats} />
             <IndexStats data={statsData} />
